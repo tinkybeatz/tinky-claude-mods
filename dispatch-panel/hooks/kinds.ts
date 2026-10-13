@@ -1,43 +1,30 @@
 import type { Dispatch } from '../types'
 
-/** The colour of each group of work: primaries and secondaries, chosen to read clearly on a dark background. */
-export const GROUP_COLORS = {
-  code: '#3b82f6',
-  review: '#ef4444',
-  explore: '#facc15',
-  plan: '#22c55e',
-  helper: '#a855f7',
-  shell: '#f97316',
-  unknown: '#e5e5e5',
-} as const
+/**
+ * What an agent is doing, each with its own colour. The colour follows the activity,
+ * not the agent type: a `general-purpose` agent writing code and one updating Jira get
+ * different colours. A small model picks the activity when the agent starts.
+ */
+export const ACTIVITIES = [
+  { label: 'writing or changing code', color: '#3b82f6' },
+  { label: 'reviewing or testing', color: '#ef4444' },
+  { label: 'updating tickets (Jira, issues)', color: '#22d3ee' },
+  { label: 'git, branches or pull requests', color: '#ec4899' },
+  { label: 'searching or researching', color: '#facc15' },
+  { label: 'planning or designing', color: '#22c55e' },
+  { label: 'writing docs or text', color: '#e5e5e5' },
+  { label: 'configuring or setting up', color: '#a855f7' },
+  { label: 'analysing data', color: '#a3e635' },
+  { label: 'something else', color: '#f97316' },
+] as const
 
-export type Group = keyof typeof GROUP_COLORS
+export const ACTIVITY_LABELS = ACTIVITIES.map(activity => activity.label)
 
-/** The colour of a failed row's ✗ mark; its border keeps its group's colour. */
+/** Shells, and agents whose activity is not known yet. */
+export const NEUTRAL_COLOR = '#94a3b8'
+
+/** The colour of a failed row's ✗ mark; its border keeps its activity's colour. */
 export const FAILED_MARK_COLOR = '#ef4444'
 
-/**
- * Which group each agent type belongs to, by the exact `subagent_type` the dispatch names
- * (compared in lower case). Nothing is guessed: a type missing here is drawn as `unknown`
- * (white) until it is added. Add a line per new agent type.
- */
-export const AGENT_GROUPS: Readonly<Record<string, Group>> = {
-  // Code: general workers that write and change code.
-  'general-purpose': 'code',
-  claude: 'code',
-  dev: 'code',
-  // Review: agents that verify, test or review work.
-  test: 'review',
-  // Explore: read-only search across files.
-  explore: 'explore',
-  // Plan: design and implementation plans.
-  plan: 'plan',
-  // Helper: documentation and configuration helpers.
-  'claude-code-guide': 'helper',
-  'statusline-setup': 'helper',
-}
-
-export const groupOf = (row: Dispatch): Group =>
-  row.kind === 'shell' ? 'shell' : (AGENT_GROUPS[row.label.toLowerCase()] ?? 'unknown')
-
-export const groupColor = (row: Dispatch) => GROUP_COLORS[groupOf(row)]
+export const activityColor = (row: Dispatch) =>
+  ACTIVITIES.find(activity => activity.label === row.activity)?.color ?? NEUTRAL_COLOR

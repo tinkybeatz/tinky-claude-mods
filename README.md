@@ -5,7 +5,7 @@ function hooks. This repository holds several mods, one folder each.
 
 | Mod | What it does |
 | --- | --- |
-| [`dispatch-panel`](dispatch-panel/) | A side panel listing dispatched agents and background shells, with their purpose, input and output tokens and duration, in Active and Finished tabs, colour-coded by kind of work. |
+| [`dispatch-panel`](dispatch-panel/) | A side panel listing dispatched agents and background shells, with their purpose, input and output tokens and duration, in Active and Finished tabs, coloured by what each agent is doing. |
 
 ## Using a mod
 
@@ -56,22 +56,34 @@ Each row shows the agent type (or `bash` for a shell), its purpose, how long it 
 for agents `in` (the input tokens of its latest request, so its context now, cache included)
 and `out` (all the output tokens it has generated).
 
-Colours come from a fixed table in
-[`dispatch-panel/hooks/kinds.ts`](dispatch-panel/hooks/kinds.ts): each agent type belongs
-to a group, and each group has one colour. A type missing from the table is drawn white;
-add a line to `AGENT_GROUPS` to give it a group.
+A running agent's card ends with a strip naming what it is doing right now, read from
+its latest tool call: `reading register.tsx`, `running tests`, `committing`,
+`updating Jira`, and `thinking` between calls. Shell commands are matched against a
+list of known ones (git, gh, test runners, linters, …); any other command shows the
+description the agent gave it.
 
-| Group | Colour | Agent types |
-| --- | --- | --- |
-| code | blue | `claude`, `general-purpose`, `dev` |
-| review | red | `test` |
-| explore | yellow | `Explore` |
-| plan | green | `Plan` |
-| helper | purple | `claude-code-guide`, `statusline-setup` |
-| shell | orange | background Bash |
-| unknown | white | anything not in the table |
+Each agent's colour shows what it is doing, not its type: a `general-purpose` agent
+writing code and one updating Jira get different colours. When an agent starts, a small
+fast model reads its type, description and the start of its prompt, and picks one
+activity (one model call per agent). The activities and their colours are in
+[`dispatch-panel/hooks/kinds.ts`](dispatch-panel/hooks/kinds.ts).
 
-A failed row keeps its group's border and shows a red `✗`.
+| Activity | Colour |
+| --- | --- |
+| writing or changing code | blue |
+| reviewing or testing | red |
+| updating tickets (Jira, issues) | cyan |
+| git, branches or pull requests | pink |
+| searching or researching | yellow |
+| planning or designing | green |
+| writing docs or text | white |
+| configuring or setting up | purple |
+| analysing data | lime |
+| something else | orange |
+
+Shells, and agents not classified yet (the first second or so), are slate grey.
+
+A failed row keeps its activity's border and shows a red `✗`.
 
 Known limits: a background shell that exits with an error is still marked done, not
 failed, and workflow agents are not listed.

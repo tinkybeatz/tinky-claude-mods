@@ -1,7 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { GROUP_COLORS, groupColor } from '../hooks/kinds'
+import { describeAction } from '../hooks/actions'
+import { ACTIVITIES, NEUTRAL_COLOR, activityColor } from '../hooks/kinds'
 import type { Dispatch } from '../types'
 
 const PANE_PROPS = {
@@ -102,14 +103,84 @@ test('an agent row shows its latest input tokens and its summed output tokens', 
   expect(await pane.find({ text: 'in 1.8k · out 300' })).toBeDefined()
 })
 
-test('agent types map to their group colour from the fixed table, unknown types to white', () => {
-  const agent = (label: string): Dispatch => ({ id: label, kind: 'agent', label, purpose: '', status: 'running', startedAt: 0 })
-  expect(groupColor(agent('claude'))).toBe(GROUP_COLORS.code)
-  expect(groupColor(agent('general-purpose'))).toBe(GROUP_COLORS.code)
-  expect(groupColor(agent('test'))).toBe(GROUP_COLORS.review)
-  expect(groupColor(agent('Explore'))).toBe(GROUP_COLORS.explore)
-  expect(groupColor(agent('Plan'))).toBe(GROUP_COLORS.plan)
-  expect(groupColor(agent('claude-code-guide'))).toBe(GROUP_COLORS.helper)
-  expect(groupColor(agent('code-reviewer'))).toBe(GROUP_COLORS.unknown)
-  expect(groupColor({ ...agent('bash'), kind: 'shell' })).toBe(GROUP_COLORS.shell)
+test('an agent is coloured by the activity the classifier picks, not by its type', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const asked: string[] = []
+  mock.store(on)
+  on('agent.list', () => ({ value: [] }))
+  on('command.register', () => ({ value: {} }) as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('session.start', (_$, e) => e as never)
+  on('model.classify', (_$, e) => {
+    asked.push(e.text)
+    return { value: e.text.includes('Jira') ? 'updating tickets (Jira, issues)' : 'writing or changing code' }
+  })
+  on('agent.spawn', (_$, e) => ({ model: 'test-model', agentId: e.description }))
+
+  await $.session.start({ cwd: '/tmp' } as Parameters<typeof $.session.start>[0])
+  for (const description of ['Implement the export button', 'Update PROD-4882 in Jira']) {
+    await $.agent.spawn({
+      tool_use_id: description,
+      prompt: description,
+      description,
+      subagentType: 'general-purpose',
+    } as Parameters<typeof $.agent.spawn>[0])
+  }
+  await clock.advance(3000)
+
+  expect(asked).toHaveLength(2)
+  const pane = await mountPane($)
+  const code = await pane.find({ text: 'Implement the export button' })
+  const jira = await pane.find({ text: 'Update PROD-4882 in Jira' })
+  expect(code).toBeDefined()
+  expect(jira).toBeDefined()
+  const drawn = JSON.stringify(await pane.drawn())
+  expect(drawn).toContain('#3b82f6')
+  expect(drawn).toContain('#22d3ee')
+})
+
+const row = (id: string): Dispatch => ({ id, kind: 'agent', label: 'general-purpose', purpose: '', status: 'running', startedAt: 0 })
+
+test('every activity has its own colour, and unclassified agents and shells are neutral', () => {
+  const colors = ACTIVITIES.map(activity => activity.color)
+  expect(new Set(colors).size).toBe(colors.length)
+  expect(activityColor(row('x'))).toBe(NEUTRAL_COLOR)
+  expect(activityColor({ ...row('s'), kind: 'shell' })).toBe(NEUTRAL_COLOR)
+})
+
+test('tool calls become short action phrases', () => {
+  expect(describeAction('Bash', { command: 'git commit -m "x"' })).toBe('committing')
+  expect(describeAction('Bash', { command: 'cd repo && pnpm test' })).toBe('running tests')
+  expect(describeAction('Bash', { command: ['gh', 'pr', 'create', '--draft'].join(' ') })).toBe('opening a PR')
+  expect(describeAction('Bash', { command: 'make thing', description: 'Generate the fixtures' })).toBe(
+    'generate the fixtures',
+  )
+  expect(describeAction('Read', { file_path: '/repo/src/register.tsx' })).toBe('reading register.tsx')
+  expect(describeAction('Edit', { file_path: '/repo/a.ts' })).toBe('editing a.ts')
+  expect(describeAction('mcp__claude_ai_Atlassian_MCP__editJiraIssue', {})).toBe('updating Jira')
+  expect(describeAction('mcp__claude_ai_Atlassian_MCP__getJiraIssue', {})).toBe('reading Jira')
+})
+
+test("a running agent's card shows its current action, and thinking between tool calls", async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  on('agent.spawn', () => ({ model: 'test-model', agentId: 'agent-9' }))
+  let pane: Awaited<ReturnType<typeof mountPane>> | undefined
+  let seenDuringCall: boolean | undefined
+  on('tool.call', { tool: 'Bash' }, async () => {
+    pane ??= await mountPane($)
+    seenDuringCall = (await pane.find({ text: 'committing' })) !== undefined
+    return { result: { stdout: '', stderr: '', interrupted: false } }
+  })
+
+  await $.agent.spawn({
+    tool_use_id: 'use-9',
+    prompt: 'Commit the work',
+    description: 'Commit the work',
+    subagentType: 'dev',
+  } as Parameters<typeof $.agent.spawn>[0])
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'use-10', command: 'git commit -m "wip"', agentId: 'agent-9' })
+
+  expect(seenDuringCall).toBe(true)
+  expect(await pane?.find({ text: 'thinking' })).toBeDefined()
 })

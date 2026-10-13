@@ -16,6 +16,14 @@ export type Dispatch = {
   inputTokens?: number
   /** Output tokens the agent has generated across all its requests; absent for shells. */
   outputTokens?: number
+  /** The start of the agent's prompt, kept so its activity can be classified. */
+  brief?: string
+  /** What the agent is doing, one of the activity labels; absent until classified. */
+  activity?: string
+  /** True once classification was tried, so a failed attempt is not repeated. */
+  isClassified?: boolean
+  /** What a running agent is doing right now ("reading register.tsx", "committing"). */
+  action?: string
 }
 
 declare module 'claude-code' {

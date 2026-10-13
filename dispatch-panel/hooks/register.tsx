@@ -2,7 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Dispatch, DispatchTab } from '../types'
-import { FAILED_MARK_COLOR, groupColor } from './kinds'
+import { THINKING, describeAction } from './actions'
+import { ACTIVITY_LABELS, FAILED_MARK_COLOR, activityColor } from './kinds'
 
 const PANE = 'dispatches'
 const TITLE = 'Dispatched'
@@ -11,6 +12,7 @@ const OUTER_X = 2
 const OUTER_Y = 1
 const INNER_X = 1
 const ROW_GAP = 0
+const ACTION_BACKGROUND = '#3a3a3a'
 const WIDTH_SHARE = 2 / 3
 const MIN_COLUMNS = 24
 const COLUMNS_KEY = 'columns'
@@ -113,9 +115,33 @@ const syncAgents = async ($: EngineInterface, at: number) => {
   }
 }
 
+/**
+ * Classifies one agent's activity per tick, outside any hook's dispatch, so a slow
+ * model call never holds up a spawn. A failed call settles on 'something else'.
+ */
+const classifyNext = async ($: EngineInterface) => {
+  const list = (await read($, dispatches)) ?? []
+  const row = list.find(one => one.kind === 'agent' && one.isClassified !== true)
+  if (row === undefined) return
+  await upsert($, row.id, found => (found === undefined ? undefined : { ...found, isClassified: true }))
+  const text = [`agent type: ${row.label}`, `task: ${row.purpose}`, row.brief ? `prompt: ${row.brief}` : '']
+    .filter(Boolean)
+    .join('\n')
+  let activity: string | undefined
+  try {
+    activity = await $.model.classify(text, ACTIVITY_LABELS)
+  } catch {
+    activity = undefined
+  }
+  await upsert($, row.id, found =>
+    found === undefined ? undefined : { ...found, activity: activity ?? 'something else' },
+  )
+}
+
 const tick = async ($: EngineInterface) => {
   const at = await $.clock.now()
   await syncAgents($, at)
+  await classifyNext($)
   await fitWidth($)
   const list = (await read($, dispatches)) ?? []
   if (list.some(isRunning)) await update($, now, () => at)
@@ -170,6 +196,10 @@ export const register: Register = on => {
         kind: 'agent',
         label: e.subagentType || 'agent',
         purpose: e.description || firstLine(e.prompt),
+        brief: e.prompt.slice(0, 600),
+        activity: row?.activity,
+        isClassified: row?.isClassified,
+        action: row?.action ?? 'starting',
         status: row?.status ?? 'running',
         startedAt: row?.startedAt ?? startedAt,
         endedAt: row?.endedAt,
@@ -193,6 +223,19 @@ export const register: Register = on => {
       )
     }
     return step
+  })
+
+  /** Each tool call an agent makes is its current action, until the call ends and it thinks again. */
+  on('tool.call', async ($, e, next) => {
+    const agentId = e.agentId
+    if (agentId === undefined) return next(e)
+    const action = describeAction(String(e.tool), e as unknown as Record<string, unknown>)
+    const setAction = (label: string) =>
+      upsert($, agentId, row => (row === undefined || !isRunning(row) ? undefined : { ...row, action: label }))
+    await setAction(action)
+    const ran = await next(e)
+    await setAction(THINKING)
+    return ran
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
@@ -257,6 +300,8 @@ export const register: Register = on => {
     const at = (await read($, now)) ?? 0
     const shownTab = (await read($, tab)) ?? 'active'
     const width = Math.max(10, e.props.bodyColumns)
+    // The card's inside: the panel's width less its side padding, the card's border and its padding.
+    const stripColumns = Math.max(4, width - 2 * OUTER_X - 2 - 2 * INNER_X)
     if (e.props.placement === 'dock') measuredColumns = e.props.bodyColumns
     const active = list.filter(isRunning)
     const finished = list.filter(row => !isRunning(row)).reverse()
@@ -297,7 +342,7 @@ export const register: Register = on => {
         {shown.map(row => {
           const running = isRunning(row)
           const elapsed = (row.endedAt ?? Math.max(at, row.startedAt)) - row.startedAt
-          const color = groupColor(row)
+          const color = activityColor(row)
           const markColor = row.status === 'failed' ? FAILED_MARK_COLOR : color
           return (
             <Box
@@ -325,6 +370,20 @@ export const register: Register = on => {
                 <Text dimColor wrap="truncate-end">
                   in {formatCount(row.inputTokens ?? 0)} · out {formatCount(row.outputTokens ?? 0)}
                 </Text>
+              )}
+              {row.kind === 'agent' && running && row.action !== undefined && (
+                // A row cannot be split, so the strip's top and bottom edges are half blocks:
+                // they read as half a row of space above and below a slightly taller strip.
+                <Box flexDirection="column" width={stripColumns}>
+                  <Text color={ACTION_BACKGROUND}>{'▄'.repeat(stripColumns)}</Text>
+                  <Box backgroundColor={ACTION_BACKGROUND} paddingX={INNER_X}>
+                    <Text wrap="truncate-end">
+                      <Text color={color}>▸ </Text>
+                      {row.action}
+                    </Text>
+                  </Box>
+                  <Text color={ACTION_BACKGROUND}>{'▀'.repeat(stripColumns)}</Text>
+                </Box>
               )}
             </Box>
           )

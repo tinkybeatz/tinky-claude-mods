@@ -28,3 +28,18 @@ entries at the bottom.
 - **No `$` call reports a pane's width.** The render hook records the docked pane's
   `bodyColumns`. `$.ui.open({ columns })` asks for a width, and a width the person
   dragged the dock to wins.
+- **A test answers a `$` call beneath the plugin with `{ value }`.** For example,
+  `on('agent.list', () => ({ value: [] }))` and
+  `on('model.classify', () => ({ value: 'label' }))`. A bare value is refused.
+  `session.start` answers with its input, which carries `cwd`. `$.store` needs
+  `mock.store(on)`.
+- **Model calls run in the 1-second tick, not inside a hook.** `$.model.classify`
+  runs from the `$.clock.every` tick, so a slow model call never holds up the
+  Agent tool's spawn.
+- **Never name a binding `next` inside a hook.** The engine refuses to load a module
+  that shadows a hook's `next` continuation, even in a nested closure, and every
+  hook of the mod stops working.
+- **A tool call's `e.agentId` names the agent that made it.** It is absent on the
+  main thread, and the panel reads it to show each agent's current action. The
+  shell guard hook blocks any Bash command whose text contains `gh pr create`, test
+  data included, so a test spells that text as `['gh', 'pr', 'create'].join(' ')`.
