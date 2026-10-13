@@ -1,0 +1,14 @@
+{
+  "name": "tinky-claude-mods",
+  "description": "Claude Code mods by Gael: interface and behaviour plugins built on function hooks",
+  "owner": {
+    "name": "Gael Delouis"
+  },
+  "plugins": [
+    {
+      "name": "dispatch-panel",
+      "source": "./dispatch-panel",
+      "description": "A side panel listing dispatched agents and background shells, with purpose, tokens and duration"
+    }
+  ]
+}
