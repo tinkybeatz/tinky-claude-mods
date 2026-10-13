@@ -28,6 +28,11 @@ let measuredColumns: number | undefined
 
 const isRunning = (row: Dispatch) => !ENDED.has(row.status)
 
+/** A task-notification row's id and status, in the order the engine writes them. */
+const TASK_NOTIFICATION = /<task-id>([^<]+)<\/task-id>[\s\S]*?<status>([^<]+)<\/status>/g
+/** The panel's status for each status a task notification reports. */
+const NOTIFIED_STATUS: Readonly<Record<string, string>> = { completed: 'done', failed: 'failed', killed: 'killed' }
+
 const firstLine = (text: string) => text.split('\n')[0]?.trim() ?? ''
 
 const upsert = ($: EngineInterface, id: string, patch: (row: Dispatch | undefined) => Dispatch | undefined) =>
@@ -113,6 +118,14 @@ const syncAgents = async ($: EngineInterface, at: number) => {
       }
     })
   }
+  // An agent the engine no longer lists is over, whatever its row last said:
+  // without this, a row whose final status was never seen stays active forever.
+  const listed = new Set(agents.map(agent => agent.id))
+  await update($, dispatches, list =>
+    (list ?? []).map(row =>
+      row.kind === 'agent' && isRunning(row) && !listed.has(row.id) ? { ...row, status: 'done', endedAt: at } : row,
+    ),
+  )
 }
 
 /**
@@ -152,8 +165,8 @@ export const register: Register = on => {
     await $.command.register({
       name: 'dispatches',
       description:
-        'Show dispatched agents and shells in a side panel (`active`, `finished`, `clear` to drop finished rows, `width <columns>` to resize)',
-      argumentHint: '[active|finished|clear|width <columns>]',
+        'Show dispatched agents and shells in a side panel (`active`, `finished`, `clear` to drop finished rows, `clear all` to drop every row, `width <columns>` to resize)',
+      argumentHint: '[active|finished|clear|clear all|width <columns>]',
     })
     const startedAt = await $.clock.now()
     await update($, now, () => startedAt)
@@ -177,6 +190,10 @@ export const register: Register = on => {
       await update($, isSized, () => true)
       await $.ui.open({ id: PANE, title: TITLE, columns })
       return { text: `Dispatch panel width set to ${columns} columns.` }
+    }
+    if (arg === 'clear all') {
+      await update($, dispatches, () => [])
+      return { text: 'Cleared every dispatch, active ones included.' }
     }
     if (arg === 'clear') {
       await update($, dispatches, list => (list ?? []).filter(isRunning))
@@ -264,6 +281,29 @@ export const register: Register = on => {
       )
     }
     return ran
+  })
+
+  /**
+   * Every finished background task writes a notification row into its owner's
+   * conversation, a subagent's included, carrying the task's id and final status.
+   * It is the one signal that reaches the panel for a shell a subagent started.
+   */
+  on('session.append', async ($, e, next) => {
+    const appended = await next(e)
+    const raw = JSON.stringify(e.message.content)
+    if (!raw.includes('<task-notification>')) return appended
+    const at = await $.clock.now()
+    for (const match of raw.matchAll(TASK_NOTIFICATION)) {
+      const [, id, status] = match
+      if (id === undefined || status === undefined) continue
+      const ended = NOTIFIED_STATUS[status] ?? 'done'
+      await upsert($, id, row =>
+        row === undefined || (!isRunning(row) && row.status !== 'done')
+          ? undefined
+          : { ...row, status: ended, endedAt: row.endedAt ?? at },
+      )
+    }
+    return appended
   })
 
   /** At each stop the engine lists the background work still in flight: any shell missing from it has finished. */

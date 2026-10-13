@@ -107,7 +107,13 @@ test('an agent is coloured by the activity the classifier picks, not by its type
   const clock = mock.clock(on, { now: 1_000_000 })
   const asked: string[] = []
   mock.store(on)
-  on('agent.list', () => ({ value: [] }))
+  const listed = ['Implement the export button', 'Update PROD-4882 in Jira'].map(id => ({
+    id,
+    description: id,
+    type: 'general-purpose',
+    status: 'running' as const,
+  }))
+  on('agent.list', () => ({ value: listed }))
   on('command.register', () => ({ value: {} }) as never)
   on('ui.open', () => ({ value: { isPlaced: true } }) as never)
   on('ui.panes', () => ({ value: [] }))
@@ -183,4 +189,70 @@ test("a running agent's card shows its current action, and thinking between tool
 
   expect(seenDuringCall).toBe(true)
   expect(await pane?.find({ text: 'thinking' })).toBeDefined()
+})
+
+test('an agent the engine stops listing is moved to finished, and clear all drops active rows too', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.store(on)
+  let listed = [{ id: 'agent-x', description: 'Stuck agent', type: 'claude', status: 'running' as const }]
+  on('agent.list', () => ({ value: listed }))
+  on('model.classify', () => ({ value: 'something else' }))
+  on('command.register', () => ({ value: {} }) as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('session.start', (_$, e) => e as never)
+
+  await $.session.start({ cwd: '/tmp' } as Parameters<typeof $.session.start>[0])
+  await clock.advance(1000)
+  const pane = await mountPane($)
+  expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
+
+  listed = []
+  await clock.advance(1000)
+  expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
+  expect(await pane.find({ type: 'Button', text: 'Finished (1)' })).toBeDefined()
+
+  listed = [{ id: 'agent-y', description: 'Another agent', type: 'claude', status: 'running' as const }]
+  await clock.advance(1000)
+  expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
+  await $.command.run({ command: 'dispatches', args: 'clear all' } as Parameters<typeof $.command.run>[0])
+  expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
+  expect(await pane.find({ type: 'Button', text: 'Finished (0)' })).toBeDefined()
+})
+
+test("a shell's completion notification ends its row with the status it reports", async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  mock.session(on)
+  on('tool.call', { tool: 'Bash' }, (_$, e) => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: e.tool_use_id },
+  }))
+
+  for (const id of ['shell-ok', 'shell-bad']) {
+    await $.tool.call({ tool: 'Bash', tool_use_id: id, command: 'sleep 30', description: `Wait ${id}`, run_in_background: true })
+  }
+  const notify = (id: string, status: string) =>
+    $.session.append({
+      door: 'delivery',
+      origin: { kind: 'engine' },
+      uuid: `row-${id}`,
+      agentId: 'agent-owner',
+      message: {
+        type: 'user',
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `<task-notification>\n<task-id>${id}</task-id>\n<output-file>/tmp/x</output-file>\n<status>${status}</status>\n<summary>Shell finished</summary>\n</task-notification>`,
+          },
+        ],
+      },
+    } as unknown as Parameters<typeof $.session.append>[0])
+  await notify('shell-ok', 'completed')
+  await notify('shell-bad', 'failed')
+
+  const pane = await mountPane($)
+  expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
+  await pane.press({ key: 'tab-finished' })
+  expect(await pane.find({ text: '✓' })).toBeDefined()
+  expect(await pane.find({ text: '✗' })).toBeDefined()
 })

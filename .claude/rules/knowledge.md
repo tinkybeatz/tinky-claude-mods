@@ -16,9 +16,11 @@ entries at the bottom.
   (`on('classic.Stop', () => ({}))`). A test's `$` has no `state` noun, so read the
   plugin's state through a mounted `Pane` (`$.ui.mount`).
 - **No `$` call lists background shells.** `dispatch-panel` gets each shell's id from
-  the Bash `tool.call` result (`backgroundTaskId`). It treats a shell as finished
-  once the shell is missing from `background_tasks` at a `classic.Stop`, so a failed
-  shell still reads as done.
+  the Bash `tool.call` result (`backgroundTaskId`). Its end comes from the
+  `<task-notification>` row (`<task-id>`, `<status>`) appended to the owner's
+  conversation, which `session.append` sees for subagents too. A shell a subagent
+  started can stay in `classic.Stop`'s `background_tasks` long after it ended, so
+  that list alone left rows active forever.
 - **Terminal layout is measured in character cells, not pixels.** A cell is about
   10px wide and 20px tall, and no half row exists. `round` is the roundest border
   the terminal draws.

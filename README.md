@@ -48,6 +48,7 @@ the fullscreen layout. Elsewhere, open it with `/dispatches`.
 | `/dispatches` | Opens the panel. |
 | `/dispatches active` / `finished` | Opens the panel on that tab. |
 | `/dispatches clear` | Drops finished rows. |
+| `/dispatches clear all` | Drops every row, active ones included. |
 | `/dispatches width <columns>` | Sets the panel's width, remembered across sessions. |
 
 While the panel has focus, `a` and `f` switch tabs.
@@ -85,8 +86,10 @@ Shells, and agents not classified yet (the first second or so), are slate grey.
 
 A failed row keeps its activity's border and shows a red `✗`.
 
-Known limits: a background shell that exits with an error is still marked done, not
-failed, and workflow agents are not listed.
+A background shell's row ends when its completion notification arrives, with the status
+that notification reports (done, failed or killed), including shells an agent started.
+
+Known limit: workflow agents are not listed.
 
 ## Developing
 
