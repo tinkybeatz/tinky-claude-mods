@@ -4,10 +4,12 @@ import type { AgentInfo, EngineInterface, Register } from 'claude-code'
 import type { Dispatch, DispatchKind, DispatchTab } from '../types'
 import { THINKING, describeAction } from './actions'
 import { ACTIVITY_LABELS, FAILED_MARK_COLOR, activityColor, activityTag } from './kinds'
+import { buildTree, descendantsOf, dropFinishedTrees, liveRootIds } from './tree'
+import type { Descendant } from './tree'
 
 const PANE = 'dispatches'
 const TITLE = 'Dispatched'
-const MAX_ROWS = 50
+const MAX_ROWS = 100
 const OUTER_X = 2
 const OUTER_Y = 1
 const INNER_X = 1
@@ -124,13 +126,16 @@ const syncAgents = async ($: EngineInterface, at: number) => {
           purpose: agent.description,
           status,
           startedAt: at,
+          parentId: agent.parentId,
         }
       }
-      if (row.status === status) return undefined
+      const parentId = row.parentId ?? agent.parentId
+      if (row.status === status && row.parentId === parentId) return undefined
       const hasEnded = ENDED.has(status)
       return {
         ...row,
         status,
+        parentId,
         endedAt: hasEnded ? (row.endedAt ?? at) : undefined,
       }
     })
@@ -213,7 +218,7 @@ export const register: Register = on => {
       return { text: 'Cleared every dispatch, active ones included.' }
     }
     if (arg === 'clear') {
-      await update($, dispatches, list => (list ?? []).filter(isRunning))
+      await update($, dispatches, list => dropFinishedTrees(list ?? [], isRunning))
       return { text: 'Cleared finished dispatches.' }
     }
     await openPane($)
@@ -239,6 +244,7 @@ export const register: Register = on => {
         endedAt: row?.endedAt,
         inputTokens: row?.inputTokens,
         outputTokens: row?.outputTokens,
+        parentId: e.parentAgentId ?? row?.parentId,
       }))
     }
     return spawned
@@ -281,7 +287,7 @@ export const register: Register = on => {
     if (taskId !== undefined) {
       const purpose = e.description || firstLine(e.command)
       await upsert($, taskId, row =>
-        row ?? { id: taskId, kind: 'shell', label: 'bash', purpose, status: 'running', startedAt },
+        row ?? { id: taskId, kind: 'shell', label: 'bash', purpose, status: 'running', startedAt, parentId: e.agentId },
       )
     }
     return ran
@@ -360,27 +366,67 @@ export const register: Register = on => {
     // The card's inside: the panel's width less its side padding, the card's border and its padding.
     const stripColumns = Math.max(4, width - 2 * OUTER_X - 2 - 2 * INNER_X)
     if (e.props.placement === 'dock') measuredColumns = e.props.bodyColumns
-    const active = list.filter(isRunning)
-    const finished = list.filter(row => !isRunning(row)).reverse()
+    // One card per top-level row; what a dispatched agent started is listed inside its card,
+    // and the whole tree stays in Active while any row in it runs.
+    const tree = buildTree(list)
+    const live = liveRootIds(list, isRunning)
+    const roots = list.filter(row => tree.rootIdOf(row) === row.id)
+    const active = roots.filter(row => live.has(row.id))
+    const finished = roots.filter(row => !live.has(row.id)).reverse()
     const shown = shownTab === 'active' ? active : finished
     const showTab = (next: DispatchTab) => () => void update($, tab, () => next)
 
     // Terminal spacing is in cells, not pixels: a cell is about 10px wide and 20px tall,
     // so OUTER (about 20px) is 2 columns or 1 row, and INNER (about 10px) is 1 column.
     // Half a row does not exist, so the gap between rows (about 10px asked) is 0 rows.
+    const elapsedOf = (row: Dispatch) => (row.endedAt ?? Math.max(at, row.startedAt)) - row.startedAt
+    const markColorOf = (row: Dispatch) => (row.status === 'failed' ? FAILED_MARK_COLOR : activityColor(row))
+
+    /** One line inside a card for an agent or shell the card's agent started, indented by depth. */
+    const childLine = ({ row, depth, isLast }: Descendant) => {
+      const running = isRunning(row)
+      const color = activityColor(row)
+      const tag = row.kind === 'shell' ? 'shell' : activityTag(row)
+      return (
+        <Box key={row.id} flexDirection="row" gap={1}>
+          <Text dimColor>{`${'  '.repeat(depth)}${isLast ? '└' : '├'}`}</Text>
+          <Text color={markColorOf(row)} dimColor={!running}>
+            {statusMark(row.status)}
+          </Text>
+          <Box flexShrink={1}>
+            <Text color={color} dimColor={!running} wrap="truncate-end">
+              {row.purpose || row.label}
+            </Text>
+          </Box>
+          {tag !== undefined && (
+            <Box flexShrink={0}>
+              <Text color={color} dimColor>{`[${tag}]`}</Text>
+            </Box>
+          )}
+          <Box flexGrow={1} />
+          <Box flexShrink={0}>
+            <Text dimColor={!running}>{formatDuration(elapsedOf(row))}</Text>
+          </Box>
+        </Box>
+      )
+    }
+
     const card = (row: Dispatch) => {
       const running = isRunning(row)
-      const elapsed = (row.endedAt ?? Math.max(at, row.startedAt)) - row.startedAt
+      const isLive = live.has(row.id)
+      const elapsed = elapsedOf(row)
       const color = activityColor(row)
       const tag = activityTag(row)
-      const markColor = row.status === 'failed' ? FAILED_MARK_COLOR : color
+      const markColor = markColorOf(row)
+      const descendants = descendantsOf(tree, row.id)
+      const subOutput = descendants.reduce((sum, { row: child }) => sum + (child.outputTokens ?? 0), 0)
       return (
         <Box
           key={row.id}
           flexDirection="column"
           borderStyle="round"
           borderColor={color}
-          borderDimColor={!running}
+          borderDimColor={!isLive}
           paddingX={INNER_X}
           marginBottom={ROW_GAP}
         >
@@ -410,9 +456,11 @@ export const register: Register = on => {
           )}
           {row.kind === 'agent' && (
             <Text dimColor wrap="truncate-end">
-              in {formatCount(row.inputTokens ?? 0)} · out {formatCount(row.outputTokens ?? 0)}
+              {`in ${formatCount(row.inputTokens ?? 0)} · out ${formatCount(row.outputTokens ?? 0)}`}
+              {subOutput > 0 ? ` · sub out ${formatCount(subOutput)}` : ''}
             </Text>
       )}
+          {descendants.map(childLine)}
           {row.kind === 'agent' && running && row.action !== undefined && (
             // A row cannot be split, so the strip's top and bottom edges are half blocks:
             // they read as half a row of space above and below a slightly taller strip.
@@ -464,7 +512,7 @@ export const register: Register = on => {
             Finished ({finished.length})
           </Button>
           {shownTab === 'finished' && finished.length > 0 && (
-            <Button key="clear" plain dimColor onPress={() => void update($, dispatches, rows => (rows ?? []).filter(isRunning))}>
+            <Button key="clear" plain dimColor onPress={() => void update($, dispatches, rows => dropFinishedTrees(rows ?? [], isRunning))}>
               clear
             </Button>
           )}

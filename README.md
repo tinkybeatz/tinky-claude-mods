@@ -54,7 +54,13 @@ the fullscreen layout. Elsewhere, open it with `/dispatches`.
 While the panel has focus, `a` and `f` switch tabs.
 
 In each tab, rows are grouped into an **Agents** section and a **Shells** section; click a
-section's header to collapse or expand it. An
+section's header to collapse or expand it.
+
+Only work the main thread started gets a card of its own. An agent or shell that a
+dispatched agent started is listed inside that agent's card as an indented line (`├` and
+`└`, one step deeper per level), with its own status mark, activity tag (`[shell]` for a
+shell) and duration. The card stays in Active while anything in it still runs, and its
+token line adds `sub out`, the output tokens of every agent listed inside it. An
 agent counts as finished once it hands back its result (the engine marks it `idle`),
 and returns to Active if a message wakes it again. A teammate that is `idle` is waiting
 for a message, not done, so it stays in Active with a `◌` mark.

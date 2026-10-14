@@ -341,3 +341,63 @@ test('rows are grouped into Agents and Shells sections', async ($, on) => {
   await pane.press({ key: 'section-agent' })
   expect(await pane.find({ text: 'Build it' })).toBeDefined()
 })
+
+test("what a dispatched agent starts is listed inside its card, and the card stays active while any of it runs", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.store(on)
+  const statuses: Record<string, 'running' | 'idle'> = { lead: 'running', helper: 'running' }
+  on('agent.list', () => ({
+    value: [
+      { id: 'lead', description: 'Research realtime collaboration', type: 'general-purpose', status: statuses.lead },
+      { id: 'helper', description: 'Compare CRDT libraries', type: 'Explore', status: statuses.helper, parentId: 'lead' },
+    ],
+  }))
+  on('model.classify', () => ({ value: 'searching or researching' }))
+  on('command.register', () => ({ value: {} }) as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('session.start', (_$, e) => e as never)
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'shell-h' },
+  }))
+
+  await $.session.start({ cwd: '/tmp' } as Parameters<typeof $.session.start>[0])
+  await $.tool.call({
+    tool: 'Bash',
+    tool_use_id: 'use-h',
+    command: 'npm view yjs',
+    description: 'Look up yjs',
+    run_in_background: true,
+    agentId: 'helper',
+  })
+  await clock.advance(3000)
+
+  const pane = await mountPane($)
+  expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: '▾ Agents (1)' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: '▾ Shells (1)' })).toBeUndefined()
+  expect(await pane.find({ text: 'Compare CRDT libraries' })).toBeDefined()
+  expect(await pane.find({ text: 'Look up yjs' })).toBeDefined()
+  expect(await pane.find({ text: '[shell]' })).toBeDefined()
+  expect(await pane.find({ text: '  └' })).toBeDefined()
+
+  statuses.lead = 'idle'
+  await clock.advance(1000)
+  expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
+
+  statuses.helper = 'idle'
+  await $.session.append({
+    door: 'delivery',
+    origin: { kind: 'engine' },
+    uuid: 'row-h',
+    agentId: 'helper',
+    message: {
+      type: 'user',
+      role: 'user',
+      content: [{ type: 'text', text: '<task-notification>\n<task-id>shell-h</task-id>\n<status>completed</status>\n</task-notification>' }],
+    },
+  } as unknown as Parameters<typeof $.session.append>[0])
+  await clock.advance(1000)
+  expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
+  expect(await pane.find({ type: 'Button', text: 'Finished (1)' })).toBeDefined()
+})

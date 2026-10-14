@@ -24,6 +24,8 @@ export type Dispatch = {
   isClassified?: boolean
   /** What a running agent is doing right now ("reading register.tsx", "committing"). */
   action?: string
+  /** The agent that started this agent or shell; absent when the main thread did. */
+  parentId?: string
 }
 
 declare module 'claude-code' {

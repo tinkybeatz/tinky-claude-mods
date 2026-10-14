@@ -45,3 +45,8 @@ entries at the bottom.
   main thread, and the panel reads it to show each agent's current action. The
   shell guard hook blocks any Bash command whose text contains `gh pr create`, test
   data included, so a test spells that text as `['gh', 'pr', 'create'].join(' ')`.
+- **Each agent and shell knows who started it.** `agent.spawn` carries
+  `parentAgentId`, `$.agent.list()` gives `parentId`, and a Bash `tool.call` carries
+  the caller's `agentId`. Each is absent when the main thread started the work.
+  `dispatch-panel` uses them to list a dispatched agent's own agents and shells
+  inside its card.
