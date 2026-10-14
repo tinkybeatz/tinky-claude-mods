@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { AgentInfo, EngineInterface, Register } from 'claude-code'
 
 import type { Dispatch, DispatchKind, DispatchTab } from '../types'
 import { THINKING, describeAction } from './actions'
@@ -16,10 +16,18 @@ const ACTION_BACKGROUND = '#3a3a3a'
 const WIDTH_SHARE = 2 / 3
 const MIN_COLUMNS = 24
 const COLUMNS_KEY = 'columns'
-// `idle` is how the engine leaves an agent that handed back its result: it could be
-// woken again, but it is doing nothing, so the panel counts it as finished. If a
-// message wakes it, its status turns back to running and its row returns to Active.
-const ENDED = new Set(['completed', 'failed', 'killed', 'done', 'idle'])
+const ENDED = new Set(['completed', 'failed', 'killed', 'done'])
+
+/**
+ * The panel's status for an agent the engine lists. A subagent that handed back its
+ * result is left `idle`: it could be woken again, but its work is done, so it counts as
+ * finished, and a message that wakes it turns it back to running. A teammate that is
+ * `idle` is waiting for a message, not done, so it keeps `idle` and stays in Active.
+ */
+const panelStatus = (agent: AgentInfo) => {
+  const isTeammate = agent.teammateId !== undefined || agent.type === 'teammate'
+  return agent.status === 'idle' && !isTeammate ? 'done' : agent.status
+}
 
 const dispatches = atom({ plugin: 'dispatch-panel', key: 'dispatches' } as const, [])
 const now = atom({ plugin: 'dispatch-panel', key: 'now' } as const, 0)
@@ -93,6 +101,7 @@ const formatDuration = (ms: number) => {
 const statusMark = (status: string) => {
   if (status === 'failed') return '✗'
   if (status === 'killed') return '■'
+  if (status === 'idle' || status === 'waiting') return '◌'
   if (ENDED.has(status)) return '✓'
   return '●'
 }
@@ -101,23 +110,24 @@ const statusMark = (status: string) => {
 const syncAgents = async ($: EngineInterface, at: number) => {
   const agents = await $.agent.list()
   for (const agent of agents) {
+    const status = panelStatus(agent)
     await upsert($, agent.id, row => {
       if (row === undefined) {
-        if (ENDED.has(agent.status)) return undefined
+        if (ENDED.has(status)) return undefined
         return {
           id: agent.id,
           kind: 'agent',
           label: agent.type,
           purpose: agent.description,
-          status: agent.status,
+          status,
           startedAt: at,
         }
       }
-      if (row.status === agent.status) return undefined
-      const hasEnded = ENDED.has(agent.status)
+      if (row.status === status) return undefined
+      const hasEnded = ENDED.has(status)
       return {
         ...row,
-        status: agent.status,
+        status,
         endedAt: hasEnded ? (row.endedAt ?? at) : undefined,
       }
     })

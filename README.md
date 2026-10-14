@@ -56,7 +56,8 @@ While the panel has focus, `a` and `f` switch tabs.
 In each tab, rows are grouped into an **Agents** section and a **Shells** section; click a
 section's header to collapse or expand it. An
 agent counts as finished once it hands back its result (the engine marks it `idle`),
-and returns to Active if a message wakes it again.
+and returns to Active if a message wakes it again. A teammate that is `idle` is waiting
+for a message, not done, so it stays in Active with a `◌` mark.
 
 Each row shows the agent type (or `bash` for a shell), its purpose, how long it has run, and
 for agents `in` (the input tokens of its latest request, so its context now, cache included)

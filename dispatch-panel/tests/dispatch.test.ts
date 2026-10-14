@@ -283,6 +283,30 @@ test('an agent that hands back and goes idle is finished, and returns to active 
   expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
 })
 
+test('an idle teammate is waiting for a message, so it stays active', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.store(on)
+  const teammate = {
+    id: 'mate-1',
+    teammateId: 'researcher@team',
+    description: 'Research the API',
+    type: 'teammate',
+    status: 'idle' as const,
+  }
+  on('agent.list', () => ({ value: [teammate] }))
+  on('model.classify', () => ({ value: 'searching or researching' }))
+  on('command.register', () => ({ value: {} }) as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('session.start', (_$, e) => e as never)
+
+  await $.session.start({ cwd: '/tmp' } as Parameters<typeof $.session.start>[0])
+  await clock.advance(1000)
+  const pane = await mountPane($)
+  expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
+  expect(await pane.find({ text: '◌' })).toBeDefined()
+})
+
 test('rows are grouped into Agents and Shells sections', async ($, on) => {
   mock.clock(on, { now: 1_000_000 })
   on('agent.spawn', () => ({ model: 'test-model', agentId: 'agent-s' }))
