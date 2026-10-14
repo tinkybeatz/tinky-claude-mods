@@ -28,6 +28,13 @@ export type Dispatch = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'dispatch-panel': { dispatches: Dispatch[]; now: number; tab: DispatchTab; isSized: boolean }
+    'dispatch-panel': {
+      dispatches: Dispatch[]
+      now: number
+      tab: DispatchTab
+      isSized: boolean
+      /** Which sections the person collapsed, by kind. */
+      collapsed: Record<DispatchKind, boolean>
+    }
   }
 }

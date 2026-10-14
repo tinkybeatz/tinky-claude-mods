@@ -256,3 +256,57 @@ test("a shell's completion notification ends its row with the status it reports"
   expect(await pane.find({ text: '✓' })).toBeDefined()
   expect(await pane.find({ text: '✗' })).toBeDefined()
 })
+
+test('an agent that hands back and goes idle is finished, and returns to active if woken', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  mock.store(on)
+  let status: 'running' | 'idle' = 'running'
+  on('agent.list', () => ({ value: [{ id: 'agent-z', description: 'Build PROD-4888', type: 'dev', status }] }))
+  on('model.classify', () => ({ value: 'writing or changing code' }))
+  on('command.register', () => ({ value: {} }) as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('session.start', (_$, e) => e as never)
+
+  await $.session.start({ cwd: '/tmp' } as Parameters<typeof $.session.start>[0])
+  await clock.advance(1000)
+  const pane = await mountPane($)
+  expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
+
+  status = 'idle'
+  await clock.advance(1000)
+  expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
+  expect(await pane.find({ type: 'Button', text: 'Finished (1)' })).toBeDefined()
+
+  status = 'running'
+  await clock.advance(1000)
+  expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
+})
+
+test('rows are grouped into Agents and Shells sections', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  on('agent.spawn', () => ({ model: 'test-model', agentId: 'agent-s' }))
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'shell-s' },
+  }))
+
+  await $.agent.spawn({
+    tool_use_id: 'use-s',
+    prompt: 'Build it',
+    description: 'Build it',
+    subagentType: 'dev',
+  } as Parameters<typeof $.agent.spawn>[0])
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'use-t', command: 'npm run dev', run_in_background: true })
+
+  const pane = await mountPane($)
+  expect(await pane.find({ type: 'Text', text: '▾ Agents (1)' })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: '▾ Shells (1)' })).toBeDefined()
+
+  await pane.press({ key: 'section-agent' })
+  expect(await pane.find({ type: 'Text', text: '▸ Agents (1)' })).toBeDefined()
+  expect(await pane.find({ text: 'Build it' })).toBeUndefined()
+  expect(await pane.find({ text: 'npm run dev' })).toBeDefined()
+
+  await pane.press({ key: 'section-agent' })
+  expect(await pane.find({ text: 'Build it' })).toBeDefined()
+})

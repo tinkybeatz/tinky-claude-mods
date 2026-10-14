@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Dispatch, DispatchTab } from '../types'
+import type { Dispatch, DispatchKind, DispatchTab } from '../types'
 import { THINKING, describeAction } from './actions'
 import { ACTIVITY_LABELS, FAILED_MARK_COLOR, activityColor } from './kinds'
 
@@ -16,12 +16,16 @@ const ACTION_BACKGROUND = '#3a3a3a'
 const WIDTH_SHARE = 2 / 3
 const MIN_COLUMNS = 24
 const COLUMNS_KEY = 'columns'
-const ENDED = new Set(['completed', 'failed', 'killed', 'done'])
+// `idle` is how the engine leaves an agent that handed back its result: it could be
+// woken again, but it is doing nothing, so the panel counts it as finished. If a
+// message wakes it, its status turns back to running and its row returns to Active.
+const ENDED = new Set(['completed', 'failed', 'killed', 'done', 'idle'])
 
 const dispatches = atom({ plugin: 'dispatch-panel', key: 'dispatches' } as const, [])
 const now = atom({ plugin: 'dispatch-panel', key: 'now' } as const, 0)
 const tab = atom({ plugin: 'dispatch-panel', key: 'tab' } as const, 'active' as DispatchTab)
 const isSized = atom({ plugin: 'dispatch-panel', key: 'isSized' } as const, false)
+const collapsed = atom({ plugin: 'dispatch-panel', key: 'collapsed' } as const, { agent: false, shell: false } as Record<DispatchKind, boolean>)
 
 /** The docked pane's width as last drawn; the render hook records it, since no `$` call reports it. */
 let measuredColumns: number | undefined
@@ -351,6 +355,69 @@ export const register: Register = on => {
     // Terminal spacing is in cells, not pixels: a cell is about 10px wide and 20px tall,
     // so OUTER (about 20px) is 2 columns or 1 row, and INNER (about 10px) is 1 column.
     // Half a row does not exist, so the gap between rows (about 10px asked) is 0 rows.
+    const card = (row: Dispatch) => {
+      const running = isRunning(row)
+      const elapsed = (row.endedAt ?? Math.max(at, row.startedAt)) - row.startedAt
+      const color = activityColor(row)
+      const markColor = row.status === 'failed' ? FAILED_MARK_COLOR : color
+      return (
+        <Box
+          key={row.id}
+          flexDirection="column"
+          borderStyle="round"
+          borderColor={color}
+          borderDimColor={!running}
+          paddingX={INNER_X}
+          marginBottom={ROW_GAP}
+        >
+          <Box flexDirection="row" justifyContent="space-between">
+            <Text wrap="truncate-end" dimColor={!running}>
+              <Text color={markColor}>{statusMark(row.status)}</Text>{' '}
+              <Text color={color} bold={running}>
+                {row.label}
+              </Text>
+            </Text>
+            <Text dimColor={!running}>{formatDuration(elapsed)}</Text>
+          </Box>
+          <Text dimColor italic wrap="truncate-end">
+            {row.purpose}
+          </Text>
+          {row.kind === 'agent' && (
+            <Text dimColor wrap="truncate-end">
+              in {formatCount(row.inputTokens ?? 0)} · out {formatCount(row.outputTokens ?? 0)}
+            </Text>
+      )}
+          {row.kind === 'agent' && running && row.action !== undefined && (
+            // A row cannot be split, so the strip's top and bottom edges are half blocks:
+            // they read as half a row of space above and below a slightly taller strip.
+            <Box flexDirection="column" width={stripColumns}>
+              <Text color={ACTION_BACKGROUND}>{'▄'.repeat(stripColumns)}</Text>
+              <Box backgroundColor={ACTION_BACKGROUND} paddingX={INNER_X}>
+                <Text wrap="truncate-end">
+                  <Text color={color}>▸ </Text>
+                  {row.action}
+                </Text>
+              </Box>
+              <Text color={ACTION_BACKGROUND}>{'▀'.repeat(stripColumns)}</Text>
+            </Box>
+      )}
+        </Box>
+      )
+    }
+
+    const folded = (await read($, collapsed)) ?? { agent: false, shell: false }
+    const sections = (
+      [
+        { kind: 'agent', title: 'Agents', rows: shown.filter(row => row.kind === 'agent') },
+        { kind: 'shell', title: 'Shells', rows: shown.filter(row => row.kind === 'shell') },
+      ] as const
+    ).filter(section => section.rows.length > 0)
+    const toggle = (kind: DispatchKind) => () =>
+      void update($, collapsed, state => {
+        const current = state ?? { agent: false, shell: false }
+        return { ...current, [kind]: !current[kind] }
+      })
+
     return (
       <Box flexDirection="column" width={width} paddingX={OUTER_X} paddingY={OUTER_Y}>
         <Box flexDirection="row" gap={OUTER_X} marginBottom={OUTER_Y}>
@@ -379,55 +446,16 @@ export const register: Register = on => {
         {shown.length === 0 && (
           <Text dimColor>{shownTab === 'active' ? 'Nothing running.' : 'Nothing finished yet.'}</Text>
         )}
-        {shown.map(row => {
-          const running = isRunning(row)
-          const elapsed = (row.endedAt ?? Math.max(at, row.startedAt)) - row.startedAt
-          const color = activityColor(row)
-          const markColor = row.status === 'failed' ? FAILED_MARK_COLOR : color
-          return (
-            <Box
-              key={row.id}
-              flexDirection="column"
-              borderStyle="round"
-              borderColor={color}
-              borderDimColor={!running}
-              paddingX={INNER_X}
-              marginBottom={ROW_GAP}
-            >
-              <Box flexDirection="row" justifyContent="space-between">
-                <Text wrap="truncate-end" dimColor={!running}>
-                  <Text color={markColor}>{statusMark(row.status)}</Text>{' '}
-                  <Text color={color} bold={running}>
-                    {row.label}
-                  </Text>
-                </Text>
-                <Text dimColor={!running}>{formatDuration(elapsed)}</Text>
-              </Box>
-              <Text dimColor italic wrap="truncate-end">
-                {row.purpose}
+        {sections.map(section => (
+          <Box key={section.title} flexDirection="column" marginBottom={OUTER_Y}>
+            <Button key={`section-${section.kind}`} plain onPress={toggle(section.kind)}>
+              <Text dimColor bold>
+                {folded[section.kind] ? '▸' : '▾'} {section.title} ({section.rows.length})
               </Text>
-              {row.kind === 'agent' && (
-                <Text dimColor wrap="truncate-end">
-                  in {formatCount(row.inputTokens ?? 0)} · out {formatCount(row.outputTokens ?? 0)}
-                </Text>
-              )}
-              {row.kind === 'agent' && running && row.action !== undefined && (
-                // A row cannot be split, so the strip's top and bottom edges are half blocks:
-                // they read as half a row of space above and below a slightly taller strip.
-                <Box flexDirection="column" width={stripColumns}>
-                  <Text color={ACTION_BACKGROUND}>{'▄'.repeat(stripColumns)}</Text>
-                  <Box backgroundColor={ACTION_BACKGROUND} paddingX={INNER_X}>
-                    <Text wrap="truncate-end">
-                      <Text color={color}>▸ </Text>
-                      {row.action}
-                    </Text>
-                  </Box>
-                  <Text color={ACTION_BACKGROUND}>{'▀'.repeat(stripColumns)}</Text>
-                </Box>
-              )}
-            </Box>
-          )
-        })}
+            </Button>
+            {!folded[section.kind] && section.rows.map(card)}
+          </Box>
+        ))}
       </Box>
     )
   })
