@@ -3,7 +3,7 @@ import type { AgentInfo, EngineInterface, Register } from 'claude-code'
 
 import type { Dispatch, DispatchKind, DispatchTab } from '../types'
 import { THINKING, describeAction } from './actions'
-import { ACTIVITY_LABELS, FAILED_MARK_COLOR, activityColor } from './kinds'
+import { ACTIVITY_LABELS, FAILED_MARK_COLOR, activityColor, activityTag } from './kinds'
 
 const PANE = 'dispatches'
 const TITLE = 'Dispatched'
@@ -16,6 +16,9 @@ const ACTION_BACKGROUND = '#3a3a3a'
 const WIDTH_SHARE = 2 / 3
 const MIN_COLUMNS = 24
 const COLUMNS_KEY = 'columns'
+/** Catch-all agent types: the card's subtitle names an agent's type only when it is not one of these. */
+const GENERIC_TYPES = new Set(['general-purpose', 'claude', 'agent'])
+
 const ENDED = new Set(['completed', 'failed', 'killed', 'done'])
 
 /**
@@ -369,6 +372,7 @@ export const register: Register = on => {
       const running = isRunning(row)
       const elapsed = (row.endedAt ?? Math.max(at, row.startedAt)) - row.startedAt
       const color = activityColor(row)
+      const tag = activityTag(row)
       const markColor = row.status === 'failed' ? FAILED_MARK_COLOR : color
       return (
         <Box
@@ -380,18 +384,30 @@ export const register: Register = on => {
           paddingX={INNER_X}
           marginBottom={ROW_GAP}
         >
-          <Box flexDirection="row" justifyContent="space-between">
-            <Text wrap="truncate-end" dimColor={!running}>
-              <Text color={markColor}>{statusMark(row.status)}</Text>{' '}
-              <Text color={color} bold={running}>
-                {row.label}
-              </Text>
+          <Box flexDirection="row" gap={1}>
+            <Text color={markColor} dimColor={!running}>
+              {statusMark(row.status)}
             </Text>
-            <Text dimColor={!running}>{formatDuration(elapsed)}</Text>
+            <Box flexShrink={1}>
+              <Text color={color} bold={running} dimColor={!running} wrap="truncate-end">
+                {row.purpose || row.label}
+              </Text>
+            </Box>
+            {tag !== undefined && (
+              <Box flexShrink={0}>
+                <Text color={color} dimColor={!running}>{`[${tag}]`}</Text>
+              </Box>
+            )}
+            <Box flexGrow={1} />
+            <Box flexShrink={0}>
+              <Text dimColor={!running}>{formatDuration(elapsed)}</Text>
+            </Box>
           </Box>
-          <Text dimColor italic wrap="truncate-end">
-            {row.purpose}
-          </Text>
+          {row.kind === 'agent' && !GENERIC_TYPES.has(row.label) && (
+            <Text dimColor italic wrap="truncate-end">
+              {row.label}
+            </Text>
+          )}
           {row.kind === 'agent' && (
             <Text dimColor wrap="truncate-end">
               in {formatCount(row.inputTokens ?? 0)} · out {formatCount(row.outputTokens ?? 0)}

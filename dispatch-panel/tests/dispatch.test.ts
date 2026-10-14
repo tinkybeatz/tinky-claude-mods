@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
 import { describeAction } from '../hooks/actions'
-import { ACTIVITIES, NEUTRAL_COLOR, activityColor } from '../hooks/kinds'
+import { ACTIVITIES, NEUTRAL_COLOR, activityColor, activityTag } from '../hooks/kinds'
 import type { Dispatch } from '../types'
 
 const PANE_PROPS = {
@@ -101,6 +101,7 @@ test('an agent row shows its latest input tokens and its summed output tokens', 
   const pane = await mountPane($)
   expect(await pane.find({ text: 'Review the diff' })).toBeDefined()
   expect(await pane.find({ text: 'in 1.8k · out 300' })).toBeDefined()
+  expect(await pane.find({ text: 'test' })).toBeDefined()
 })
 
 test('an agent is coloured by the activity the classifier picks, not by its type', async ($, on) => {
@@ -144,6 +145,9 @@ test('an agent is coloured by the activity the classifier picks, not by its type
   const drawn = JSON.stringify(await pane.drawn())
   expect(drawn).toContain('#3b82f6')
   expect(drawn).toContain('#22d3ee')
+  expect(drawn).toContain('[code]')
+  expect(drawn).toContain('[jira]')
+  expect(await pane.find({ text: 'general-purpose' })).toBeUndefined()
 })
 
 const row = (id: string): Dispatch => ({ id, kind: 'agent', label: 'general-purpose', purpose: '', status: 'running', startedAt: 0 })
@@ -153,6 +157,9 @@ test('every activity has its own colour, and unclassified agents and shells are 
   expect(new Set(colors).size).toBe(colors.length)
   expect(activityColor(row('x'))).toBe(NEUTRAL_COLOR)
   expect(activityColor({ ...row('s'), kind: 'shell' })).toBe(NEUTRAL_COLOR)
+  const tags = ACTIVITIES.map(activity => activity.tag)
+  expect(new Set(tags).size).toBe(tags.length)
+  expect(activityTag(row('x'))).toBeUndefined()
 })
 
 test('tool calls become short action phrases', () => {
