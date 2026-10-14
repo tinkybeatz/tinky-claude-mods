@@ -342,7 +342,7 @@ test('rows are grouped into Agents and Shells sections', async ($, on) => {
   expect(await pane.find({ text: 'Build it' })).toBeDefined()
 })
 
-test("what a dispatched agent starts is listed inside its card, and the card stays active while any of it runs", async ($, on) => {
+test("what a dispatched agent starts is listed inside its card, stays active while any of it runs, and a stopped agent's shells stop with it", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.store(on)
   const statuses: Record<string, 'running' | 'idle'> = { lead: 'running', helper: 'running' }
@@ -385,21 +385,12 @@ test("what a dispatched agent starts is listed inside its card, and the card sta
   await clock.advance(1000)
   expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
 
-  statuses.helper = 'idle'
-  await $.session.append({
-    door: 'delivery',
-    origin: { kind: 'engine' },
-    uuid: 'row-h',
-    agentId: 'helper',
-    message: {
-      type: 'user',
-      role: 'user',
-      content: [{ type: 'text', text: '<task-notification>\n<task-id>shell-h</task-id>\n<status>completed</status>\n</task-notification>' }],
-    },
-  } as unknown as Parameters<typeof $.session.append>[0])
+  statuses.helper = 'killed' as never
   await clock.advance(1000)
   expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
-  expect(await pane.find({ type: 'Button', text: 'Finished (1)' })).toBeDefined()
+  await pane.press({ key: 'tab-finished' })
+  expect(await pane.find({ text: '■' })).toBeDefined()
+
 })
 
 test("the footer draws a bar for each of the account's rate-limit windows", async ($, on) => {
@@ -430,4 +421,23 @@ test("the footer draws a bar for each of the account's rate-limit windows", asyn
   expect(await pane.find({ text: 'Week' })).toBeDefined()
   expect(await pane.find({ text: '· resets in 3d04h' })).toBeDefined()
   expect(JSON.stringify(await pane.drawn())).toContain('#ef4444')
+})
+
+test('a shell that ends between turns is finished as soon as its notification is queued', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'shell-q' },
+  }))
+  on('session.receive', (_$, e) => ({ text: e.text }) as never)
+
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'use-q', command: 'npm run build', run_in_background: true })
+  const pane = await mountPane($)
+  expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
+
+  await $.session.receive({
+    origin: { kind: 'task-notification' },
+    text: '<task-notification>\n<task-id>shell-q</task-id>\n<status>completed</status>\n<summary>Background command "npm run build" completed (exit code 0)</summary>\n</task-notification>',
+  } as unknown as Parameters<typeof $.session.receive>[0])
+  expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
+  expect(await pane.find({ type: 'Button', text: 'Finished (1)' })).toBeDefined()
 })

@@ -68,6 +68,22 @@ const upsert = ($: EngineInterface, id: string, patch: (row: Dispatch | undefine
     return rows.map(row => (row.id === id ? next : row))
   })
 
+/** Ends each tracked row a task notification in `raw` reports on, with the status it reports. */
+const applyNotifications = async ($: EngineInterface, raw: string) => {
+  if (!raw.includes('<task-notification>')) return
+  const at = await $.clock.now()
+  for (const match of raw.matchAll(TASK_NOTIFICATION)) {
+    const [, id, status] = match
+    if (id === undefined || status === undefined) continue
+    const ended = NOTIFIED_STATUS[status] ?? 'done'
+    await upsert($, id, row =>
+      row === undefined || (!isRunning(row) && row.status !== 'done')
+        ? undefined
+        : { ...row, status: ended, endedAt: row.endedAt ?? at },
+    )
+  }
+}
+
 const formatCount = (count: number) => {
   if (count < 1000) return `${count}`
   if (count < 1_000_000) return `${(count / 1000).toFixed(1)}k`
@@ -181,6 +197,22 @@ const syncAgents = async ($: EngineInterface, at: number) => {
 }
 
 /**
+ * Ends the running shells of an agent that has ended. Such a shell sends its completion
+ * notice to its owner's queue, which nobody reads once the owner is done or stopped, so
+ * without this its row stays active forever. A stopped owner's shells show as stopped.
+ */
+const endOrphanShells = async ($: EngineInterface, at: number) =>
+  update($, dispatches, list => {
+    const rows = list ?? []
+    const byId = new Map(rows.map(row => [row.id, row]))
+    return rows.map(row => {
+      const owner = row.parentId === undefined ? undefined : byId.get(row.parentId)
+      if (row.kind !== 'shell' || !isRunning(row) || owner === undefined || isRunning(owner)) return row
+      return { ...row, status: owner.status === 'killed' ? 'killed' : 'done', endedAt: owner.endedAt ?? at }
+    })
+  })
+
+/**
  * Classifies one agent's activity per tick, outside any hook's dispatch, so a slow
  * model call never holds up a spawn. A failed call settles on 'something else'.
  */
@@ -206,6 +238,7 @@ const classifyNext = async ($: EngineInterface) => {
 const tick = async ($: EngineInterface) => {
   const at = await $.clock.now()
   await syncAgents($, at)
+  await endOrphanShells($, at)
   await classifyNext($)
   await fitWidth($)
   await syncLimits($).catch(() => undefined)
@@ -342,25 +375,24 @@ export const register: Register = on => {
   })
 
   /**
-   * Every finished background task writes a notification row into its owner's
-   * conversation, a subagent's included, carrying the task's id and final status.
-   * It is the one signal that reaches the panel for a shell a subagent started.
+   * Every finished background task sends a notification to its owner, a subagent
+   * included, carrying the task's id and final status. It is the one signal that
+   * reaches the panel for a shell a subagent started.
+   *
+   * It reaches the session twice: `session.receive` when it is queued, the moment
+   * the task ends, and `session.append` once it becomes a row of the conversation.
+   * Between the person's turns the main thread's notifications wait in the queue
+   * until the next turn, and some are folded into that turn without a row of their
+   * own, so the queue is where a shell that ends between turns is seen.
    */
+  on('session.receive', async ($, e, next) => {
+    await applyNotifications($, e.text)
+    return next(e)
+  })
+
   on('session.append', async ($, e, next) => {
     const appended = await next(e)
-    const raw = JSON.stringify(e.message.content)
-    if (!raw.includes('<task-notification>')) return appended
-    const at = await $.clock.now()
-    for (const match of raw.matchAll(TASK_NOTIFICATION)) {
-      const [, id, status] = match
-      if (id === undefined || status === undefined) continue
-      const ended = NOTIFIED_STATUS[status] ?? 'done'
-      await upsert($, id, row =>
-        row === undefined || (!isRunning(row) && row.status !== 'done')
-          ? undefined
-          : { ...row, status: ended, endedAt: row.endedAt ?? at },
-      )
-    }
+    await applyNotifications($, JSON.stringify(e.message.content))
     return appended
   })
 

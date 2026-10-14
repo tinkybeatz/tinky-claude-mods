@@ -50,3 +50,10 @@ entries at the bottom.
   the caller's `agentId`. Each is absent when the main thread started the work.
   `dispatch-panel` uses them to list a dispatched agent's own agents and shells
   inside its card.
+- **A finished shell's notice is queued before it is a row.** Between the person's
+  turns, the main thread's task notifications wait in the queue
+  (`queue-operation` in the transcript) until the next turn. Some are folded into
+  that turn without a row of their own, so `session.append` alone misses them.
+  `session.receive` sees a delivery as it is queued. A shell whose owning agent has
+  ended sends its notice to a queue nobody reads, so `dispatch-panel` ends such a
+  shell together with its owner.
