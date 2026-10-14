@@ -64,7 +64,7 @@ test('a foreground Bash call is not listed', async ($, on) => {
   expect(await pane.find({ text: 'Nothing running.' })).toBeDefined()
 })
 
-test('an agent row shows its latest input tokens and its summed output tokens', async ($, on) => {
+test('an agent row sums its input and output tokens across requests', async ($, on) => {
   mock.clock(on, { now: 1_000_000 })
   on('agent.spawn', () => ({ model: 'test-model', agentId: 'agent-1' }))
   on('turn.step', async function* (_$, e) {
@@ -100,7 +100,7 @@ test('an agent row shows its latest input tokens and its summed output tokens', 
 
   const pane = await mountPane($)
   expect(await pane.find({ text: 'Review the diff' })).toBeDefined()
-  expect(await pane.find({ text: 'in 1.8k · out 300' })).toBeDefined()
+  expect(await pane.find({ text: 'in 3.3k · out 300' })).toBeDefined()
   expect(await pane.find({ text: 'test' })).toBeDefined()
 })
 
@@ -400,4 +400,34 @@ test("what a dispatched agent starts is listed inside its card, and the card sta
   await clock.advance(1000)
   expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
   expect(await pane.find({ type: 'Button', text: 'Finished (1)' })).toBeDefined()
+})
+
+test("the footer draws a bar for each of the account's rate-limit windows", async ($, on) => {
+  const clock = mock.clock(on, { now: Date.parse('2026-10-14T12:00:00Z') })
+  mock.store(on)
+  on('agent.list', () => ({ value: [] }))
+  on('command.register', () => ({ value: {} }) as never)
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('ui.panes', () => ({ value: [] }))
+  on('session.start', (_$, e) => e as never)
+  on('session.usage', () => ({
+    value: {
+      startedAt: 0,
+      context: {},
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: 62.4, resetsAt: '2026-10-14T14:14:00Z' },
+        { kind: 'seven_day', percentUsed: 93, resetsAt: '2026-10-17T16:00:00Z' },
+      ],
+    },
+  }) as never)
+
+  await $.session.start({ cwd: '/tmp' } as Parameters<typeof $.session.start>[0])
+  await clock.advance(1000)
+  const pane = await mountPane($)
+  expect(await pane.find({ text: 'Session (5h)' })).toBeDefined()
+  expect(await pane.find({ text: '62%' })).toBeDefined()
+  expect(await pane.find({ text: '· resets in 2h14m' })).toBeDefined()
+  expect(await pane.find({ text: 'Week' })).toBeDefined()
+  expect(await pane.find({ text: '· resets in 3d04h' })).toBeDefined()
+  expect(JSON.stringify(await pane.drawn())).toContain('#ef4444')
 })

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register } from 'claude-code'
 
-import type { Dispatch, DispatchKind, DispatchTab } from '../types'
+import type { Dispatch, DispatchKind, DispatchTab, UsageLimit } from '../types'
 import { THINKING, describeAction } from './actions'
 import { ACTIVITY_LABELS, FAILED_MARK_COLOR, activityColor, activityTag } from './kinds'
 import { buildTree, descendantsOf, dropFinishedTrees, liveRootIds } from './tree'
@@ -18,6 +18,11 @@ const ACTION_BACKGROUND = '#3a3a3a'
 const WIDTH_SHARE = 2 / 3
 const MIN_COLUMNS = 24
 const COLUMNS_KEY = 'columns'
+/** The footer's name for each rate-limit window; any other kind shows its own name. */
+const LIMIT_NAMES: Readonly<Record<string, string>> = { five_hour: 'Session (5h)', seven_day: 'Week', spend_limit: 'Spend' }
+const LIMIT_EMPTY_COLOR = '#3a3a3a'
+/** A bar turns yellow, then red, as its window fills. */
+const limitColor = (percent: number) => (percent >= 90 ? '#ef4444' : percent >= 70 ? '#facc15' : '#22c55e')
 /** Catch-all agent types: the card's subtitle names an agent's type only when it is not one of these. */
 const GENERIC_TYPES = new Set(['general-purpose', 'claude', 'agent'])
 
@@ -38,6 +43,7 @@ const dispatches = atom({ plugin: 'dispatch-panel', key: 'dispatches' } as const
 const now = atom({ plugin: 'dispatch-panel', key: 'now' } as const, 0)
 const tab = atom({ plugin: 'dispatch-panel', key: 'tab' } as const, 'active' as DispatchTab)
 const isSized = atom({ plugin: 'dispatch-panel', key: 'isSized' } as const, false)
+const limits = atom({ plugin: 'dispatch-panel', key: 'limits' } as const, [] as UsageLimit[])
 const collapsed = atom({ plugin: 'dispatch-panel', key: 'collapsed' } as const, { agent: false, shell: false } as Record<DispatchKind, boolean>)
 
 /** The docked pane's width as last drawn; the render hook records it, since no `$` call reports it. */
@@ -101,6 +107,30 @@ const formatDuration = (ms: number) => {
   if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`
   if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`
   return `${s}s`
+}
+
+/** Time left until an ISO timestamp, as `2h14m` or `3d04h`; empty when unknown or past. */
+const formatUntil = (iso: string | undefined, at: number) => {
+  const resets = iso === undefined ? Number.NaN : Date.parse(iso)
+  if (Number.isNaN(resets) || resets <= at) return ''
+  const minutes = Math.ceil((resets - at) / 60_000)
+  const d = Math.floor(minutes / 1440)
+  const h = Math.floor((minutes % 1440) / 60)
+  const m = minutes % 60
+  if (d > 0) return `${d}d${String(h).padStart(2, '0')}h`
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`
+  return `${m}m`
+}
+
+/**
+ * Reads the account's rate-limit windows, as the status line has them. The plain
+ * `$.session.usage()` call costs nothing; the atom is written only when a window moved.
+ */
+const syncLimits = async ($: EngineInterface) => {
+  const { rateLimits } = await $.session.usage()
+  const fresh = rateLimits.map(({ kind, percentUsed, resetsAt }) => ({ kind, percentUsed, resetsAt }))
+  const known = (await read($, limits)) ?? []
+  if (JSON.stringify(fresh) !== JSON.stringify(known)) await update($, limits, () => fresh)
 }
 
 const statusMark = (status: string) => {
@@ -178,6 +208,7 @@ const tick = async ($: EngineInterface) => {
   await syncAgents($, at)
   await classifyNext($)
   await fitWidth($)
+  await syncLimits($).catch(() => undefined)
   const list = (await read($, dispatches)) ?? []
   if (list.some(isRunning)) await update($, now, () => at)
 }
@@ -259,7 +290,11 @@ export const register: Register = on => {
       await upsert($, agentId, row =>
         row === undefined
           ? undefined
-          : { ...row, inputTokens, outputTokens: (row.outputTokens ?? 0) + usage.output_tokens },
+          : {
+              ...row,
+              inputTokens: (row.inputTokens ?? 0) + inputTokens,
+              outputTokens: (row.outputTokens ?? 0) + usage.output_tokens,
+            },
       )
     }
     return step
@@ -419,6 +454,7 @@ export const register: Register = on => {
       const tag = activityTag(row)
       const markColor = markColorOf(row)
       const descendants = descendantsOf(tree, row.id)
+      const subInput = descendants.reduce((sum, { row: child }) => sum + (child.inputTokens ?? 0), 0)
       const subOutput = descendants.reduce((sum, { row: child }) => sum + (child.outputTokens ?? 0), 0)
       return (
         <Box
@@ -457,7 +493,7 @@ export const register: Register = on => {
           {row.kind === 'agent' && (
             <Text dimColor wrap="truncate-end">
               {`in ${formatCount(row.inputTokens ?? 0)} · out ${formatCount(row.outputTokens ?? 0)}`}
-              {subOutput > 0 ? ` · sub out ${formatCount(subOutput)}` : ''}
+              {subInput + subOutput > 0 ? ` · sub in ${formatCount(subInput)} · out ${formatCount(subOutput)}` : ''}
             </Text>
       )}
           {descendants.map(childLine)}
@@ -492,8 +528,42 @@ export const register: Register = on => {
         return { ...current, [kind]: !current[kind] }
       })
 
+    // The footer: one bar per rate-limit window of the account, pinned to the pane's bottom
+    // while the rows fit, and following the rows when they scroll.
+    const windows = (await read($, limits)) ?? []
+    const footerColumns = Math.max(4, width - 2 * OUTER_X)
+    const limitBar = (limit: UsageLimit) => {
+      const percent = Math.max(0, Math.min(100, limit.percentUsed))
+      const filled = Math.round((percent / 100) * footerColumns)
+      const resets = formatUntil(limit.resetsAt, at)
+      return (
+        <Box key={limit.kind} flexDirection="column">
+          <Box flexDirection="row" gap={1}>
+            <Box flexShrink={1}>
+              <Text dimColor wrap="truncate-end">
+                {LIMIT_NAMES[limit.kind] ?? limit.kind.replace(/_/g, ' ')}
+              </Text>
+            </Box>
+            <Box flexGrow={1} />
+            <Text color={limitColor(percent)}>{`${Math.round(limit.percentUsed)}%`}</Text>
+            {resets !== '' && <Text dimColor>{`· resets in ${resets}`}</Text>}
+          </Box>
+          <Text>
+            <Text color={limitColor(percent)}>{'█'.repeat(filled)}</Text>
+            <Text color={LIMIT_EMPTY_COLOR}>{'█'.repeat(footerColumns - filled)}</Text>
+          </Text>
+        </Box>
+      )
+    }
+
     return (
-      <Box flexDirection="column" width={width} paddingX={OUTER_X} paddingY={OUTER_Y}>
+      <Box
+        flexDirection="column"
+        width={width}
+        minHeight={e.props.scroll.bodyRows}
+        paddingX={OUTER_X}
+        paddingY={OUTER_Y}
+      >
         <Box flexDirection="row" gap={OUTER_X} marginBottom={OUTER_Y}>
           <Button
             key="tab-active"
@@ -530,6 +600,13 @@ export const register: Register = on => {
             {!folded[section.kind] && section.rows.map(card)}
           </Box>
         ))}
+        {windows.length > 0 && <Box flexGrow={1} />}
+        {windows.length > 0 && (
+          <Box flexDirection="column">
+            <Text dimColor>{'─'.repeat(footerColumns)}</Text>
+            {windows.map(limitBar)}
+          </Box>
+        )}
       </Box>
     )
   })

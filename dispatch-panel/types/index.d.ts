@@ -12,7 +12,7 @@ export type Dispatch = {
   status: string
   startedAt: number
   endedAt?: number
-  /** Input tokens of the agent's latest request (its context now, cache included); absent for shells. */
+  /** Input tokens the agent has sent across all its requests, cache reads and writes included; absent for shells. */
   inputTokens?: number
   /** Output tokens the agent has generated across all its requests; absent for shells. */
   outputTokens?: number
@@ -28,6 +28,16 @@ export type Dispatch = {
   parentId?: string
 }
 
+/** One of the account's rate-limit windows, as the last API response reported it. */
+export type UsageLimit = {
+  /** `five_hour`, `seven_day`, or a gateway's `spend_limit`. */
+  kind: string
+  /** How much of the window is used, 0 to 100. */
+  percentUsed: number
+  /** When the window resets, as an ISO 8601 timestamp. */
+  resetsAt?: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'dispatch-panel': {
@@ -37,6 +47,8 @@ declare module 'claude-code' {
       isSized: boolean
       /** Which sections the person collapsed, by kind. */
       collapsed: Record<DispatchKind, boolean>
+      /** The account's rate-limit windows, drawn as bars in the footer; empty off a subscription. */
+      limits: UsageLimit[]
     }
   }
 }

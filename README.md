@@ -60,7 +60,7 @@ Only work the main thread started gets a card of its own. An agent or shell that
 dispatched agent started is listed inside that agent's card as an indented line (`├` and
 `└`, one step deeper per level), with its own status mark, activity tag (`[shell]` for a
 shell) and duration. The card stays in Active while anything in it still runs, and its
-token line adds `sub out`, the output tokens of every agent listed inside it. An
+token line adds `sub in` and `out`, the tokens of every agent listed inside it. An
 agent counts as finished once it hands back its result (the engine marks it `idle`),
 and returns to Active if a message wakes it again. A teammate that is `idle` is waiting
 for a message, not done, so it stays in Active with a `◌` mark.
@@ -68,8 +68,15 @@ for a message, not done, so it stays in Active with a `◌` mark.
 Each row's title is its purpose (the description the agent or shell was given), followed by
 its activity tag and how long it has run. Below it, an agent's type appears only when it is
 not a catch-all one (`general-purpose`, `claude`), such as `Explore` or `Plan`. Agents also
-show `in` (the input tokens of its latest request, so its context now, cache included)
-and `out` (all the output tokens it has generated).
+show what they have consumed: `in`, the input tokens of all their requests added up
+(cache reads and writes included, since each request sends the whole context again), and
+`out`, all the output tokens they have generated.
+
+The panel's footer shows the account's usage limits as bars, one per window the last
+API response reported (`Session (5h)`, `Week`, or a gateway's spend limit), each with
+the percentage used and the time until it resets. A bar is green, then yellow from 70%
+and red from 90%. Off a subscription, or before the first response, no window has a
+reading and the footer is hidden.
 
 A running agent's card ends with a strip naming what it is doing right now, read from
 its latest tool call: `reading register.tsx`, `running tests`, `committing`,
