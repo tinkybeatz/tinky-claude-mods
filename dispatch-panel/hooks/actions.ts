@@ -110,3 +110,14 @@ export const describeAction = (tool: string, input: Record<string, unknown>): st
 
 /** Shown between tool calls, while the agent's model is writing its next step. */
 export const THINKING = 'thinking'
+
+/**
+ * A background shell's title when its call gave no description: the action its command
+ * is recognised as ("checking a PR", "running tests"), else the command's first line.
+ * A raw loop such as `until [ "$(gh pr view 1233 ...` reads as noise in a card.
+ */
+export const shellTitle = (command: string) => {
+  const action = shellAction({ command })
+  if (!action.startsWith('running ') || action === 'running tests') return action.charAt(0).toUpperCase() + action.slice(1)
+  return command.split('\n')[0]?.trim() ?? ''
+}

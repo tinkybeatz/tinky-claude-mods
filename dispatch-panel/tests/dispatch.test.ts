@@ -1,8 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { describeAction } from '../hooks/actions'
-import { ACTIVITIES, NEUTRAL_COLOR, activityColor, activityTag } from '../hooks/kinds'
+import { describeAction, shellTitle } from '../hooks/actions'
+import { ACTIVITIES, NEUTRAL_COLOR, activityColor, activityFromDescription, activityTag } from '../hooks/kinds'
 import type { Dispatch } from '../types'
 
 const PANE_PROPS = {
@@ -104,7 +104,7 @@ test('an agent row sums its input and output tokens across requests', async ($, 
   expect(await pane.find({ text: 'test' })).toBeDefined()
 })
 
-test('an agent is coloured by the activity the classifier picks, not by its type', async ($, on) => {
+test('an agent is coloured by its activity: named outright by its description, or picked by the classifier', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const asked: string[] = []
   mock.store(on)
@@ -121,7 +121,8 @@ test('an agent is coloured by the activity the classifier picks, not by its type
   on('session.start', (_$, e) => e as never)
   on('model.classify', (_$, e) => {
     asked.push(e.text)
-    return { value: e.text.includes('Jira') ? 'updating tickets (Jira, issues)' : 'writing or changing code' }
+    // The Jira task is named outright by its description, so this answer never reaches it.
+    return { value: e.text.includes('export button') ? 'writing or changing code' : 'writing docs or text' }
   })
   on('agent.spawn', (_$, e) => ({ model: 'test-model', agentId: e.description }))
 
@@ -136,7 +137,7 @@ test('an agent is coloured by the activity the classifier picks, not by its type
   }
   await clock.advance(3000)
 
-  expect(asked).toHaveLength(2)
+  expect(asked).toHaveLength(1)
   const pane = await mountPane($)
   const code = await pane.find({ text: 'Implement the export button' })
   const jira = await pane.find({ text: 'Update PROD-4882 in Jira' })
@@ -157,6 +158,11 @@ test('every activity has its own colour, and unclassified agents and shells are 
   expect(new Set(colors).size).toBe(colors.length)
   expect(activityColor(row('x'))).toBe(NEUTRAL_COLOR)
   expect(activityColor({ ...row('s'), kind: 'shell' })).toBe(NEUTRAL_COLOR)
+  expect(activityFromDescription('Update PROD-4882 in Jira')).toBe('updating tickets (Jira, issues)')
+  expect(activityFromDescription('Find or spec swap element ticket')).toBe('updating tickets (Jira, issues)')
+  expect(activityFromDescription('Open a PR for the fix')).toBe('git, branches or pull requests')
+  expect(activityFromDescription('Build PROD-4888')).toBeUndefined()
+  expect(activityFromDescription('Research realtime collaboration')).toBeUndefined()
   const tags = ACTIVITIES.map(activity => activity.tag)
   expect(new Set(tags).size).toBe(tags.length)
   expect(activityTag(row('x'))).toBeUndefined()
@@ -173,6 +179,9 @@ test('tool calls become short action phrases', () => {
   expect(describeAction('Edit', { file_path: '/repo/a.ts' })).toBe('editing a.ts')
   expect(describeAction('mcp__claude_ai_Atlassian_MCP__editJiraIssue', {})).toBe('updating Jira')
   expect(describeAction('mcp__claude_ai_Atlassian_MCP__getJiraIssue', {})).toBe('reading Jira')
+  expect(shellTitle('until [ "$(gh pr view 1233 --json state -q .state)" = MERGED ]; do sleep 30; done')).toBe('Checking CI')
+  expect(shellTitle('pnpm test --run')).toBe('Running tests')
+  expect(shellTitle('npm run dev')).toBe('npm run dev')
 })
 
 test("a running agent's card shows its current action, and thinking between tool calls", async ($, on) => {

@@ -2,8 +2,15 @@ import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register } from 'claude-code'
 
 import type { Dispatch, DispatchKind, DispatchTab, UsageLimit } from '../types'
-import { THINKING, describeAction } from './actions'
-import { ACTIVITY_LABELS, FAILED_MARK_COLOR, activityColor, activityTag } from './kinds'
+import { THINKING, describeAction, shellTitle } from './actions'
+import {
+  ACTIVITY_LABELS,
+  CLASSIFIER_HINTS,
+  FAILED_MARK_COLOR,
+  activityColor,
+  activityFromDescription,
+  activityTag,
+} from './kinds'
 import { buildTree, descendantsOf, dropFinishedTrees, liveRootIds } from './tree'
 import type { Descendant } from './tree'
 
@@ -173,6 +180,9 @@ const syncAgents = async ($: EngineInterface, at: number) => {
           status,
           startedAt: at,
           parentId: agent.parentId,
+          ...(activityFromDescription(agent.description) === undefined
+            ? {}
+            : { activity: activityFromDescription(agent.description), isClassified: true }),
         }
       }
       const parentId = row.parentId ?? agent.parentId
@@ -221,7 +231,7 @@ const classifyNext = async ($: EngineInterface) => {
   const row = list.find(one => one.kind === 'agent' && one.isClassified !== true)
   if (row === undefined) return
   await upsert($, row.id, found => (found === undefined ? undefined : { ...found, isClassified: true }))
-  const text = [`agent type: ${row.label}`, `task: ${row.purpose}`, row.brief ? `prompt: ${row.brief}` : '']
+  const text = [`agent type: ${row.label}`, `task: ${row.purpose}`, row.brief ? `prompt: ${row.brief}` : '', CLASSIFIER_HINTS]
     .filter(Boolean)
     .join('\n')
   let activity: string | undefined
@@ -294,14 +304,16 @@ export const register: Register = on => {
     const spawned = await next(e)
     if (spawned.agentId !== undefined) {
       const agentId = spawned.agentId
+      // A description that names its activity outright colours the row at once.
+      const signalled = activityFromDescription(e.description)
       await upsert($, agentId, row => ({
         id: agentId,
         kind: 'agent',
         label: e.subagentType || 'agent',
         purpose: e.description || firstLine(e.prompt),
         brief: e.prompt.slice(0, 600),
-        activity: row?.activity,
-        isClassified: row?.isClassified,
+        activity: row?.activity ?? signalled,
+        isClassified: row?.isClassified ?? (signalled === undefined ? undefined : true),
         action: row?.action ?? 'starting',
         status: row?.status ?? 'running',
         startedAt: row?.startedAt ?? startedAt,
@@ -353,7 +365,7 @@ export const register: Register = on => {
     if (ran.deny !== undefined || ran.isError) return ran
     const taskId = ran.result.backgroundTaskId
     if (taskId !== undefined) {
-      const purpose = e.description || firstLine(e.command)
+      const purpose = e.description || shellTitle(e.command)
       await upsert($, taskId, row =>
         row ?? { id: taskId, kind: 'shell', label: 'bash', purpose, status: 'running', startedAt, parentId: e.agentId },
       )
@@ -415,7 +427,7 @@ export const register: Register = on => {
           id: task.id,
           kind: 'shell',
           label: 'bash',
-          purpose: task.description || firstLine(task.command ?? ''),
+          purpose: task.description || shellTitle(task.command ?? ''),
           status: 'running',
           startedAt: at,
         },
@@ -456,13 +468,14 @@ export const register: Register = on => {
       const tag = row.kind === 'shell' ? 'shell' : activityTag(row)
       return (
         <Box key={row.id} flexDirection="row" gap={1}>
-          <Text dimColor>{`${'  '.repeat(depth)}${isLast ? '└' : '├'}`}</Text>
-          <Text color={markColorOf(row)} dimColor={!running}>
-            {statusMark(row.status)}
-          </Text>
+          {/* Branch, mark and title in one text, so their spacing never collapses as the title truncates. */}
           <Box flexShrink={1}>
-            <Text color={color} dimColor={!running} wrap="truncate-end">
-              {row.purpose || row.label}
+            <Text wrap="truncate-end">
+              <Text dimColor>{`${'  '.repeat(depth)}${isLast ? '└' : '├'} `}</Text>
+              <Text color={markColorOf(row)} dimColor={!running}>
+                {statusMark(row.status)}
+              </Text>
+              <Text color={color} dimColor={!running}>{` ${row.purpose || row.label}`}</Text>
             </Text>
           </Box>
           {tag !== undefined && (

@@ -87,7 +87,9 @@ description the agent gave it.
 Each agent's colour shows what it is doing, not its type: a `general-purpose` agent
 writing code and one updating Jira get different colours. When an agent starts, a small
 fast model reads its type, description and the start of its prompt, and picks one
-activity (one model call per agent). The card shows that activity's short tag in
+activity (one model call per agent). A description that names its activity outright
+("Update PROD-4882 in Jira", "Open a PR for the fix") is coloured at once, with no model
+call, and the model cannot overrule it. The card shows that activity's short tag in
 brackets after the agent's type, such as `general-purpose [research]`, so two agents
 share a colour only when they do the same kind of work. The activities, tags and
 colours are in [`dispatch-panel/hooks/kinds.ts`](dispatch-panel/hooks/kinds.ts).

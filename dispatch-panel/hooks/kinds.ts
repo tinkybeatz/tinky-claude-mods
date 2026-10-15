@@ -32,3 +32,27 @@ export const activityColor = (row: Dispatch) =>
 
 /** The short activity tag shown after the agent's type, once the classifier has picked one. */
 export const activityTag = (row: Dispatch) => ACTIVITIES.find(activity => activity.label === row.activity)?.tag
+
+/**
+ * Words in an agent's description that name its activity outright. They settle it the
+ * moment the agent starts, before any model call, and the classifier cannot overrule
+ * them. Only unambiguous signals belong here: a ticket key alone does not, since dev
+ * agents carry one too ("Build PROD-4888").
+ */
+const CLEAR_SIGNALS: ReadonlyArray<readonly [RegExp, (typeof ACTIVITIES)[number]['label']]> = [
+  [/\b(jira|tickets?|backlog|sprint)\b/i, 'updating tickets (Jira, issues)'],
+  [/\b(commit|push|rebase|cherry-pick)\b|\bpull requests?\b|\b(open|create|merge|arm)\b.*\bPRs?\b/i, 'git, branches or pull requests'],
+]
+
+/** The activity a description names outright, or undefined when the classifier has to decide. */
+export const activityFromDescription = (description: string) =>
+  CLEAR_SIGNALS.find(([pattern]) => pattern.test(description))?.[1]
+
+/**
+ * Notes for the classifier on the confusions it made in use: writing a ticket's text is
+ * still updating tickets, not writing docs.
+ */
+export const CLASSIFIER_HINTS = [
+  'Creating, editing, commenting on or moving Jira issues or tickets is "updating tickets (Jira, issues)", even when the work is writing text.',
+  '"writing docs or text" is documentation, READMEs, notes and pages, not tickets.',
+].join('\n')
