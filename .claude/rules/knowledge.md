@@ -57,3 +57,55 @@ entries at the bottom.
   `session.receive` sees a delivery as it is queued. A shell whose owning agent has
   ended sends its notice to a queue nobody reads, so `dispatch-panel` ends such a
   shell together with its owner.
+
+Learned while spiking `godmode` against Claude Code 2.1.299 (types from 2.1.295).
+
+- **On a Team-plan login, some events skip the person's own plugins.** The
+  organisation's security plugin (`cc-plugin-sec-default`) sits outermost and passes
+  `prompt.compose` and `skill.prompt` over every user-tier plugin, `--plugin-dir` ones
+  included; `session.append` and `classic.Stop` were passed over too, which
+  `dispatch-panel` relies on. The only sign is a debug-log line,
+  `<plugin>: <event> bypassed by cc-plugin-sec-default (tier user); beneath runs`.
+  `claude plugin validate` warns for `prompt.compose` and `skill.prompt`.
+  `prompt.submit`, `command.run`, `tool.call`, `tool.check` and `agent.spawn` still run.
+- **A hook adds model-only text through `prompt.submit` or `command.run`, not only
+  `prompt.compose`.** `next({ ...e, context: [...] })` at `prompt.submit` attaches
+  hidden blocks to each prompt the person sends, which reaches only the main thread. A
+  `command.run` answer's `context` is one hidden message recorded after the command.
+- **"Ask the person" is a `tool.check` verdict, not a `tool.call` answer.** `tool.call`
+  can only answer, rewrite or `{ deny }`. `tool.check` returns
+  `{ decision: 'ask', reason }`, and the dialog shows the reason. The mode settles an
+  ask: in `auto` mode the classifier answered it and the command ran unasked.
+  `bypassPermissions` did not override it. With nobody to ask (`-p`, a background
+  subagent) an ask is a denial. To ask the person in every mode, a `tool.call` hook
+  awaits `$.ui.ask(question, options)` (the AskUserQuestion dialog), then calls
+  `next(e)` or denies. It rejects under `-p`.
+- **`tool.check` carries `agentId` too.** A subagent's Bash call raised `tool.call` and
+  then `tool.check`, both with the same `agentId`; both lack it on the main thread.
+- **A plugin folder ships `skills/`, `agents/` and `.mcp.json` beside its hooks.** They
+  load together. The skill is `<plugin>:<name>`, the agent type `<plugin>:<name>`, and an
+  MCP tool `mcp__plugin_<plugin>_<server>__<tool>`. `${CLAUDE_PLUGIN_ROOT}` expands in
+  `.mcp.json`. `claude plugin validate` does not list them; the debug log does.
+- **A tool from `$.tool.register` never meets the permission check.** Its `tool.call`
+  hook answers without `next`, so no `tool.check` and no dialog run for it.
+- **`agent.spawn` rewrites the brief, the model and the folder.** `next({ ...e, prompt,
+  model, cwd })` changes what the subagent gets. `e.model` is the Agent call's own
+  parameter, often `undefined`. `e.parentAgentId` is absent when the main thread
+  dispatched.
+- **`$.process.run(argv, { cwd, env, stdin, timeoutMs })` runs a host command with no
+  shell.** It resolves `{ exitCode, stdout, stderr }` for any exit code. The timeout is
+  30 seconds by default and ten minutes at most, and each stream is cut at 4 MiB. Git runs
+  with the repo's hooks off. `git` and `gh` both ran from a hooks module.
+- **A plugin whose `dependencies` are not installed does not load at all.** The debug log
+  says `dependency-unsatisfied` and suggests `claude plugin install <dep>`.
+  `claude plugin validate` passes it.
+- **A test sees the plugin's state through a `state.set` hook.** The test's own
+  `on('state.set', (_$, e, next) => ...)` sits beneath the plugin and receives every
+  write (`e.key`, `e.value`), so a module without a pane can still be tested. In a test,
+  `$.tool.call` does not raise `tool.check`, so a check is tested with `$.tool.check`.
+- **`validate` reads a command as the module's own only when its name is a literal.**
+  With `name: 'godmode'` in `$.command.register` and `{ command: 'godmode' }` in the
+  matcher, it reports `answers its own command`. Through a constant, it reports a gating
+  hook without `.catch`.
+- **A types contract may not hold `export {}`.** Every top-level `export` must be a type
+  or an interface, or `validate` fails.
