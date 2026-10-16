@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { AgentStatus } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
 import { describeAction, shellTitle } from '../hooks/actions'
@@ -201,7 +202,13 @@ test("a running agent's card shows its current action, and thinking between tool
     description: 'Commit the work',
     subagentType: 'dev',
   } as Parameters<typeof $.agent.spawn>[0])
-  await $.tool.call({ tool: 'Bash', tool_use_id: 'use-10', command: 'git commit -m "wip"', agentId: 'agent-9' })
+  // A subagent's call carries its `agentId`; the test input type leaves it out, so it is cast in.
+  await $.tool.call({
+    tool: 'Bash',
+    tool_use_id: 'use-10',
+    command: 'git commit -m "wip"',
+    agentId: 'agent-9',
+  } as Parameters<typeof $.tool.call>[0])
 
   expect(seenDuringCall).toBe(true)
   expect(await pane?.find({ text: 'thinking' })).toBeDefined()
@@ -354,7 +361,7 @@ test('rows are grouped into Agents and Shells sections', async ($, on) => {
 test("what a dispatched agent starts is listed inside its card, stays active while any of it runs, and a stopped agent's shells stop with it", async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.store(on)
-  const statuses: Record<string, 'running' | 'idle'> = { lead: 'running', helper: 'running' }
+  const statuses: { lead: AgentStatus; helper: AgentStatus } = { lead: 'running', helper: 'running' }
   on('agent.list', () => ({
     value: [
       { id: 'lead', description: 'Research realtime collaboration', type: 'general-purpose', status: statuses.lead },
@@ -378,7 +385,7 @@ test("what a dispatched agent starts is listed inside its card, stays active whi
     description: 'Look up yjs',
     run_in_background: true,
     agentId: 'helper',
-  })
+  } as Parameters<typeof $.tool.call>[0])
   await clock.advance(3000)
 
   const pane = await mountPane($)
@@ -394,7 +401,7 @@ test("what a dispatched agent starts is listed inside its card, stays active whi
   await clock.advance(1000)
   expect(await pane.find({ type: 'Button', text: 'Active (1)' })).toBeDefined()
 
-  statuses.helper = 'killed' as never
+  statuses.helper = 'killed'
   await clock.advance(1000)
   expect(await pane.find({ type: 'Button', text: 'Active (0)' })).toBeDefined()
   await pane.press({ key: 'tab-finished' })
