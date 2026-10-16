@@ -2,8 +2,11 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { GodmodeMode, SetupScope } from '../types'
-import { changedConventions, godmodeVersionOf, isOlderVersion, readNote } from './storage'
-import type { NoteLookup } from './storage'
+import { NO_GIT_LINE } from './host'
+import { changedConventions, godmodeVersionOf, isOlderVersion, projectOf, readNote } from './storage'
+import type { NoteLookup, Project } from './storage'
+import { runTicketTool, TICKET_TOOLS, TicketError, ticketBackendOf } from './tickets'
+import type { TicketToolName } from './tickets'
 
 const USAGE = 'Use `/godmode`, `/godmode setup`, `/godmode off`, `/godmode report` or `/godmode try <ticket>`.'
 
@@ -27,10 +30,10 @@ type SwitchOnPlan = {
  * Reads the project's setup note (D20): none means setup, a note means coding. A note
  * from an older godmode adds the update line, and changes nothing until asked (D60).
  */
-const switchOnPlan = async ($: EngineInterface): Promise<SwitchOnPlan> => {
+const switchOnPlan = async ($: EngineInterface, project: Project): Promise<SwitchOnPlan> => {
   let found: NoteLookup
   try {
-    found = await readNote($)
+    found = await readNote($, project)
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     return { mode: 'setup', setupScope: 'full', recheck: [], line: `godmode could not look for its setup note (${reason}), so setup runs.` }
@@ -49,10 +52,46 @@ const switchOnPlan = async ($: EngineInterface): Promise<SwitchOnPlan> => {
   return { mode: 'coding', setupScope: 'full', recheck, line }
 }
 
+/**
+ * Declares the four ticket tools (D24) at each switch-on. No call takes a tool back, so
+ * after `/godmode off` they stay listed and answer "godmode is off".
+ * Resolves the line to show when they could not be declared.
+ */
+const registerTicketTools = async ($: EngineInterface) => {
+  try {
+    for (const tool of TICKET_TOOLS) await $.tool.register(tool)
+    return undefined
+  } catch (error) {
+    return `godmode could not add its ticket tools (${error instanceof Error ? error.message : String(error)}).`
+  }
+}
+
 const switchOn = async ($: EngineInterface, to: GodmodeMode) => {
   await update($, mode, () => to)
   await update($, isOn, () => true)
+  return registerTicketTools($)
 }
+
+/** The session's project, or undefined in a folder with no git, where godmode does not start (D54). */
+const gitProject = async ($: EngineInterface) => {
+  const project = await projectOf($).catch(() => undefined)
+  return project?.hasGit === true ? project : undefined
+}
+
+/** Serves a ticket tool from the project's backend; a failure is the model's to read, as an error. */
+const serveTicketTool = async ($: EngineInterface, e: { tool: string; agentId?: string } & Record<string, unknown>) => {
+  if ((await read($, isOn)) !== true) return { deny: 'godmode is off, so its ticket tools do nothing. The person switches it on with `/godmode`.' }
+  const { tool, tool_use_id: _id, agentId, consent: _consent, ...input } = e
+  try {
+    const backend = await ticketBackendOf($)
+    return { result: await runTicketTool(backend, tool.replace(/^mcp__godmode__/, '') as TicketToolName, input, { agentId }) }
+  } catch (error) {
+    if (error instanceof TicketError) return { deny: error.message }
+    return { deny: `godmode's ticket tool failed: ${error instanceof Error ? error.message : String(error)}` }
+  }
+}
+
+const failedTicketTool = () => ({ deny: 'godmode\'s ticket tool failed before it could answer.' })
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -62,8 +101,16 @@ export const register: Register = on => {
         'Switch godmode on: a PM main thread that files tickets and dispatches dev and review agents (`setup` to change the setup, `off`, `report`, `try <ticket>`)',
       argumentHint: '[setup|off|report|try <ticket>]',
     })
+    // A reload runs `register` again while the state says on: declare the tools again.
+    if ((await read($, isOn)) === true) await registerTicketTools($)
     return next(e)
   })
+
+  // One hook per tool, each named literally so `validate` reads what the module serves.
+  on('tool.call', { tool: 'mcp__godmode__ticket_create' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
+  on('tool.call', { tool: 'mcp__godmode__ticket_move' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
+  on('tool.call', { tool: 'mcp__godmode__ticket_list' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
+  on('tool.call', { tool: 'mcp__godmode__ticket_comment' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
 
   on('command.run', { command: 'godmode' }, async ($, e) => {
     const [action = '', ...rest] = e.args.trim().split(/\s+/)
@@ -72,15 +119,20 @@ export const register: Register = on => {
     // Switching on is quiet (D46), and typed while on it changes nothing (D45).
     if (action === '') {
       if ((await read($, isOn)) === true) return {}
-      const plan = await switchOnPlan($)
+      const project = await gitProject($)
+      if (project === undefined) return { text: NO_GIT_LINE }
+      const plan = await switchOnPlan($, project)
       await update($, setupScope, () => plan.setupScope)
       await update($, recheck, () => plan.recheck)
-      await switchOn($, plan.mode)
-      return plan.line === undefined ? {} : { text: plan.line }
+      const toolsLine = await switchOn($, plan.mode)
+      const lines = [plan.line, toolsLine].filter(line => line !== undefined)
+      return lines.length === 0 ? {} : { text: lines.join('\n') }
     }
     if (action === 'setup') {
-      await switchOn($, 'change-setup')
-      return { text: 'godmode is in change-setup mode: say what you want to change.' }
+      if ((await gitProject($)) === undefined) return { text: NO_GIT_LINE }
+      const toolsLine = await switchOn($, 'change-setup')
+      const line = 'godmode is in change-setup mode: say what you want to change.'
+      return { text: toolsLine === undefined ? line : `${line}\n${toolsLine}` }
     }
     if (action === 'off') {
       if ((await read($, isOn)) !== true) return { text: 'godmode is already off.' }

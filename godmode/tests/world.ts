@@ -4,11 +4,17 @@ import type { EngineInterface, On } from 'claude-code'
 import { writeNote } from '../hooks/storage'
 import type { NoteDraft } from '../hooks/storage'
 
+/** What a command answers in the world. */
+export type RunAnswer = { exitCode: number; stdout: string; stderr?: string }
+
+/** One command the plugin ran: its argv, folder and standard input. */
+export type Run = { argv: string[]; cwd?: string; stdin?: string }
+
 /**
  * A pretend disk and git repo, in memory. `mountWorld` answers the plugin's `$.fs`,
- * `$.process.run`, `$.env` and `$.session.root` calls from it beneath the plugin;
- * `worldEngine` hands the storage helpers a `$` over the same world, since a test's own
- * `$` has no `fs` or `process` noun.
+ * `$.process.run`, `$.env`, `$.clock`, `$.tool.register` and `$.session.root` calls from
+ * it beneath the plugin; `worldEngine` hands the helpers a `$` over the same world, since
+ * a test's own `$` has no `fs` or `process` noun.
  */
 export type World = {
   files: Map<string, string>
@@ -19,8 +25,14 @@ export type World = {
   env: Record<string, string>
   /** The version `plugin.json` answers with. */
   pluginVersion: string
-  /** Every git command run, joined with spaces. */
+  /** Every command run, joined with spaces. */
   gitRuns: string[]
+  /** Every command run, with its folder and standard input. */
+  runs: Run[]
+  /** Answers a command before the world's own git does; undefined passes it on. */
+  answer?: (run: Run) => RunAnswer | undefined
+  /** The tools the plugin declared, by short name. */
+  tools: string[]
 }
 
 export const HOME = '/home/dev'
@@ -34,8 +46,13 @@ export const makeWorld = (overrides: Partial<World> = {}): World => ({
   env: { HOME },
   pluginVersion: '0.2.0',
   gitRuns: [],
+  runs: [],
+  tools: [],
   ...overrides,
 })
+
+/** What the world's clock reads: 2026-10-16 09:30 UTC. */
+export const NOW = Date.UTC(2026, 9, 16, 9, 30)
 
 const isManifest = (path: string) => path.endsWith('/.claude-plugin/plugin.json')
 
@@ -49,15 +66,44 @@ const read = (world: World, path: string) => {
 const exists = (world: World, path: string) =>
   world.files.has(path) || [...world.files.keys()].some(file => file.startsWith(`${path}/`))
 
-const run = (world: World, argv: readonly string[]) => {
-  const answer = (exitCode: number, stdout: string) => ({
+/** The files and folders directly in `path`, as `$.fs.list` answers them. */
+const list = (world: World, path: string) => {
+  const prefix = `${path.replace(/\/+$/, '')}/`
+  const names = new Map<string, 'file' | 'dir'>()
+  for (const file of world.files.keys()) {
+    if (!file.startsWith(prefix)) continue
+    const [name = '', ...rest] = file.slice(prefix.length).split('/')
+    names.set(name, rest.length === 0 ? 'file' : 'dir')
+  }
+  if (names.size === 0 && !exists(world, path)) throw new Error(`ENOENT: ${path}`)
+  return [...names].map(([name, kind]) => ({ name, kind, size: 0, mtimeMs: 0, isLink: false }))
+}
+
+/** `mv` and `mkdir -p` on the world's files: what the markdown tickets need. */
+const shell = (world: World, argv: readonly string[]): RunAnswer | undefined => {
+  if (argv[0] === 'mkdir') return { exitCode: 0, stdout: '' }
+  if (argv[0] !== 'mv') return undefined
+  const [from = '', to = ''] = argv.slice(1)
+  const text = world.files.get(from)
+  if (text === undefined) return { exitCode: 1, stdout: '', stderr: `mv: ${from}: No such file or directory` }
+  world.files.delete(from)
+  world.files.set(to, text)
+  return { exitCode: 0, stdout: '' }
+}
+
+const run = (world: World, argv: readonly string[], init: { cwd?: string; stdin?: string } = {}) => {
+  const answer = (exitCode: number, stdout: string, stderr?: string) => ({
     exitCode,
     stdout,
-    stderr: exitCode === 0 ? '' : 'fatal: not a git repository',
+    stderr: stderr ?? (exitCode === 0 ? '' : 'fatal: not a git repository'),
     isStdoutTruncated: false,
     isStderrTruncated: false,
   })
+  const call: Run = { argv: [...argv], cwd: init.cwd, stdin: init.stdin }
   world.gitRuns.push(argv.join(' '))
+  world.runs.push(call)
+  const custom = world.answer?.(call) ?? shell(world, argv)
+  if (custom !== undefined) return answer(custom.exitCode, custom.stdout, custom.stderr)
   if (argv[0] !== 'git' || world.git === undefined) return answer(128, '')
   const args = argv.slice(1).join(' ')
   if (args === 'worktree list --porcelain') {
@@ -80,13 +126,25 @@ export const mountWorld = (on: On, world: World) => {
     }
   })
   on('fs.exists', (_$, e) => ({ value: exists(world, e.path) }))
+  on('fs.list', (_$, e) => {
+    try {
+      return { value: list(world, e.path ?? world.sessionRoot) }
+    } catch (error) {
+      return { deny: (error as Error).message } as never
+    }
+  })
   on('fs.write', (_$, e) => {
     world.files.set(e.path, e.text)
     return { value: undefined } as never
   })
-  on('process.run', (_$, e) => ({ value: run(world, e.argv) }))
+  on('process.run', (_$, e) => ({ value: run(world, e.argv, e.init) }))
   on('session.root', () => ({ value: world.sessionRoot }))
+  on('tool.register', (_$, e) => {
+    world.tools.push(e.name)
+    return { value: { tool: `mcp__godmode__${e.name}` } } as never
+  })
   mock.env(on, world.env)
+  mock.clock(on, { now: NOW })
 }
 
 /** A `$` over `world` for calling the storage helpers directly. */
@@ -97,11 +155,12 @@ export const worldEngine = (world: World) =>
       read: async (path: string) => read(world, path),
       write: async (path: string, text: string) => void world.files.set(path, text),
       exists: async (path: string) => exists(world, path),
+      list: async (path: string) => list(world, path),
     },
-    process: { run: async (argv: readonly string[]) => run(world, argv) },
+    process: { run: async (argv: readonly string[], init?: { cwd?: string; stdin?: string }) => run(world, argv, init) },
     env: { get: async (name: string) => world.env[name] },
     session: { root: async () => world.sessionRoot },
-    clock: { now: async () => Date.UTC(2026, 9, 16, 9, 30) },
+    clock: { now: async () => NOW },
   }) as unknown as EngineInterface
 
 export const draft = (overrides: Partial<NoteDraft> = {}): NoteDraft => ({

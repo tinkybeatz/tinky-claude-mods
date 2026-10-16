@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { NO_GIT_LINE } from '../hooks/host'
 import type { GodmodeMode, SetupScope } from '../types'
 import { FIRST_COMMIT, HOME, makeWorld, mountWorld, REPO, setUpProject } from './world'
 
@@ -212,14 +213,20 @@ for (const version of ['0.2.0', '0.10.0']) {
   })
 }
 
-test('/godmode in a folder with no git runs setup without failing', async ($, on) => {
-  mountWorld(on, makeWorld({ git: undefined, sessionRoot: '/work/notes' }))
+test('/godmode and /godmode setup refuse a folder with no git, offering git init without running it (D54)', async ($, on) => {
+  const world = makeWorld({ git: undefined, sessionRoot: '/work/notes' })
+  mountWorld(on, world)
   const seen = watchState(on)
 
   const answer = await godmode($)
+  const setup = await godmode($, 'setup')
 
-  expect(seen.mode).toBe('setup')
-  expect(answer.text).toBeUndefined()
+  expect(seen.writes).toBe(0)
+  expect(answer.text).toBe(NO_GIT_LINE)
+  expect(answer.text).toContain('`git init`')
+  expect(setup.text).toBe(NO_GIT_LINE)
+  expect(world.gitRuns.some(command => command.startsWith('git init'))).toBe(false)
+  expect(world.tools).toEqual([])
 })
 
 test('/godmode on a note it cannot read says so and runs setup', async ($, on) => {

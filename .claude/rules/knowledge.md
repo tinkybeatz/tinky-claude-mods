@@ -140,3 +140,23 @@ Learned while building `godmode` 0.2.0 (storage and the setup note).
   skipped silently, and tsc then passes having checked nothing: after the repo moved from
   `claude-mods/` to `tinky-claude-mods/`, dispatch-panel's checks passed that way while its
   tests had type errors.
+
+Learned while building `godmode` 0.3.0 (tickets and the git host).
+
+- **`$.fs` has no delete, rename or move.** It reads, writes, lists, stats and checks
+  existence only. godmode moves a done ticket into `tickets/done/` with `mkdir -p` and `mv`
+  through `$.process.run`, which holds on macOS and Linux; a Windows host has neither.
+- **A tool from `$.tool.register` cannot be taken back.** No call unregisters it, and no
+  `tool.describe` answer hides it. godmode declares its ticket tools on the first
+  switch-on, declares them again in `session.start` when the state says on (a reload
+  forgets them), and answers `{ deny: 'godmode is off' }` while off.
+- **A closure over `$` inside a function declaration is followed.** An object whose arrow
+  methods use the `$` of the function declaration that built it loads, and `validate`
+  lists those calls (`$.fs.list (via markdownBackend)`). Only passing `$` as an argument
+  to an arrow refuses the module.
+- **In a test, the plugin's `{ deny }` reaches the test's `$.tool.call` as returned**, not
+  as `{ isError, text }`. `$.tool.register` needs an answer beneath the plugin:
+  `on('tool.register', (_$, e) => ({ value: { tool: 'mcp__<plugin>__' + e.name } }))`.
+  `$.process.run`'s hook input is `{ argv, init }`, with `cwd` and `stdin` under `init`.
+- **The test kit's `expect` has no `.rejects` or `.resolves`.** Await the promise with a
+  `.then(() => undefined, error => error.message)` helper and assert on the message.
