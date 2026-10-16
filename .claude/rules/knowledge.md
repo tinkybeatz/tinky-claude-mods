@@ -109,3 +109,34 @@ Learned while spiking `godmode` against Claude Code 2.1.299 (types from 2.1.295)
   hook without `.catch`.
 - **A types contract may not hold `export {}`.** Every top-level `export` must be a type
   or an interface, or `validate` fails.
+
+Learned while building `godmode` 0.2.0 (storage and the setup note).
+
+- **A helper in another file that takes `$` must be a function declaration.** The engine
+  follows `$` past an import only into `function name($) { ... }`. An exported arrow
+  function that takes `$` makes the whole module refuse to load ("$ is passed to ..., a
+  name bound to a function expression"), and every hook of the mod stops. Pure helpers
+  can stay arrow functions.
+- **A test's `$` has no `fs` or `process` noun, so a plugin's file and process calls are
+  answered beneath it.** `on('fs.read' | 'fs.exists' | 'fs.write' | 'process.run' |
+  'session.root', ...)` answers with `{ value }`; `{ deny: reason }` makes the plugin's
+  call reject, as a missing file does. The engine turns a relative path into an absolute
+  one (against the plugin's folder in a test) before the hook sees it. A test can also
+  import the plugin's helpers and call them with a `$` built by hand over the same
+  in-memory files (`godmode/tests/world.ts`).
+- **`crypto.subtle.digest` works in the hooks environment and in tests.** It is how
+  `godmode` fingerprints files, since there is no Node `crypto`. `Date` works too, but
+  `$.clock.now()` keeps a timestamp mockable.
+- **No `$` call gives the plugin's own version.** `$.plugin` has `name` and `root` only;
+  read `${$.plugin.root}/.claude-plugin/plugin.json` to get it, so `plugin.json` stays the
+  one place the version is written.
+- **`validate` lists only the calls reachable from the hooks.** A helper no hook calls
+  yet (godmode's `writeNote`, until setup uses it) does not appear under `calls`.
+- **Type-check with a scratch tsconfig that names real paths.** `tsc -p <mod>` needs the
+  types the engine lays in `.claude-plugin/types/`, which exist only once the mod has
+  loaded. Otherwise use a tsconfig outside the repo with `target`/`lib` `es2023`,
+  `types: []`, `jsxFactory: "h"`, and an `include` naming the skill's `claude-code.d.ts`
+  plus the mod's `hooks`, `types` and `tests`. An `include` path that no longer exists is
+  skipped silently, and tsc then passes having checked nothing: after the repo moved from
+  `claude-mods/` to `tinky-claude-mods/`, dispatch-panel's checks passed that way while its
+  tests had type errors.

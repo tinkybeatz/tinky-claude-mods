@@ -546,3 +546,25 @@ needed? anything else that would make sense?")
   researcher or a shell. A text rule tells the PM to delegate on purpose, so the hook is
   the backstop. This replaces the reference loop's "small work is the PM's"
   rule.
+
+## Session 2 — 2026-10-16
+
+- Spikes (`spikes.md`): on an organisation-managed (Team) login, Claude Code's default
+  security plugin skips `prompt.compose`, `session.append` and `classic.Stop` hooks from
+  plugins the person installs. A `prompt.submit` hook that attaches context, plus the
+  `/godmode` reply's own context, carries the PM's role instead.
+- **D64. Godmode works on both kinds of account.** Gael: "this plugin is not only to be
+  used with this account. I have personnal claude accounts too. friends will prolly want
+  to use it too, can you make it work for both? (with or without system prompt)". Where
+  `prompt.compose` runs, the PM's role goes in the system prompt and the per-message
+  reminder switches itself off; where it is skipped, the reply-plus-reminder fallback is
+  used. The mod detects which one ran.
+- Open: whether "ask me" in the permission presets goes through Claude Code's own check
+  (`tool.check`, which auto mode may answer by itself) or always asks Gael directly
+  (`$.ui.ask`).
+- **D65. Gitignored mode ignores `.godmode/` through `.git/info/exclude`, not
+  `.gitignore`.** Gael: "i feel like 2nd option is a better fit to 'gitignored mode' since
+  it will not even track that parent folder." The repo stays untouched (no tracked file
+  changes, nothing to commit by mistake); the exclude file is shared by every worktree of
+  the repo; no effect on performance. Committed mode keeps its `.godmode/personal.json`
+  line in `.gitignore`, since that one should apply to every clone.

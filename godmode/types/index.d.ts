@@ -5,6 +5,12 @@
  */
 export type GodmodeMode = 'setup' | 'change-setup' | 'coding'
 
+/**
+ * How much of the setup runs: `full` on a project with no note, `personal` when a
+ * teammate's committed note is there and only this person's answers are missing (D61).
+ */
+export type SetupScope = 'full' | 'personal'
+
 declare module 'claude-code' {
   interface PluginState {
     godmode: {
@@ -12,6 +18,10 @@ declare module 'claude-code' {
       isOn: boolean
       /** The mode godmode runs in; read only while `isOn`. */
       mode: GodmodeMode
+      /** Which questions setup asks; read only in `setup` mode. */
+      setupScope: SetupScope
+      /** Conventions files edited since the setup note was written, each re-checked alone (D20). */
+      recheck: string[]
     }
   }
 }
