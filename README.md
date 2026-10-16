@@ -7,12 +7,72 @@ function hooks. This repository holds several mods, one folder each.
 | --- | --- |
 | [`dispatch-panel`](dispatch-panel/) | A side panel listing dispatched agents and background shells, with their purpose, input and output tokens and duration, in Active and Finished tabs, coloured by what each agent is doing. |
 
-## Using a mod
+`godmode` (an agentic dev loop for any project) is being built in [`godmode/`](godmode/).
+It is not in the marketplace yet.
 
-### From this folder, in every session
+## Installing on a new machine
 
-Add the mod's folder to `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of
-`~/.claude/settings.json`. Separate several folders with `:`.
+The repository is a marketplace (`.claude-plugin/marketplace.json`), so the mods install
+from GitHub with no clone.
+
+**1. Add the marketplace.** At a Claude Code prompt:
+
+```
+/plugin marketplace add tinkybeatz/tinky-claude-mods
+```
+
+**2. Install a mod.** Still at the prompt:
+
+```
+/plugin install dispatch-panel@tinky-claude-mods
+```
+
+Pick the **user** scope so it loads in every project. The mod runs at once, with no
+restart.
+
+Use the `<mod>@tinky-claude-mods` form. `/plugin install dispatch-panel --marketplace …`
+is ignored by some versions, which then search the default marketplace and answer
+`Plugin "dispatch-panel" not found`.
+
+**3. Use the fullscreen layout, so the panel docks on the right.** Claude Code draws a
+panel on the right only in its fullscreen layout, in a window at least 110 columns
+wide. Otherwise the panel sits above the input bar. The layout is chosen when Claude Code
+starts, so a mod cannot change it. In a normal terminal, run once:
+
+```sh
+echo 'export CLAUDE_CODE_NO_FLICKER=1' >> ~/.zshrc
+```
+
+(`~/.bashrc` for bash.) Then open a new terminal window and start `claude`. Every new
+window keeps the setting. Inside tmux, Claude Code uses the other layout by default, so
+start it outside tmux. A window narrower than 110 columns puts the panel back above the
+input bar until it is widened.
+
+**4. Updating.** An installed mod runs the copy made when it was installed. To get a newer
+version:
+
+```sh
+claude plugin update dispatch-panel@tinky-claude-mods
+```
+
+Then restart Claude Code (or run `/reload-plugins` in an open session). `/plugin` →
+**Installed** also has **Update now**.
+
+### When it does not work
+
+| What you see | Why | Fix |
+| --- | --- | --- |
+| `/plugin` → **Errors**: `Failed to load hooks from …/hooks.json` … `expected record, received undefined` | This machine's Claude Code has mods switched off, so it reads `hooks.json` in the older hooks format | Run `claude -p "Reply with the single word ok." --model haiku` once so Claude Code refreshes its settings, then quit and restart it. If the error stays, the logged-in account does not have mods yet. `claude update` if the version is old. |
+| `Plugin "dispatch-panel" not found in … marketplace` | The marketplace was not added, or the `--marketplace` flag was ignored | Steps 1 and 2 above, with the `@tinky-claude-mods` form. |
+| Adding the marketplace is refused | An organization's managed settings restrict marketplaces | An admin has to allow it. |
+| The panel is above the input bar | Main-screen layout, tmux, or a narrow window | Step 3. |
+| Some features never react (on a work login) | Where an organization manages Claude Code, some hooks of plugins a person installs are skipped | An admin lists the plugins in the managed settings. |
+
+### From a local clone (developing)
+
+To run a mod straight from a clone, so every edit is picked up: add its folder to
+`CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of `~/.claude/settings.json`. Separate
+several folders with `:`.
 
 ```json
 "env": {
@@ -23,25 +83,18 @@ Add the mod's folder to `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of
 New sessions load the mod, and a session reloads it when its files change. A session
 that was already running when the setting changed does not pick it up.
 
-### For one session
+For one session only:
 
 ```sh
 claude --plugin-dir ~/Documents/GAEL/AI/tinky-claude-mods/dispatch-panel
 ```
 
-### From GitHub
-
-The repository is a marketplace (`.claude-plugin/marketplace.json`), so a mod installs
-with one line typed at a Claude Code prompt:
-
-```
-/plugin install dispatch-panel --marketplace tinkybeatz/tinky-claude-mods
-```
+Do not install the same mod from the marketplace and from a clone at once.
 
 ## dispatch-panel
 
 The panel opens by itself in a terminal at least 144 columns wide, docked on the right in
-the fullscreen layout. Elsewhere, open it with `/dispatches`.
+the fullscreen layout (see step 3 above). Elsewhere, open it with `/dispatches`.
 
 | Command | Effect |
 | --- | --- |
