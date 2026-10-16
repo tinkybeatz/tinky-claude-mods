@@ -127,11 +127,13 @@ Copied in and generalised; nothing depends on Gael's skills being installed.
 - Backends: GitHub through `gh`; Other through the mapping found at setup (`glab`, a
   connector); local branches when no host is reachable (review on the branch, no PR).
 
-## Step 7 — Loop hooks (D35, D36, D37, D38, D47, D48, D53, D56, D58, D62, D63)
+## Step 7 — Loop hooks (D35, D36, D37, D38, D47, D48, D53, D56, D58, D62, D63, D66)
 
 Every block says why and what unblocks it; every rule is a setting (D37).
 
 - **Permissions**: the four presets gate tool calls; attribution setting (D15, D18).
+  "Ask me" asks the person directly with `$.ui.ask`, never through Claude Code's own
+  permission check (D66).
 - **Thin main thread** (D63): the PM may talk, use ticket tools, dispatch and run quick
   status checks; heavier work is blocked with "dispatch a researcher or a shell".
 - **Dispatch**: only tickets Gael said go for; the PM confirms which it understood
@@ -183,8 +185,11 @@ Every block says why and what unblocks it; every rule is a setting (D37).
 
 ## Risks
 
-- **Hook gaps** (spike 0.4): if "ask me" cannot be expressed by a hook, the presets lean
-  on Claude Code's own permission settings, which godmode would write per project.
+- **Hook gaps** (spike 0.4): settled. "Ask me" is expressed by a hook: godmode's
+  `tool.call` hook asks the person itself with `$.ui.ask` and never returns a `tool.check`
+  "ask", which auto mode could approve without them (D66). godmode writes no Claude Code
+  permission settings. Still open: one interactive check of how a subagent's question
+  shows in a live session.
 - **Content weight**: `senior-dev` is about 39k words; bundle only what the roles read.
 - **Stack coverage**: coding standards and test rules need a language-neutral base plus
   per-language notes; start with the languages the dogfood repos use.

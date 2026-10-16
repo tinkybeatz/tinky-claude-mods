@@ -284,14 +284,14 @@ const callTool = async ($: Engine, name: string, input: Record<string, unknown>)
 
 const godmode = ($: Engine, args = '') => $.command.run({ command: 'godmode', args } as Parameters<typeof $.command.run>[0])
 
-test('switching on declares the four ticket tools, listed in the prompt', async ($, on) => {
+test('switching on declares the four ticket tools and review_verdict, listed in the prompt', async ($, on) => {
   const world = makeWorld()
   await setUpProject(world)
   mountWorld(on, world)
 
   await godmode($)
 
-  expect(world.tools).toEqual([...TICKET_TOOL_NAMES])
+  expect(world.tools).toEqual([...TICKET_TOOL_NAMES, 'review_verdict'])
 })
 
 test('the ticket tools work end to end through the plugin, in the note\'s storage', async ($, on) => {

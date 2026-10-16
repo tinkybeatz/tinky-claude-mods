@@ -153,8 +153,9 @@ godmode does not need to write permission settings. Each preset action set to "a
 (D13) becomes either a `tool.check` ask, which respects the person's mode (in `auto` the
 classifier decides), or a `$.ui.ask` from `tool.call`, which always asks the person. The
 second matches "ask me" literally. Which one to use, or a setting between them, is a
-question for Gael. D63's thin main thread is a `tool.call` deny on calls with no
-`agentId`. Every gating hook needs `.catch(($, e, next) => next.called ? next(e) : { deny })`.
+question for Gael. (Settled by D66, 2026-10-16: the second, always the person.) D63's
+thin main thread is a `tool.call` deny on calls with no `agentId`. Every gating hook
+needs `.catch(($, e, next) => next.called ? next(e) : { deny })`.
 
 ## 5. `$.tool.register`: tools the model can call
 
@@ -242,6 +243,8 @@ settings.
 2. **Spike 4.** Remove the risk that godmode must write Claude Code permission settings.
    Decide with Gael whether "ask me" means the mode's decider (`tool.check`, where the
    `auto` classifier may answer) or always the person (`$.ui.ask` from `tool.call`).
+   Settled on 2026-10-16 (D66): always the person, through `$.ui.ask` from `tool.call`;
+   godmode never answers `tool.check` with an ask. Applied in `build-plan.md`.
 3. **Spike 4.** Add one interactive check in M1: how a subagent's ask shows in a live
    session.
 4. **Spike 7.** Consider rewriting a dev agent's `cwd` to its worktree in `agent.spawn`.

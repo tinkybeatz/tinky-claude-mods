@@ -3,6 +3,8 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { GodmodeMode, SetupScope } from '../types'
 import { NO_GIT_LINE } from './host'
+import { afterToolCall, decideToolCall, planSpawn, recordAgent, REVIEW_VERDICT_TOOL, serveReviewVerdict, takePendingReviews } from './loop'
+import type { LoopCache } from './loop'
 import { changedConventions, godmodeVersionOf, isOlderVersion, projectOf, readNote } from './storage'
 import type { NoteLookup, Project } from './storage'
 import { runTicketTool, TICKET_TOOLS, TicketError, ticketBackendOf } from './tickets'
@@ -10,10 +12,15 @@ import type { TicketToolName } from './tickets'
 
 const USAGE = 'Use `/godmode`, `/godmode setup`, `/godmode off`, `/godmode report` or `/godmode try <ticket>`.'
 
+/*
+ * State refs are written in each file that reads or updates them: `validate` follows a
+ * state source only to an atom made in the same file. `loop.ts` holds its own.
+ */
 const isOn = atom({ plugin: 'godmode', key: 'isOn' } as const, false)
 const mode = atom({ plugin: 'godmode', key: 'mode' } as const, 'coding' as GodmodeMode)
 const setupScope = atom({ plugin: 'godmode', key: 'setupScope' } as const, 'full' as SetupScope)
 const recheck = atom({ plugin: 'godmode', key: 'recheck' } as const, [] as string[])
+const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
 
 /** How `/godmode` switches on: the mode, and what the setup or the PM picks up first. */
 type SwitchOnPlan = {
@@ -53,13 +60,13 @@ const switchOnPlan = async ($: EngineInterface, project: Project): Promise<Switc
 }
 
 /**
- * Declares the four ticket tools (D24) at each switch-on. No call takes a tool back, so
- * after `/godmode off` they stay listed and answer "godmode is off".
- * Resolves the line to show when they could not be declared.
+ * Declares the four ticket tools (D24) and `review_verdict` (D53) at each switch-on. No
+ * call takes a tool back, so after `/godmode off` they stay listed and answer "godmode is
+ * off". Resolves the line to show when they could not be declared.
  */
 const registerTicketTools = async ($: EngineInterface) => {
   try {
-    for (const tool of TICKET_TOOLS) await $.tool.register(tool)
+    for (const tool of [...TICKET_TOOLS, REVIEW_VERDICT_TOOL]) await $.tool.register(tool)
     return undefined
   } catch (error) {
     return `godmode could not add its ticket tools (${error instanceof Error ? error.message : String(error)}).`
@@ -67,6 +74,7 @@ const registerTicketTools = async ($: EngineInterface) => {
 }
 
 const switchOn = async ($: EngineInterface, to: GodmodeMode) => {
+  await update($, mainThreadReads, () => 0)
   await update($, mode, () => to)
   await update($, isOn, () => true)
   return registerTicketTools($)
@@ -93,7 +101,16 @@ const serveTicketTool = async ($: EngineInterface, e: { tool: string; agentId?: 
 
 const failedTicketTool = () => ({ deny: 'godmode\'s ticket tool failed before it could answer.' })
 
+/**
+ * Prompts the person sent themselves; each starts the main thread's read count over (D63).
+ * A prompt with no origin is the person's own.
+ */
+const PERSON_ORIGINS: readonly (string | undefined)[] = ['composer', 'bridge', 'sdk', undefined]
+
 export const register: Register = on => {
+  // The note's settings and the open PRs, kept between calls for this load of the module.
+  const cache: LoopCache = {}
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'godmode',
@@ -111,10 +128,54 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__godmode__ticket_move' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
   on('tool.call', { tool: 'mcp__godmode__ticket_list' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
   on('tool.call', { tool: 'mcp__godmode__ticket_comment' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
+  on('tool.call', { tool: 'mcp__godmode__review_verdict' }, ($, e) => serveReviewVerdict($, cache, e)).catch(() => ({
+    deny: 'godmode\'s review_verdict tool failed before it could record anything.',
+  }))
+
+  /*
+   * The loop's gate (Step 7): every tool call while godmode is on. A failed check refuses
+   * the call rather than letting it through, and says how to go on without godmode. Its
+   * own `$.ui.ask` raises an AskUserQuestion call beneath this hook: that re-entry is
+   * passed on, or the person could never be asked.
+   */
+  on('tool.call', async ($, e, next) => {
+    const decision = await decideToolCall($, cache, e)
+    if (decision.deny !== undefined) return { deny: decision.deny }
+    return afterToolCall($, cache, decision, await next(e))
+  }).catch(($, e, next) => {
+    if (next.error.kind === 're-entry' || next.called) return next(e)
+    return {
+      deny: `godmode's tool-call check failed (${next.error.message ?? next.error.kind}), so it refused this call to be safe. Nothing ran. The person can go on without godmode with \`/godmode off\`.`,
+    }
+  })
+
+  // Dispatch (Step 7): the agent cap, the role's model, a dev agent's ticket, worktree and brief.
+  on('agent.spawn', async ($, e, next) => {
+    const plan = await planSpawn($, cache, e)
+    if (plan.deny !== undefined) return { deny: plan.deny }
+    const started = await next(plan.input)
+    if (started.agentId !== undefined && plan.record !== undefined) await recordAgent($, started.agentId, plan.record)
+    return started
+  }).catch(($, e, next) => {
+    if (next.error.kind === 're-entry' || next.called) return next(e)
+    return {
+      deny: `godmode's dispatch check failed (${next.error.message ?? next.error.kind}), so the agent did not start. The person can go on without godmode with \`/godmode off\`.`,
+    }
+  })
+
+  // The PM hears about each new draft PR on its next prompt, a person's or a task notification (D35, D64).
+  on('prompt.submit', async ($, e, next) => {
+    if ((await read($, isOn)) !== true) return next(e)
+    if (PERSON_ORIGINS.includes((e.origin as typeof e.origin | undefined)?.kind)) await update($, mainThreadReads, () => 0)
+    const told = await takePendingReviews($)
+    return next(told === undefined ? e : { ...e, context: [...(e.context ?? []), told] })
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'godmode' }, async ($, e) => {
     const [action = '', ...rest] = e.args.trim().split(/\s+/)
     const ticket = rest.join(' ')
+    // The setup note may have changed: the loop reads it again on its next call.
+    cache.context = undefined
 
     // Switching on is quiet (D46), and typed while on it changes nothing (D45).
     if (action === '') {

@@ -160,3 +160,32 @@ Learned while building `godmode` 0.3.0 (tickets and the git host).
   `$.process.run`'s hook input is `{ argv, init }`, with `cwd` and `stdin` under `init`.
 - **The test kit's `expect` has no `.rejects` or `.resolves`.** Await the promise with a
   `.then(() => undefined, error => error.message)` helper and assert on the message.
+
+Learned while building `godmode` 0.4.0 (the loop hooks).
+
+- **A state atom must be made in the file that reads or updates it.** `validate` follows a
+  `read`/`update` source only to an `atom(...)` written in the same file (or inline). An
+  atom imported from a shared module refuses the whole module ("the state library's
+  update takes a source the scan can read"). godmode repeats its atoms in `register.tsx`
+  and `loop.ts`; same `{ plugin, key }`, same state.
+- **A test answers `$.ui.ask` as an `AskUserQuestion` tool call beneath the plugin.**
+  `on('tool.call', ...)` with `e.tool === 'AskUserQuestion'` returning
+  `{ result: { questions: e.questions, answers: { [question]: label } } }` resolves the
+  ask to `label`; `{ deny }` makes it reject, as a dismissed question or `-p` does. In the
+  kit the asking hook's own `.catch` is not called for that call. The types say a live
+  session asks the `.catch` on re-entry with `called` false, so a guard's `.catch` passes
+  `next.error.kind === 're-entry'` on, or its own question would be refused.
+- **Register every hook beneath the plugin before the test's first `$` call.** An `on(...)`
+  after it throws. A shared setup helper that switches the mod on takes the extra hooks as
+  a callback. A test's `$` has no `store` noun either: answer `store.get` and `store.set`
+  beneath with a `Map` to read the plugin's store back.
+- **`$.tool.check` takes `{ tool, input: { ... } }`**, unlike `tool.call`'s flat input.
+- **A test's `$.prompt.submit` raises `prompt.submit` with no `e.origin`.** A hook that
+  reads `e.origin.kind` throws there; treat a missing origin as the person's own prompt.
+- **The Agent tool has no `cwd`.** Only an `agent.spawn` rewrite sets where a subagent
+  runs, and the folder should exist first: godmode runs `git worktree add` in the spawn
+  hook before rewriting `cwd` to the ticket's worktree.
+- **The shell guard can refuse a Bash line for `gh` text that only goes into a file.** A
+  heredoc script that wrote test code holding `gh api user --jq .login` and `gh pr view`
+  was refused as a `gh` write. Edit files that hold such commands with the Edit or Write
+  tool, not a heredoc or `sed`.

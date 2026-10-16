@@ -568,3 +568,11 @@ needed? anything else that would make sense?")
   changes, nothing to commit by mistake); the exclude file is shared by every worktree of
   the repo; no effect on performance. Committed mode keeps its `.godmode/personal.json`
   line in `.gitignore`, since that one should apply to every clone.
+- **D66. "Ask me" always asks Gael directly, through godmode's own question
+  (`$.ui.ask`), never through Claude Code's permission check.** Gael's decision, relayed
+  on 2026-10-16 while Step 7 was built. A rule set to "ask me" (D13) holds the tool call
+  in godmode's `tool.call` hook and opens the question dialog itself; the hook never
+  returns an "ask" verdict from `tool.check`. Why: in auto mode Claude Code's classifier
+  settles a `tool.check` ask by itself, so a write could go through without Gael ever
+  seeing it (spike 4). This settles the open question above. With nobody to ask (a `-p`
+  run, a dismissed question) the call is refused, and the refusal says so.
