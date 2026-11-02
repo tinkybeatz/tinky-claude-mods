@@ -43,7 +43,14 @@ export type World = {
   gh?: Gh
   /** Local branches, which `git worktree add -b` adds to. */
   branches: string[]
+  /** The plugin's own `templates/` folder (Step 4's files), by path inside it: `required/AGENTS.md`. */
+  templates: Map<string, string>
+  /** The plugin's other files, by path inside its folder: `agents/pm.md`. */
+  plugin: Map<string, string>
 }
+
+/** The PM's role file, as the plugin ships it: front matter, then a body naming a rules file. */
+export const PM_ROLE = '---\nname: pm\nmodel: inherit\n---\n\n# You are the PM\n\nFollow `${CLAUDE_PLUGIN_ROOT}/rules/writing-tickets.md`.\n'
 
 export const HOME = '/home/dev'
 export const REPO = '/work/app'
@@ -59,6 +66,8 @@ export const makeWorld = (overrides: Partial<World> = {}): World => ({
   runs: [],
   tools: [],
   branches: ['main'],
+  templates: new Map(),
+  plugin: new Map([['agents/pm.md', PM_ROLE]]),
   ...overrides,
 })
 
@@ -67,21 +76,56 @@ export const NOW = Date.UTC(2026, 9, 16, 9, 30)
 
 const isManifest = (path: string) => path.endsWith('/.claude-plugin/plugin.json')
 
+/**
+ * A path inside the plugin's own `templates/` folder, relative to it ('' for the folder),
+ * or undefined. The plugin's folder is named `godmode`, wherever the kit or the hand-built
+ * `$` puts it.
+ */
+const templatePath = (world: World, path: string) => {
+  if (path.startsWith(`${world.git?.root ?? REPO}/`) || path.startsWith(`${HOME}/`)) return undefined
+  const match = /\/godmode\/templates(?:\/(.*))?$/.exec(path)
+  return match === null ? undefined : (match[1] ?? '')
+}
+
+/** A path inside the plugin's folder but not its templates, relative to it, or undefined. */
+const pluginPath = (world: World, path: string) => {
+  if (path.startsWith(`${world.git?.root ?? REPO}/`) || path.startsWith(`${HOME}/`)) return undefined
+  return /\/godmode\/((?:agents|rules|skills)\/.+)$/.exec(path)?.[1]
+}
+
 const read = (world: World, path: string) => {
   if (isManifest(path)) return JSON.stringify({ name: 'godmode', version: world.pluginVersion })
+  const own = pluginPath(world, path)
+  if (own !== undefined) {
+    const text = world.plugin.get(own)
+    if (text === undefined) throw new Error(`ENOENT: ${path}`)
+    return text
+  }
+  const template = templatePath(world, path)
+  if (template !== undefined) {
+    const text = world.templates.get(template)
+    if (text === undefined) throw new Error(`ENOENT: ${path}`)
+    return text
+  }
   const text = world.files.get(path)
   if (text === undefined) throw new Error(`ENOENT: ${path}`)
   return text
 }
 
-const exists = (world: World, path: string) =>
-  world.files.has(path) || [...world.files.keys()].some(file => file.startsWith(`${path}/`))
+const exists = (world: World, path: string) => {
+  const template = templatePath(world, path)
+  if (template !== undefined) return template === '' ? world.templates.size > 0 : world.templates.has(template) || [...world.templates.keys()].some(file => file.startsWith(`${template}/`))
+  return world.files.has(path) || [...world.files.keys()].some(file => file.startsWith(`${path}/`))
+}
 
 /** The files and folders directly in `path`, as `$.fs.list` answers them. */
 const list = (world: World, path: string) => {
-  const prefix = `${path.replace(/\/+$/, '')}/`
+  const template = templatePath(world, path.replace(/\/+$/, ''))
+  const keys = template === undefined ? [...world.files.keys()] : [...world.templates.keys()]
+  const folder = template === undefined ? path : template
+  const prefix = folder === '' ? '' : `${folder.replace(/\/+$/, '')}/`
   const names = new Map<string, 'file' | 'dir'>()
-  for (const file of world.files.keys()) {
+  for (const file of keys) {
     if (!file.startsWith(prefix)) continue
     const [name = '', ...rest] = file.slice(prefix.length).split('/')
     names.set(name, rest.length === 0 ? 'file' : 'dir')

@@ -64,7 +64,7 @@ standards docs the reviewer checks against, and a tool to run the app for behavi
 checks.
 
 **Gael's skills to draw from:** `skills-tinky` (git@github.com:tinkybeatz/skills-tinky.git)
-is the source; `agents-skills` is Leo Delpon's French original. Candidates:
+is the source. Candidates:
 `claude-md-architect` (does not handle AGENTS.md; templates lean JS/TS),
 `standard-maker`, `adr-writer`, `architecture-conceptor`, `change-advisor`, the
 parallel-agents git standard `senior-dev/std/_shared/multi-claude-workflow.md`, the
@@ -576,3 +576,61 @@ needed? anything else that would make sense?")
   settles a `tool.check` ask by itself, so a write could go through without Gael ever
   seeing it (spike 4). This settles the open question above. With nobody to ask (a `-p`
   run, a dismissed question) the call is refused, and the refusal says so.
+- **D67. The PM main thread may itself comment on PRs, mark them ready, merge them, and
+  start background shells, as exceptions to D63's thin main thread.** Gael's words: "yes
+  thats fine". Relaying a verdict as a PR comment, marking a PR ready and merging it on
+  his go are loop steps, not heavy work, and a background shell is how heavier work
+  leaves the main thread anyway. The verdict-at-commit rule (no ready or merge without a
+  clean verdict at the PR's current commit, D53) and auto-merge off unless Gael says so
+  (D53) still apply to the PM's own actions exactly as to an agent's. (Step 7's hooks
+  already let these through; this records the decision behind them.)
+- **D68. A visual "godmode is on" indicator, one of three styles, chosen as a personal
+  setting** (Gael said yes; his words on the questionnaire: "setup WILL ask about it"):
+  - `mode` (the default): a red "godmode" label among the footer's mode labels;
+  - `hint`: a red tag at the end of the hint line under the prompt;
+  - `band`: a thin dark red strip saying GODMODE above the prompt.
+  Only one shows at a time. Setup asks it as a personal answer (D61's split, key
+  `indicator`, values `mode`, `hint`, `band`), and change-setup can change it.
+
+### Step 3, setup mode, as built (2026-10-16)
+
+Build notes, not decisions: the decisions are D3, D8, D9, D14, D15, D18, D19, D23,
+D29-D34, D54, D59, D61, D64, D68. Recorded so a later session knows why it is shaped so.
+
+- Checked first (spike 9 in `spikes.md`): a subagent never gets the AskUserQuestion tool.
+  The engine strips it from the agent's tools even when its definition lists it. So the
+  setup agent cannot ask Gael itself. Its questions go through godmode's own tools, which
+  ask with `$.ui.ask` from the mod's hook, the same dialog D66 uses for "ask me".
+- Also checked: an agent the mod spawns itself (`$.agent.spawn` from the `/godmode` hook)
+  works on the Team login, but runs in the background as a non-interactive run, and its
+  Write call was refused outright with nobody asked. So `/godmode` does not spawn the
+  setup agent: its reply's hidden context tells the PM to dispatch `godmode:setup`, which
+  runs like any agent the model dispatches. `command.run` context reaches the model on
+  both kinds of account (D64).
+- The setup agent's five tools: `setup_scan` (the deterministic scan: stacks, commands,
+  git and PR host, conventions files, runnable UI, and the templates on offer),
+  `setup_questionnaire` (only the gaps the scan left, then permissions, storage, tracker,
+  attribution, QA, indicator; a question about reference repos is refused, D59),
+  `setup_confirm` (Gael's yes before weak conventions are improved in place, D32),
+  `setup_write_preset` (writes the templates, filled from the scan; never overwrites), and
+  `setup_finish` (refuses while a required piece is neither written nor covered by an
+  existing file, D31; then writes the note with fingerprints and switches to coding mode).
+- Hard rules in code (D37): an edit to an existing conventions file during setup is
+  refused until `setup_confirm` got a yes; the finish refuses a missing required piece.
+  Judgement stays with the agent: whether conventions are none, solid or weak, extra gap
+  questions, filling placeholders the scan could not.
+- No git: `/godmode` asks whether to run `git init`, and runs it only on a yes (D54). A
+  remote that is not a GitHub godmode can reach adds a `gitHost` question (local branches,
+  or another host for later); no `origin` at all means local branches, unasked.
+- Where conventions go per storage: committed, `docs/conventions/` with `AGENTS.md` and
+  `CLAUDE.md` at the root and the PR template in `.github/` on GitHub; gitignored,
+  `.godmode/conventions/`; outside, beside the note under `~/.claude`. Because a
+  gitignored or outside file is never loaded on its own, every godmode agent's brief now
+  lists the note's conventions files by absolute path.
+- The PM's role (`agents/pm.md`) is hidden from the model's list of agents and given to
+  the main thread instead: in `/godmode`'s hidden context when it switches on in coding
+  mode, once more with the setup's report, and as a one-line reminder on each prompt
+  (D64's channels).
+- Open, for Gael: whether a gitignored or outside setup should also write a root
+  `CLAUDE.local.md` that points at the conventions, so a session without godmode on
+  still sees them.

@@ -189,3 +189,43 @@ Learned while building `godmode` 0.4.0 (the loop hooks).
   heredoc script that wrote test code holding `gh api user --jq .login` and `gh pr view`
   was refused as a `gh` write. Edit files that hold such commands with the Edit or Write
   tool, not a heredoc or `sed`.
+
+Learned while building `godmode` 0.5.0 (setup mode).
+
+- **A subagent never has the AskUserQuestion tool.** The engine strips it from an agent's
+  tools even when the agent's definition lists it, so a subagent cannot ask the person.
+  An agent that needs answers calls a tool of the mod's, whose hook asks with
+  `$.ui.ask`; godmode's setup questionnaire works that way.
+- **An agent the mod spawns with `$.agent.spawn` runs in the background, non-interactive.**
+  It works from a `command.run` hook, on a Team login too, but a permission prompt in it is
+  refused at once ("Permission to use Write has been denied"), where an agent the model
+  dispatched waits for the grant. For an agent that writes files, have the main thread
+  dispatch it: a `command.run` answer's hidden `context` can tell the model to.
+- **`${CLAUDE_PLUGIN_ROOT}` expands in a plugin agent's prompt and in a skill's body**
+  (`${CLAUDE_SKILL_DIR}` too, in a skill), **but not in a file a hook reads raw.** godmode
+  reads `agents/pm.md` with `$.fs.read` for the main thread, so it replaces the variable
+  with `$.plugin.root` itself.
+- **Every `agents/*.md` file becomes a dispatchable `<plugin>:<name>` type.** One that is
+  not meant to be dispatched (godmode's PM role, which belongs to the main thread) is
+  hidden with `on('agent.offer', { agent: '<plugin>:<name>' }, () => ({ isOffered: false }))`.
+- **A test's `state.get` answer is a `StateRead`, wrapped in `{ value }`.** The hook beneath
+  answers `{ value: { value, version } }`; answering `{ value, version }` reads as nothing
+  stored, and the type check flags it.
+- **`$.ui.toast` in a test needs an answer beneath** (`on('ui.toast', () => ({ value:
+  undefined }))`), or the kit prints "$.ui.toast dropped: no implementation" (the test
+  still passes). Likewise a `ui.render` hook that calls `next(e)` needs a `ui.render`
+  answer beneath it in the test.
+- **In a test, the plugin's own files are read at the real plugin folder.** `$.plugin.root`
+  is the mod's folder on disk, so a test world that serves fixture templates matches a
+  path by the folder's name (`/godmode/templates/...`), not by a fixed root.
+- **macOS has no `timeout` command.** A spike script that wraps `claude -p` in `timeout`
+  fails with "command not found" before anything runs.
+- **A test's `state.get` answer is wrapped twice.** A hook beneath the plugin answers
+  `{ value: { value, version } }`: the outer `value` is the event's result, the inner one
+  the `StateRead`. Answering `{ value, version }` types wrong and the plugin reads nothing.
+- **A test's `ui.render` answer is the element itself**, not `{ value }`: return
+  `{ type: 'Text', children: ['engine'] }` typed as `RenderElement`. A plugin hook that
+  passes (`next(e)`) with no test hook beneath it fails the test.
+- **Test hooks run in the order they were made.** A catch-all `on('ui.render', ...)` made
+  first answers before a narrower one made later, which then never runs. Make the hook
+  that records what the plugin passed down before any catch-all.

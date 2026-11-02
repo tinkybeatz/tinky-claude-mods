@@ -86,6 +86,17 @@ Each is a small throwaway mod or a grep in the API types. Record the answers in
   solid → adopt as they are and fill missing required pieces; weak → show what would
   change and why in a line or two, wait for yes, improve in place.
 - Writes the note (step 2).
+- **Built in 0.5.0** (see the log's "Step 3, setup mode, as built"): `/godmode` with no
+  note tells the PM, through its reply's hidden context, to dispatch `godmode:setup`
+  (a mod-spawned agent runs non-interactive, spike 9). The agent works through five
+  godmode tools: `setup_scan`, `setup_questionnaire` (asks through `$.ui.ask`, since a
+  subagent has no AskUserQuestion), `setup_confirm`, `setup_write_preset`,
+  `setup_finish`. The scan is code (`hooks/scan.ts`); the questions are data
+  (`hooks/questionnaire.ts`), including `gitHost` when `origin` is not a reachable
+  GitHub and the on-indicator (D68). Templates are read by listing `templates/required`,
+  `templates/optional` and `templates/presets/<stack>/` at run time; stack notes fill
+  `{{languageNotes}}` and `{{testingNotes}}`. The PM's role from `agents/pm.md` reaches
+  the main thread as context (D64), and its agent type is hidden.
 
 ## Step 4 — Bundled content (D2, D30, D31, D40, D42)
 

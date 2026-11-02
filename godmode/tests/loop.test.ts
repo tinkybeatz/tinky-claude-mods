@@ -604,7 +604,8 @@ test('a dev agent\'s draft PR tells the PM to start the review, once, on its nex
   const told = loop.contexts[0]?.join('\n') ?? ''
   expect(told).toContain('PR #14 (https://github.com/acme/app/pull/14) for T-1')
   expect(told).toContain('dispatch one godmode:reviewer agent per PR')
-  expect(loop.contexts[1]).toBeUndefined()
+  // The next prompt carries only the PM's one-line reminder: the review notice is not repeated.
+  expect(loop.contexts[1]).toEqual([expect.stringContaining('godmode is on: you are its PM')])
   const ticket = (await loop.tickets.list({})).find(header => header.id === dev.ticket)
   expect(ticket?.status).toBe('review')
   expect(ticket?.pr).toBe('https://github.com/acme/app/pull/14')

@@ -338,12 +338,26 @@ export function otherBackend(): TicketBackend {
   )
 }
 
-/** The tracker a note's answers name; no answer is "None", the default. */
+/** Ways of saying "no tracker", all meaning None: markdown tickets kept by godmode (D23). */
+const NO_TRACKER = /^(?:none|no|no tracker|no-tracker|without|markdown|markdown tickets|md|local|files?|none \(markdown\))$/
+
+/**
+ * The tracker a piece of text names: `none` for any way of saying "no tracker", `jira`,
+ * `other`; undefined for a name godmode does not know (Linear, GitHub Issues, ...).
+ */
+export const trackerKindOf = (value: Answer): TrackerKind | undefined => {
+  const name = String(value).trim().toLowerCase()
+  if (name === '' || NO_TRACKER.test(name)) return 'none'
+  if (TRACKERS.includes(name as TrackerKind)) return name as TrackerKind
+  return undefined
+}
+
+/** The tracker a note's answers name; no answer, or "no tracker" in any words, is "None", the default. */
 export const trackerOf = (answers: Readonly<Record<string, Answer>>): TrackerKind => {
   const value = answers.tracker
   if (value === undefined) return 'none'
-  const name = String(value).toLowerCase()
-  if (TRACKERS.includes(name as TrackerKind)) return name as TrackerKind
+  const kind = trackerKindOf(value)
+  if (kind !== undefined) return kind
   throw new TicketError(`The setup note names the tracker \`${String(value)}\`, which godmode does not know (${TRACKERS.join(', ')}). Fix it with \`/godmode setup\`.`)
 }
 

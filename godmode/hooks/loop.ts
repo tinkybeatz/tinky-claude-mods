@@ -26,6 +26,7 @@ import {
 import type { Level, LoopSettings, ShellStep } from './rules'
 import { readNote } from './storage'
 import type { Answer, NoteLookup, Project } from './storage'
+import { indicatorOf } from './indicator'
 import { backendFor, slugOf, TICKET_STATUSES, trackerOf } from './tickets'
 import type { TicketBackend } from './tickets'
 
@@ -41,6 +42,7 @@ const mode = atom({ plugin: 'godmode', key: 'mode' } as const, 'coding' as Godmo
 const agents = atom({ plugin: 'godmode', key: 'agents' } as const, {} as Record<string, DispatchedAgent>)
 const pendingReviews = atom({ plugin: 'godmode', key: 'pendingReviews' } as const, [] as PendingReview[])
 const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as 'mode' | 'hint' | 'band')
 
 type FoundNote = Extract<NoteLookup, { status: 'found' }>
 
@@ -91,6 +93,9 @@ export async function loopContextOf($: EngineInterface, cache: LoopCache): Promi
   if (found?.status === 'found') {
     const answers = { ...found.shared.answers, ...(found.personal?.answers ?? {}) }
     value = { project: found.project, note: found, answers, settings: settingsOf(answers) }
+    // A change-setup may have changed the on-indicator's style (D68).
+    const style = indicatorOf(found.personal?.answers.indicator)
+    if ((await read($, indicator)) !== style) await update($, indicator, () => style)
   }
   cache.context = { at: now, value }
   return value
@@ -496,6 +501,17 @@ async function ensureWorktree($: EngineInterface, project: Project, settings: Lo
 
 const HELD_LIST_LIMIT = 200
 
+/**
+ * The conventions the setup recorded (Step 3), as absolute paths, so every godmode agent
+ * reads them wherever the storage keeps them: a gitignored or outside-the-repo file is
+ * never loaded on its own.
+ */
+export const conventionsBrief = (context: Pick<LoopContext, 'project' | 'note'>) => {
+  const paths = context.note.shared.conventions.map(file => (file.path.startsWith('/') ? file.path : `${context.project.root}/${file.path}`))
+  if (paths.length === 0) return undefined
+  return ['---', 'The project\'s conventions (from godmode\'s setup). Read the ones your work touches before you start, and follow them:', ...paths.map(path => `- ${path}`)].join('\n')
+}
+
 /** What godmode adds to a dev agent's brief: its ticket, worktree, and the files other PRs hold (D38, D47). */
 export const devBrief = (ticket: { id: string; title: string }, worktree: string, branch: string, held: readonly PullRequest[] | undefined) => {
   const lines = [
@@ -557,8 +573,9 @@ async function planDevSpawn($: EngineInterface, cache: LoopCache, context: LoopC
       }
     }
   }
+  const conventions = conventionsBrief(context)
   return {
-    input: { ...e, prompt: `${e.prompt}\n\n${devBrief(ticket, worktree, branch, held)}`, cwd: worktree },
+    input: { ...e, prompt: [e.prompt, devBrief(ticket, worktree, branch, held), conventions].filter(part => part !== undefined).join('\n\n'), cwd: worktree },
     record: { role: 'dev', ticket: ticket.id, worktree, branch },
   }
 }
@@ -584,7 +601,11 @@ export async function planSpawn($: EngineInterface, cache: LoopCache, e: AgentSp
   if (e.workflow !== undefined) return { input: e, record: { role } }
   const model = spawnModel(e.model, role, context?.note)
   const input = model === e.model ? e : { ...e, model }
-  if (role !== 'dev' || context === undefined || (await read($, mode)) !== 'coding') return { input, record: { role } }
+  if (context === undefined || role === 'setup' || (await read($, mode)) !== 'coding') return { input, record: { role } }
+  if (role !== 'dev') {
+    const conventions = conventionsBrief(context)
+    return { input: conventions === undefined ? input : { ...input, prompt: `${input.prompt}\n\n${conventions}` }, record: { role } }
+  }
   return planDevSpawn($, cache, context, input)
 }
 

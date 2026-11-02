@@ -271,7 +271,9 @@ const parse = <T>(text: string, check: (value: unknown) => value is T): T | stri
 export async function readNote($: EngineInterface, project?: Project): Promise<NoteLookup> {
   const at = project ?? (await projectOf($))
   const claudeDir = await claudeDirOf($)
-  const dirs = [noteDir(at, 'committed', claudeDir), noteDir(at, 'outside', claudeDir)]
+  // A repo set up before its first commit (setup ran `git init`) kept an outside note under its path.
+  const byPath = at.id === pathId(at.root) ? undefined : noteDir({ ...at, id: pathId(at.root) }, 'outside', claudeDir)
+  const dirs = [noteDir(at, 'committed', claudeDir), noteDir(at, 'outside', claudeDir), byPath]
   for (const dir of dirs) {
     if (dir === undefined || !(await $.fs.exists(`${dir}/${SHARED_NOTE}`))) continue
     const sharedPath = `${dir}/${SHARED_NOTE}`
@@ -325,6 +327,53 @@ export async function writeNote($: EngineInterface, draft: NoteDraft, project?: 
   await $.fs.write(`${dir}/${SHARED_NOTE}`, `${JSON.stringify(shared, null, 2)}\n`)
   await $.fs.write(`${dir}/${PERSONAL_NOTE}`, `${JSON.stringify(personal, null, 2)}\n`)
   return dir
+}
+
+/**
+ * Writes only the personal half (D61): a teammate's first setup on a committed note, whose
+ * shared half the team wrote. Resolves the path written.
+ */
+export async function writePersonalNote($: EngineInterface, dir: string, answers: Record<string, Answer>, models: PersonalNote['models'] = {}) {
+  const personal: PersonalNote = { writtenAt: new Date(await $.clock.now()).toISOString(), answers, models }
+  const path = `${dir.replace(/[\\/]+$/, '')}/${PERSONAL_NOTE}`
+  await $.fs.write(path, `${JSON.stringify(personal, null, 2)}\n`)
+  return path
+}
+
+/**
+ * Where setup writes the conventions it makes (D3, D19). Committed: `docs/conventions/`,
+ * team documents in plain sight. Gitignored and outside: a `conventions/` folder beside
+ * the note, so each mode keeps them where it keeps the rest. In committed mode the agent
+ * rules (`AGENTS.md`, `CLAUDE.md`) go at the repo's root instead, where every tool looks
+ * for them; see `presetTarget`.
+ */
+export const CONVENTIONS_FOLDER = 'docs/conventions'
+
+export const conventionsDirOf = (project: Project, mode: StorageMode, claudeDir: string | undefined) => {
+  if (mode === 'committed') return `${project.root}/${CONVENTIONS_FOLDER}`
+  const dir = noteDir(project, mode, claudeDir)
+  return dir === undefined ? undefined : `${dir}/conventions`
+}
+
+/** Template names that are the project's agent rules, kept at the repo's root in committed mode. */
+export const ROOT_TEMPLATES: readonly string[] = ['agents.md', 'claude.md']
+
+/**
+ * Where one template is written: the agent rules at the root in committed mode, the PR
+ * template where GitHub reads it when PRs live there, everything else in the conventions
+ * folder.
+ */
+export const presetTarget = (project: Project, mode: StorageMode, conventionsDir: string, name: string, isGitHub = false) => {
+  const lower = name.toLowerCase()
+  if (mode === 'committed' && ROOT_TEMPLATES.includes(lower)) return `${project.root}/${name}`
+  if (mode === 'committed' && isGitHub && lower === 'pr-template.md') return `${project.root}/.github/pull_request_template.md`
+  return `${conventionsDir}/${name}`
+}
+
+/** A path as the note records it: relative to the root when inside it, else absolute. */
+export const notePath = (project: Project, path: string) => {
+  const root = `${project.root.replace(/[\\/]+$/, '')}/`
+  return path.startsWith(root) ? path.slice(root.length) : path
 }
 
 /** A conventions file's fingerprint now, or undefined when it is gone. */

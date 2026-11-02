@@ -129,7 +129,7 @@ test('an unknown /godmode argument lists the commands and changes nothing', asyn
   expect(answer.text).toContain('/godmode try <ticket>')
 })
 
-test('/godmode with no setup note switches on in setup mode', async ($, on) => {
+test('/godmode with no setup note switches on in setup mode, and tells the PM to dispatch the setup agent', async ($, on) => {
   mountWorld(on, makeWorld())
   const seen = watchState(on)
 
@@ -138,7 +138,9 @@ test('/godmode with no setup note switches on in setup mode', async ($, on) => {
   expect(seen.isOn).toBe(true)
   expect(seen.mode).toBe('setup')
   expect(seen.setupScope).toBe('full')
-  expect(answer.text).toBeUndefined()
+  expect(answer.text).toContain('godmode is setting up this project')
+  expect(answer.context?.[0]).toContain('subagent_type `godmode:setup`')
+  expect(answer.context?.[0]).toContain('Scope: full')
 })
 
 for (const storage of ['committed', 'gitignored', 'outside'] as const) {

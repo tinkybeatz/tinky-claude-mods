@@ -250,3 +250,38 @@ settings.
 4. **Spike 7.** Consider rewriting a dev agent's `cwd` to its worktree in `agent.spawn`.
 5. **Outside godmode.** `dispatch-panel`'s `session.append` and `classic.Stop` hooks are
    passed over on a Team-plan login.
+
+---
+
+## 9. Can a subagent ask the person, and how does an agent the mod spawns run? (2026-10-16, Step 3)
+
+**Question.** The setup agent (D33) runs the questionnaire. Can a subagent call
+AskUserQuestion, and should `/godmode` spawn the setup agent itself (`$.agent.spawn`) or
+have the PM dispatch it?
+
+**Method.** A throwaway mod with an agent `spk:asker` whose `tools` were `Read, Write,
+AskUserQuestion`, told to list its tools and write them to a file, and a `/spk` command
+whose hook ran `$.agent.spawn({ subagentType: 'spk:asker', ... })`. Two headless runs on
+the Team login (`claude -p --plugin-dir ... --model haiku`): `/spk`, then a prompt asking
+the model to dispatch `spk:asker`. The subagents' transcripts and the debug log were read.
+
+**Answer: a subagent never has AskUserQuestion.** Both runs' agents listed `Read` and
+`Write` only: the engine strips AskUserQuestion from a subagent's tools even when its
+definition names it. So the setup agent asks through godmode's own tools, which call
+`$.ui.ask` from the mod's hook (the dialog D66 uses).
+
+**`$.agent.spawn` from a `command.run` hook works on the Team login** (it resolved
+`{ model, agentId }`; the debug log showed `$.agent.spawn (spk): Agent ... started`, and
+the agent ran to the end). Its meta file says `"requestShape": "background",
+"requestNonInteractive": true`, and its Write call was refused at once ("Permission to use
+Write has been denied") where the model-dispatched agent's was held for a grant ("you
+haven't granted it yet"). A mod-spawned agent cannot get a permission prompt answered.
+
+**Consequence.** `/godmode` in setup mode does not spawn the agent: its reply's hidden
+`context` tells the PM to dispatch `godmode:setup`, which then runs like any agent the
+model dispatches, with the person's usual permission prompts. `command.run` context
+reaches the model on both kinds of account (D64).
+
+**Not settled.** How `$.ui.ask` from a hook serving a background subagent's tool call
+shows in an interactive session (the same open check as spike 4). Headless, it rejects,
+and the setup tools then stop and hand the questions back for the PM to ask.

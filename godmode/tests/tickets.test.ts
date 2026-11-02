@@ -14,6 +14,7 @@ import {
   trackerOf,
 } from '../hooks/tickets'
 import type { TicketBackend, TicketChange, TicketComment, TicketDraft, TicketFilter, TicketHeader } from '../hooks/tickets'
+import { SETUP_TOOL_NAMES } from '../hooks/setup'
 import { FIRST_COMMIT, HOME, makeWorld, mountWorld, REPO, setUpProject, worldEngine } from './world'
 import type { World } from './world'
 
@@ -284,14 +285,14 @@ const callTool = async ($: Engine, name: string, input: Record<string, unknown>)
 
 const godmode = ($: Engine, args = '') => $.command.run({ command: 'godmode', args } as Parameters<typeof $.command.run>[0])
 
-test('switching on declares the four ticket tools and review_verdict, listed in the prompt', async ($, on) => {
+test('switching on declares the four ticket tools, review_verdict and the setup tools', async ($, on) => {
   const world = makeWorld()
   await setUpProject(world)
   mountWorld(on, world)
 
   await godmode($)
 
-  expect(world.tools).toEqual([...TICKET_TOOL_NAMES, 'review_verdict'])
+  expect(world.tools).toEqual([...TICKET_TOOL_NAMES, 'review_verdict', ...SETUP_TOOL_NAMES])
 })
 
 test('the ticket tools work end to end through the plugin, in the note\'s storage', async ($, on) => {

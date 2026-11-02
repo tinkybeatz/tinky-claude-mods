@@ -3,10 +3,14 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { GodmodeMode, SetupScope } from '../types'
 import { NO_GIT_LINE } from './host'
+import { indicatorOf, registerIndicator } from './indicator'
 import { afterToolCall, decideToolCall, planSpawn, recordAgent, REVIEW_VERDICT_TOOL, serveReviewVerdict, takePendingReviews } from './loop'
 import type { LoopCache } from './loop'
 import { changedConventions, godmodeVersionOf, isOlderVersion, projectOf, readNote } from './storage'
 import type { NoteLookup, Project } from './storage'
+import { pmReminder, pmRoleOf } from './role'
+import { beginSetup, offerGitInit, serveSetupTool, SETUP_TOOLS, setupEditRefusal, takeSetupReport } from './setup'
+import type { SetupToolName } from './setup'
 import { runTicketTool, TICKET_TOOLS, TicketError, ticketBackendOf } from './tickets'
 import type { TicketToolName } from './tickets'
 
@@ -21,6 +25,7 @@ const mode = atom({ plugin: 'godmode', key: 'mode' } as const, 'coding' as Godmo
 const setupScope = atom({ plugin: 'godmode', key: 'setupScope' } as const, 'full' as SetupScope)
 const recheck = atom({ plugin: 'godmode', key: 'recheck' } as const, [] as string[])
 const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as 'mode' | 'hint' | 'band')
 
 /** How `/godmode` switches on: the mode, and what the setup or the PM picks up first. */
 type SwitchOnPlan = {
@@ -31,6 +36,8 @@ type SwitchOnPlan = {
   recheck: string[]
   /** The one line the reply carries, if any (D46, D60). */
   line?: string
+  /** The on-indicator's style from the note's personal answers (D68). */
+  indicatorStyle?: unknown
 }
 
 /**
@@ -56,17 +63,17 @@ const switchOnPlan = async ($: EngineInterface, project: Project): Promise<Switc
     ? `A godmode update is available for this project's conventions (set up with ${found.shared.godmodeVersion}, now ${current}): \`/godmode setup\` to apply it.`
     : undefined
   if (found.personal === undefined) return { mode: 'setup', setupScope: 'personal', recheck, line }
-  return { mode: 'coding', setupScope: 'full', recheck, line }
+  return { mode: 'coding', setupScope: 'full', recheck, line, indicatorStyle: found.personal.answers.indicator }
 }
 
 /**
- * Declares the four ticket tools (D24) and `review_verdict` (D53) at each switch-on. No
+ * Declares the four ticket tools (D24), `review_verdict` (D53) and the setup tools (Step 3) at each switch-on. No
  * call takes a tool back, so after `/godmode off` they stay listed and answer "godmode is
  * off". Resolves the line to show when they could not be declared.
  */
 const registerTicketTools = async ($: EngineInterface) => {
   try {
-    for (const tool of [...TICKET_TOOLS, REVIEW_VERDICT_TOOL]) await $.tool.register(tool)
+    for (const tool of [...TICKET_TOOLS, REVIEW_VERDICT_TOOL, ...SETUP_TOOLS]) await $.tool.register(tool)
     return undefined
   } catch (error) {
     return `godmode could not add its ticket tools (${error instanceof Error ? error.message : String(error)}).`
@@ -101,6 +108,14 @@ const serveTicketTool = async ($: EngineInterface, e: { tool: string; agentId?: 
 
 const failedTicketTool = () => ({ deny: 'godmode\'s ticket tool failed before it could answer.' })
 
+/** Serves a setup tool (Step 3), its input without the call's own fields. */
+const setupTool = ($: EngineInterface, name: SetupToolName, e: Record<string, unknown>) => {
+  const { tool: _tool, tool_use_id: _id, agentId: _agentId, consent: _consent, ...input } = e
+  return serveSetupTool($, name, input)
+}
+
+const failedSetupTool = () => ({ deny: 'godmode\'s setup tool failed before it could answer.' })
+
 /**
  * Prompts the person sent themselves; each starts the main thread's read count over (D63).
  * A prompt with no origin is the person's own.
@@ -110,6 +125,12 @@ const PERSON_ORIGINS: readonly (string | undefined)[] = ['composer', 'bridge', '
 export const register: Register = on => {
   // The note's settings and the open PRs, kept between calls for this load of the module.
   const cache: LoopCache = {}
+
+  // The "godmode is on" indicator (D68), drawn by `indicator.tsx`.
+  registerIndicator(on)
+
+  // The PM is the main thread, never a dispatched agent: its type stays off the model's list.
+  on('agent.offer', { agent: 'godmode:pm' }, () => ({ isOffered: false }))
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -128,6 +149,16 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__godmode__ticket_move' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
   on('tool.call', { tool: 'mcp__godmode__ticket_list' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
   on('tool.call', { tool: 'mcp__godmode__ticket_comment' }, ($, e) => serveTicketTool($, e)).catch(failedTicketTool)
+  on('tool.call', { tool: 'mcp__godmode__setup_scan' }, ($, e) => setupTool($, 'setup_scan', e)).catch(failedSetupTool)
+  on('tool.call', { tool: 'mcp__godmode__setup_questionnaire' }, ($, e) => setupTool($, 'setup_questionnaire', e)).catch(failedSetupTool)
+  on('tool.call', { tool: 'mcp__godmode__setup_confirm' }, ($, e) => setupTool($, 'setup_confirm', e)).catch(failedSetupTool)
+  on('tool.call', { tool: 'mcp__godmode__setup_write_preset' }, ($, e) => setupTool($, 'setup_write_preset', e)).catch(failedSetupTool)
+  // The note is new: the loop reads it again on its next call.
+  on('tool.call', { tool: 'mcp__godmode__setup_finish' }, async ($, e) => {
+    const answer = await setupTool($, 'setup_finish', e)
+    cache.context = undefined
+    return answer
+  }).catch(failedSetupTool)
   on('tool.call', { tool: 'mcp__godmode__review_verdict' }, ($, e) => serveReviewVerdict($, cache, e)).catch(() => ({
     deny: 'godmode\'s review_verdict tool failed before it could record anything.',
   }))
@@ -139,6 +170,8 @@ export const register: Register = on => {
    * passed on, or the person could never be asked.
    */
   on('tool.call', async ($, e, next) => {
+    const setupRefusal = await setupEditRefusal($, e as unknown as { tool: string } & Record<string, unknown>)
+    if (setupRefusal !== undefined) return { deny: setupRefusal }
     const decision = await decideToolCall($, cache, e)
     if (decision.deny !== undefined) return { deny: decision.deny }
     return afterToolCall($, cache, decision, await next(e))
@@ -167,8 +200,12 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     if ((await read($, isOn)) !== true) return next(e)
     if (PERSON_ORIGINS.includes((e.origin as typeof e.origin | undefined)?.kind)) await update($, mainThreadReads, () => 0)
-    const told = await takePendingReviews($)
-    return next(told === undefined ? e : { ...e, context: [...(e.context ?? []), told] })
+    const report = await takeSetupReport($)
+    // A setup that just finished hands the main thread its PM role; after that, a one-line reminder (D64).
+    const role = report === undefined ? undefined : await pmRoleOf($)
+    const reminder = (await read($, mode)) === 'coding' && role === undefined ? pmReminder($.plugin.root) : undefined
+    const told = [report, role, reminder, await takePendingReviews($)].filter(text => text !== undefined)
+    return next(told.length === 0 ? e : { ...e, context: [...(e.context ?? []), ...told] })
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'godmode' }, async ($, e) => {
@@ -180,17 +217,33 @@ export const register: Register = on => {
     // Switching on is quiet (D46), and typed while on it changes nothing (D45).
     if (action === '') {
       if ((await read($, isOn)) === true) return {}
-      const project = await gitProject($)
-      if (project === undefined) return { text: NO_GIT_LINE }
+      let project = await gitProject($)
+      // No git (D54): offer `git init`, run only on a yes; otherwise godmode does not start.
+      if (project === undefined) {
+        const folder = await $.session.root()
+        if (!(await offerGitInit($, folder))) return { text: NO_GIT_LINE }
+        project = await gitProject($)
+        if (project === undefined) return { text: NO_GIT_LINE }
+      }
       const plan = await switchOnPlan($, project)
       await update($, setupScope, () => plan.setupScope)
       await update($, recheck, () => plan.recheck)
+      await update($, indicator, () => indicatorOf(plan.indicatorStyle))
       const toolsLine = await switchOn($, plan.mode)
-      const lines = [plan.line, toolsLine].filter(line => line !== undefined)
-      return lines.length === 0 ? {} : { text: lines.join('\n') }
+      // Setup mode (Step 3): the PM is told to dispatch the setup agent, so the main thread stays clean.
+      const setup = plan.mode === 'setup' ? await beginSetup($, plan.setupScope) : undefined
+      const lines = [plan.line, setup?.text, toolsLine].filter(line => line !== undefined)
+      if (setup !== undefined) return { text: lines.join('\n'), context: setup.context }
+      // Coding mode: the PM's role reaches the main thread as hidden context, quietly (D46, D64).
+      const role = await pmRoleOf($)
+      const context = role === undefined ? {} : { context: [role] }
+      return lines.length === 0 ? context : { text: lines.join('\n'), ...context }
     }
     if (action === 'setup') {
-      if ((await gitProject($)) === undefined) return { text: NO_GIT_LINE }
+      const project = await gitProject($)
+      if (project === undefined) return { text: NO_GIT_LINE }
+      const found = await readNote($, project).catch(() => undefined)
+      if (found?.status === 'found') await update($, indicator, () => indicatorOf(found.personal?.answers.indicator))
       const toolsLine = await switchOn($, 'change-setup')
       const line = 'godmode is in change-setup mode: say what you want to change.'
       return { text: toolsLine === undefined ? line : `${line}\n${toolsLine}` }
