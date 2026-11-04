@@ -22,6 +22,7 @@ godmode is not in the marketplace yet, so it runs from the clone. If the folder 
 - [ ] 6. One small ticket: ask the PM for one. Was a dev agent dispatched, did it open a draft PR, and did a review start by itself?
 - [ ] 7. Anything refused or stuck: paste the exact refusal text.
 - [ ] 8. Errors: paste any red line or dim "skipped" line, and what `/plugin` → Errors shows.
+- [ ] 9. QA: setup still asks QA on or off (the four QA modes are not built yet). In a later session, the PM is not told the project's QA answer, so watch whether it runs a QA agent when you said off, or skips QA when you said on.
 
 ## Also say
 

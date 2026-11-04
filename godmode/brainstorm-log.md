@@ -201,7 +201,8 @@ generalised.
 - **D24. Markdown tickets as proposed above** (Gael: "yes, works for me"): one file per
   ticket in `tickets/` with a short header, edited only through the mod's create / move /
   list / comment tools, done tickets moved to `tickets/done/`, and the same four tools
-  routed to Jira or Other when one is chosen.
+  routed to Jira or Other when one is chosen. (Statuses changed by D69: a `qa` status
+  now sits between review and done.)
 - **D25. "Other" tracker** (Gael: "yes, works for me"): in setup Gael names the tracker;
   the main thread checks how Claude can reach it (a connector already set up, or a
   command-line tool such as `gh`), maps the four ticket tools onto it, and saves the
@@ -280,7 +281,8 @@ generalised.
   - **Researcher:** reads code and docs before a ticket is written, so the PM's context
     stays free of files.
   - **QA:** runs the app and clicks through the change before review (the reference loop's
-    "try it" step, done by an agent), for projects with something to run.
+    "try it" step, done by an agent), for projects with something to run. (Where it
+    runs now depends on the QA mode, changed by D69 and D71.)
   Requirement: the new roles fit into the loop without friction; where each sits in the
   flow is the next point.
 - Rejected: QA running alongside the reviewer. Gael: "its a waste. what if review says
@@ -292,13 +294,14 @@ generalised.
   like a person (browser for a web app, real commands for a CLI, requests for an API),
   checks the ticket's ask item by item, and returns pass/fail with evidence (screenshots,
   real outputs). Gael wondered if it was overkill.
-- **D34. QA is an optional piece.** Offered at setup, on by default only when the scan
+- **D34. QA is an optional piece** (replaced by D69's four modes). Offered at setup, on by default only when the scan
   finds a runnable UI; the PM also skips it for tickets that change nothing visible.
   Gael: "yes, works for me". It needs a driving tool (a browser tool such as
   agent-browser or Playwright) and an app that runs locally.
 - **D35. Order: dev → review → fix rounds until clean → QA → fixes if needed → ready for
   Gael.** After a QA fix the reviewer re-checks only the changed lines and QA re-tests
-  only what it flagged. Gael: "yes, lock it in."
+  only what it flagged. Gael: "yes, lock it in." (Changed by D69: this order is now the
+  `bot` mode; the human modes follow D69-D72.)
 - Gael asked whether the PM takes decisions in the reference loop or whether everything
   is deterministic. Answer: its PM is a model following written rules (a local rules file
   and a PM workflow doc); it judges process steps within them
@@ -307,7 +310,8 @@ generalised.
   enforced by code. A mod can make some of it deterministic with hooks.
 - **D36. Hard rules in code where it makes sense; model judgement where a rule cannot
   express it.** Gael: "yes where it makes sense." Example: QA runs if and only if the
-  ticket's "visible change" field, confirmed with the ticket, says yes.
+  ticket's "visible change" field, confirmed with the ticket, says yes. (Changed by D69:
+  the example now holds for bot QA; whether human QA uses the field is open.)
 - Why the reference loop wrote rules as text, and the trade-off (as discussed):
   - The reason is not written down. Its kit is "a handful of files you commit to your
     repo" (agents, skills, a local rules file), which works in any Claude Code without a
@@ -344,7 +348,9 @@ generalised.
   - Text: how to write a ticket (measured vs inferred), the review checklist, fix-round
     briefs, how to red-check a test, classifying a red CI run, what small work the PM does
     itself, when to ask Gael.
-- **D38. The hook / text split as proposed under D37** (Gael: "ok yeah").
+- **D38. The hook / text split as proposed under D37** (Gael: "ok yeah"). (Changed by
+  D69 and D73: the QA hook now follows the QA mode, and the prompt hook also checks the
+  tickets waiting on QA.)
 
 ### Models (2026-10-15)
 
@@ -399,7 +405,8 @@ generalised.
   file.
 - **D44. `/godmode report` gives a status report** (setup check, open PRs and the files
   each holds, tickets ready to build, 2 or 3 suggested next). Gael: "i like that idea but
-  give me a /godmode report."
+  give me a /godmode report." (Extended by D70: the report also checks the tickets
+  waiting on QA.)
 - **D45. `/godmode` only switches godmode on.** Gael: "in not godmode, /godmode starts
   it / in godmode, /godmode does nun". Typed while godmode is already on, it changes
   nothing.
@@ -449,7 +456,9 @@ generalised.
 - **D53. Auto-merge is off by default, in every preset, until Gael says so.** Gael: "it
   depends. keep auto-merge off by default unless i say so". This narrows D18: Free and
   Full freedom no longer arm auto-merge on their own. Once review and QA are clean, the
-  PM waits for Gael's go. Whether "says so" is per ticket or a switch: open.
+  PM waits for Gael's go. Whether "says so" is per ticket or a switch: open. (Changed by
+  D69: in `human-pr` the PR is not marked ready until QA passes; in `human-staging` the
+  merge comes before QA; in `none` there is no QA step.)
 - Settled: Gael just says it, in his own words, and the PM understands the scope (D51).
   Gael: "ill just say so !!!!!!!!!!" — the per-ticket-or-switch question was one too
   many; don't ask how plain talk will be phrased.
@@ -513,7 +522,8 @@ needed? anything else that would make sense?")
   - Shared: agent rules, coding standards, git workflow, testing rules, quality gates,
     review checklist, ticket and PR templates, the optional pieces, decisions log,
     markdown tickets, the team's tracker choice, the start command for `/godmode try`,
-    QA on or off, and the godmode version that wrote the conventions.
+    QA on or off (now the QA mode, changed by D69), and the godmode version that wrote
+    the conventions.
   - Personal: permission preset, attribution, auto-merge, models per role, agent cap,
     fix-round limit, tracker identity (account, default epic and sprint), reference repo
     paths, and the person's own answers.
@@ -591,6 +601,49 @@ needed? anything else that would make sense?")
   - `band`: a thin dark red strip saying GODMODE above the prompt.
   Only one shows at a time. Setup asks it as a personal answer (D61's split, key
   `indicator`, values `mode`, `hint`, `band`), and change-setup can change it.
+- **D69. QA is one of four modes, asked at setup per repo; this replaces D34's on/off.**
+  Gael: "this plugin is made to be plug-and-play with any project, so that should be a
+  step of the setup", and "we need to make this as modulable as the rest". Personal and
+  work repos do not test the same way, work repos differ between them, and someone else
+  may use godmode. The four modes:
+  - `human-pr`: people test the PR before merge. After a clean review the ticket moves to
+    a QA status and the PM waits; it never marks the PR ready until it is told QA passed.
+    A human fail starts a fix round.
+  - `human-staging`: people test on staging after merge. Merging stays allowed, but the
+    ticket goes to a QA status instead of done, and the QA team closes it.
+  - `bot`: the QA agent runs after a clean review and before ready (D35's order).
+  - `none`: a clean review goes straight to ready.
+  The setup asks "human QA?" first, then where humans test, or else whether a bot QA is
+  needed. The scan's runnable-UI finding only suggests a default. Ticket statuses gain a
+  QA status (todo / doing / review / qa / done).
+- **D70. In `human-pr` mode, the PM learns the QA result from any signal setup chose for
+  the repo** (Gael: "second option sounds good"). Telling the PM always works; setup can
+  add a ticket moved to the board's pass status (its exact name asked) and a PR approval
+  from a named QA person or team. A fail through any signal starts a fix round. No
+  background listener: Gael worried one would not outlive a QA pass that comes weeks
+  later. Instead the PM checks the tickets waiting on QA when it next looks (each prompt,
+  `/godmode`, `/godmode report`), since the result lives in the tracker or on the PR, not
+  in a process. Gael keeps one PM session open as long as possible, so a new session is
+  not the trigger.
+- **D71. In both human QA modes, a bot QA pass first is a setup option** (Gael: "make it
+  an option at setup, modular."). When on, the QA agent tests after a clean review and
+  its fails are fixed before the change reaches the human testers, so they only get
+  changes that already passed. It needs what bot QA always needs (an app that runs
+  locally and a driving tool); the scan's runnable-UI finding suggests the default.
+- **D72. In `human-staging` mode, the PM watches the QA result with the same signals as
+  D70, and a fail opens a new fix ticket and PR** (Gael: "yes, same signals, fail opens a
+  new fix ticket."), since the change is already merged. The fix ticket links the
+  original and carries the QA person's reason.
+- **D73. The QA check runs in godmode's prompt hook from the ticket store, never from the
+  PM's memory** (Gael: "yes log it"). Gael's worry: after a session open for weeks, the PM
+  may no longer remember that a ticket waits on QA. So on each prompt the hook (code)
+  reads the tickets in the QA status from disk, checks the signals it can reach itself
+  (GitHub through `gh`), and adds a fresh line to that prompt with each result or "still
+  waiting". Compaction cannot lose it, as it comes from disk each time, like D64's
+  reminder line. If a hook cannot call the Jira tools (a spike is needed), the line says
+  to check that ticket's Jira status and the PM model does that check, reminded on every
+  prompt. Rejected: a timer re-checking every few minutes. Gael: "feels overkill and
+  could get out of hand"; a fail is seen on his next message, which is enough.
 
 ### Step 3, setup mode, as built (2026-10-16)
 
@@ -610,7 +663,8 @@ D29-D34, D54, D59, D61, D64, D68. Recorded so a later session knows why it is sh
 - The setup agent's five tools: `setup_scan` (the deterministic scan: stacks, commands,
   git and PR host, conventions files, runnable UI, and the templates on offer),
   `setup_questionnaire` (only the gaps the scan left, then permissions, storage, tracker,
-  attribution, QA, indicator; a question about reference repos is refused, D59),
+  attribution, QA, indicator; a question about reference repos is refused, D59; the QA
+  question is still D34's on/off, which D69 replaces),
   `setup_confirm` (Gael's yes before weak conventions are improved in place, D32),
   `setup_write_preset` (writes the templates, filled from the scan; never overwrites), and
   `setup_finish` (refuses while a required piece is neither written nor covered by an
@@ -634,3 +688,57 @@ D29-D34, D54, D59, D61, D64, D68. Recorded so a later session knows why it is sh
 - Open, for Gael: whether a gitignored or outside setup should also write a root
   `CLAUDE.local.md` that points at the conventions, so a session without godmode on
   still sees them.
+
+### QA modes: what they change, and open questions (2026-11-04)
+
+Notes, not decisions. D69-D73 change some earlier decisions; the "(changed by D69)" notes
+above mark where. The work is planned in `build-plan.md` (Step 13, and the order under
+"What comes next").
+
+- Shared vs personal (D61): the QA mode is shared, since it replaces D61's shared "QA on
+  or off" and D69 asks it per repo. Where the other new answers go is open (below).
+
+Open questions found while planning, none decided:
+
+- Where the bot pass before human QA (D71), the pass status's name and the named QA
+  people or team (D70) belong under D61: shared or personal.
+- How godmode records "QA passed" when Gael tells the PM, so that the ready gate, which
+  is code, can read it: a ticket field only the main thread may set, like `ready`, or
+  something else.
+- Whether a QA pass counts only at the PR's commit it was given at, as a review verdict
+  does (D53), so that a later commit needs a new QA pass.
+- How a fail shows through each signal. D70 asks only for the pass status's name: which
+  board status, or which PR review (changes requested?), means a fail.
+- Which tickets wait on QA when the tracker is Jira or Other. D73 reads them "from
+  disk", which only holds for markdown tickets: godmode could keep its own list of the
+  tickets it moved to QA, or ask the tracker on each prompt.
+- The name of the board's "waiting for QA" status in Jira or Other, which godmode's `qa`
+  status maps to. Setup asks only for the pass status's name.
+- Markdown tickets (tracker None): their statuses are fixed, and testers outside godmode
+  cannot see gitignored or outside-the-repo tickets, so the "ticket status" signal may
+  only make sense with Jira, Other or committed tickets.
+- Whether human QA skips tickets whose change is not visible, as bot QA does (D36).
+- Whether a human QA fail counts towards the fix-round limit (D56).
+- After a human fail in `human-pr`: whether the bot pass (D71) runs again before the
+  testers, and whether they re-test everything or only what failed (D35's rule was
+  written for bot QA).
+- D72 says a staging fail "opens a new fix ticket and PR"; D52 says filing a ticket
+  never starts a build. Whether the fix starts on its own or waits for Gael's go.
+- `human-staging`: whether a PR approval still means anything once the PR is merged;
+  whether the fix ticket goes through QA itself; when the original ticket closes.
+- `human-pr` on GitHub: check whether QA people can approve a PR that is still a draft,
+  since godmode keeps it a draft until QA passes.
+- Git hosts other than GitHub (D55) and local branches (D54) have no PR approval for
+  the hook to read.
+- `/godmode` and QA results: D70 has the PM check on `/godmode`, but D46 keeps
+  switching on quiet, and D57 makes the resume lines the one thing it shows.
+- The prompt hook's cost: each waiting ticket means a `gh` call on every prompt, and
+  spike 6 says long sweeps do not belong in a hook that holds work up. A limit, or
+  keeping each answer for a short while, may be needed; a timer is ruled out (D73).
+- D73's Jira fallback has the PM check Jira itself, so D63's thin main thread must let
+  that read through, or the ticket list tool must do it.
+- Resume (D57): whether a ticket waiting in `qa` counts as in progress. It should not
+  restart dev work, and in `human-staging` its worktree is already gone.
+- Changing the QA mode later in change-setup (D22) while tickets sit in the `qa` status.
+- Notes written before D69 hold QA on or off. Until Gael says yes to the update notice
+  (D60), how they are read (on as `bot`, off as `none`?).
