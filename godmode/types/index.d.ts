@@ -23,6 +23,10 @@ export interface DispatchedAgent {
   worktree?: string
   /** The dev agent's branch: an open PR on it is its own, not a held file's owner (D48). */
   branch?: string
+  /** The name it was dispatched with (`Agent({ name })`), which SendMessage may address it by. */
+  name?: string
+  /** True for a dev agent a workflow launched: the workflow, not a resume, carries its ticket on. */
+  isWorkflow?: boolean
 }
 
 /** A draft PR a dev agent opened, waiting for the PM to be told to start its review (D35). */
@@ -33,6 +37,8 @@ export interface PendingReview {
   /** The dev agent that opened it. */
   agentId: string
   ticket?: string
+  /** The line for the PM about the ticket: the move to review to mirror in a tracker godmode cannot reach (Other), or what to do by hand when recording the PR or the move failed. */
+  mirror?: string
 }
 
 /** A stack the setup scan recognises from the files at the project's root (D29). */
@@ -100,6 +106,24 @@ export interface SetupRun {
   consented: string[]
   /** Files `setup_write_preset` wrote, absolute, with the template each came from. */
   written: { template: string; path: string }[]
+  /**
+   * A change-setup's round (D22), until `setup_finish` saves it: the topics asked, the
+   * recorded keys they replace, the person's answers, and whether it answers an update (D60).
+   */
+  change?: { topics: string[]; dropped: string[]; answers: Record<string, string | number | boolean>; isUpdate: boolean }
+}
+
+/** The app `/godmode try` started for the person (D49): one at a time. */
+export interface TryRun {
+  ticket: string
+  /** The free port godmode gave the app in `PORT`; what listens there is freed when the try stops. */
+  port: number
+  /** The link the person was given: that port, or the one the app's output printed when it ignores `PORT`. */
+  url: string
+  /** The project's start command, as the setup note holds it. */
+  command: string
+  /** The ticket's worktree, absolute, where the command runs. */
+  worktree: string
 }
 
 /** How the "godmode is on" indicator shows (D68): a footer mode label, a hint-line tag, or a band above the prompt. */
@@ -128,6 +152,8 @@ declare module 'claude-code' {
       setupReport: string
       /** The style of the on-indicator (D68), a personal answer; `mode` unless the note says otherwise. */
       indicator: 'mode' | 'hint' | 'band'
+      /** The app `/godmode try` runs, until `/godmode try stop`, the next try or the session's end; null when none. */
+      tryRun: TryRun | null
     }
   }
 }

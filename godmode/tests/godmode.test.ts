@@ -59,17 +59,29 @@ test('/godmode switches on in coding mode, quietly', async ($, on) => {
   expect(answer.text).toBeUndefined()
 })
 
-test('/godmode while on changes nothing', async ($, on) => {
+test('/godmode while on in coding mode changes nothing', async ($, on) => {
   await setUp(on)
   const seen = watchState(on)
-  await godmode($, 'setup')
+  await godmode($)
   const writes = seen.writes
 
   const answer = await godmode($)
 
   expect(seen.writes).toBe(writes)
-  expect(seen.mode).toBe('change-setup')
+  expect(seen.mode).toBe('coding')
   expect(answer.text).toBeUndefined()
+})
+
+test('/godmode in change-setup mode ends the change unsaved and goes back to coding mode, in one line', async ($, on) => {
+  await setUp(on)
+  const seen = watchState(on)
+  await godmode($, 'setup')
+
+  const answer = await godmode($)
+
+  expect(seen.isOn).toBe(true)
+  expect(seen.mode).toBe('coding')
+  expect(answer.text).toBe('godmode left change-setup mode with nothing saved: back in coding mode.')
 })
 
 test('/godmode setup switches on in change-setup mode, from off and from coding', async ($, on) => {
@@ -105,17 +117,18 @@ test('/godmode off switches off, and says so when already off', async ($, on) =>
   expect(again.text).toBe('godmode is already off.')
 })
 
-test('/godmode report and /godmode try answer without touching state', async ($, on) => {
+test('/godmode report, and /godmode try where nothing can start, answer without touching state', async ($, on) => {
+  mountWorld(on, makeWorld())
   const seen = watchState(on)
+  on('agent.list', () => ({ value: [] }))
 
   const report = await godmode($, 'report')
   const tried = await godmode($, 'try T-3')
   const bare = await godmode($, 'try')
 
   expect(seen.writes).toBe(0)
-  expect(report.text).toContain('not built yet')
-  expect(tried.text).toContain('T-3')
-  expect(tried.text).toContain('not built yet')
+  expect(report.text).toContain('not set up in this project yet')
+  expect(tried.text).toContain('not set up in this project yet')
   expect(bare.text).toContain('Name a ticket')
 })
 
@@ -141,6 +154,39 @@ test('/godmode with no setup note switches on in setup mode, and tells the PM to
   expect(answer.text).toContain('godmode is setting up this project')
   expect(answer.context?.[0]).toContain('subagent_type `godmode:setup`')
   expect(answer.context?.[0]).toContain('Scope: full')
+})
+
+test('wired: /godmode setup offers the update in one line and briefs the PM; with no note a full setup starts', async ($, on) => {
+  const world = makeWorld({ pluginVersion: '0.6.0' })
+  mountWorld(on, world)
+  const seen = watchState(on)
+  const asked: string[] = []
+  on('tool.call', (_$, e) => {
+    if (e.tool === 'AskUserQuestion') asked.push(e.tool)
+    return { deny: 'nobody answers here' }
+  })
+
+  const fresh = await godmode($, 'setup')
+
+  expect(seen.mode).toBe('setup')
+  expect(seen.setupScope).toBe('full')
+  expect(fresh.text).toContain('no godmode setup to change yet, so a full setup runs')
+  expect(fresh.context?.[0]).toContain('subagent_type `godmode:setup`')
+
+  // A note written by an older godmode, from before the QA modes.
+  await setUpProject(world, { sharedAnswers: { tracker: 'none', qa: true } }, '0.5.0')
+  const change = await godmode($, 'setup')
+
+  expect(seen.mode).toBe('change-setup')
+  const offers = (change.text ?? '').split('\n').filter(line => line.includes('asks something new'))
+  expect(offers).toHaveLength(1)
+  expect(offers[0]).toContain('godmode 0.6.0 asks something new since this project\'s setup (0.5.0): the QA mode')
+  expect(asked).toEqual([])
+  const brief = change.context?.join('\n') ?? ''
+  expect(brief).toContain('Never edit the setup note')
+  expect(brief).toContain('setup_questionnaire with `change`')
+  expect(brief).toContain('change ["update"]')
+  expect(brief).not.toContain('godmode:setup')
 })
 
 for (const storage of ['committed', 'gitignored', 'outside'] as const) {

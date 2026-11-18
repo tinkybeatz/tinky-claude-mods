@@ -4,11 +4,13 @@ import type { AgentSpawnInput, On } from 'claude-code'
 
 import type { ScanFacts } from '../types'
 import { gapQuestions, questionsFor, resolveAnswer } from '../hooks/questionnaire'
+import type { Question } from '../hooks/questionnaire'
 import { analyse, presetFoldersFor, scanProject } from '../hooks/scan'
 import type { Snapshot } from '../hooks/scan'
 import { fillTemplate, notesKey } from '../hooks/setup'
 import { projectOf } from '../hooks/storage'
 import { trackerOf } from '../hooks/tickets'
+import { makeJira, mountJira, SERVER } from './jira-world'
 import { FIRST_COMMIT, HOME, makeWorld, mountWorld, REPO, worldEngine } from './world'
 import type { World } from './world'
 
@@ -168,7 +170,7 @@ const facts = (overrides: Partial<ScanFacts> = {}): ScanFacts => ({
 })
 
 test('questionnaire: a fully scanned project asks only the person\'s choices, in order', () => {
-  expect(questionsFor(facts(), 'full').map(question => question.key)).toEqual(['permissions', 'storage', 'tracker', 'attribution', 'qa', 'indicator'])
+  expect(questionsFor(facts(), 'full').map(question => question.key)).toEqual(['permissions', 'storage', 'tracker', 'attribution', 'qaHuman', 'indicator'])
 })
 
 test('questionnaire: each gap the scan left becomes one question, first', () => {
@@ -191,10 +193,78 @@ test('questionnaire: GitHub with gh not signed in asks; no origin at all asks no
   expect(gapQuestions(none)).toEqual([])
 })
 
-test('questionnaire: QA defaults on only with a runnable UI (D34)', () => {
-  const qaOf = (hasUi: boolean) => questionsFor(facts({ hasUi, uiReason: 'React app' }), 'full').find(question => question.key === 'qa')
-  expect(qaOf(true)?.choices[0]).toEqual({ label: 'On (default)', value: true })
-  expect(qaOf(false)?.choices[0]).toEqual({ label: 'Off (default)', value: false })
+/** The QA question for these facts, and the follow-ups each answer leads to. */
+const qaFlow = (scanned: ScanFacts) => {
+  const qa = questionsFor(scanned, 'full').find(question => question.key === 'qaHuman')
+  if (qa === undefined) throw new Error('no QA question')
+  const after = (question: Question | undefined, answers: Record<string, string | boolean>) => question?.followUps?.(answers) ?? []
+  return { qa, after }
+}
+
+test('questionnaire: people testing leads to where; no people, to the QA agent (D69)', () => {
+  const { qa, after } = qaFlow(facts())
+  expect(qa.choices.map(choice => choice.value)).toEqual([true, false])
+  expect(after(qa, { qaHuman: true }).map(question => question.header)).toEqual(['QA where'])
+  expect(after(qa, { qaHuman: false }).map(question => question.header)).toEqual(['QA agent'])
+  expect(after(qa, { qaHuman: false })[0]?.choices.map(choice => choice.value)).toEqual(['none', 'bot'])
+  const [where] = after(qa, { qaHuman: true })
+  expect(where?.choices.map(choice => choice.value)).toEqual(['human-pr', 'human-staging'])
+})
+
+test('questionnaire: the runnable UI only picks the QA agent\'s default, with people testing or without (D34, D71)', () => {
+  const defaults = (hasUi: boolean) => {
+    const { qa, after } = qaFlow(facts({ hasUi, uiReason: 'React app' }))
+    const [agent] = after(qa, { qaHuman: false })
+    const [botFirst] = after(after(qa, { qaHuman: true })[0], { qaHuman: true, qaMode: 'human-pr' })
+    return [agent?.choices[0], botFirst?.choices[0]]
+  }
+  expect(defaults(true)).toEqual([
+    { label: 'On (default)', value: 'bot' },
+    { label: 'Yes (default)', value: true },
+  ])
+  expect(defaults(false)).toEqual([
+    { label: 'Off (default)', value: 'none' },
+    { label: 'No (default)', value: false },
+  ])
+})
+
+test('questionnaire: each pass signal is offered only where godmode can read it (D70)', () => {
+  const humanFlow = (scanned: ScanFacts, answers: Record<string, string | boolean>) => {
+    const { qa, after } = qaFlow(scanned)
+    const followUps = after(after(qa, { qaHuman: true })[0], { ...answers, qaHuman: true })
+    const signals = followUps.find(question => question.key === 'qaSignals')
+    return { headers: followUps.map(question => question.header), offered: signals?.choices.map(choice => choice.label) }
+  }
+  const local = facts({ git: { hasGit: true, host: 'local', hostReason: 'the repo has no `origin` remote' } })
+
+  // Markdown tickets have no board, so only the PR approval, and only before the merge on GitHub.
+  expect(humanFlow(facts(), { tracker: 'none', qaMode: 'human-pr' })).toEqual({ headers: ['QA bot first', 'QA signals'], offered: ['PR approval', 'Only being told'] })
+  expect(humanFlow(facts(), { tracker: 'none', qaMode: 'human-staging' })).toEqual({ headers: ['QA bot first'], offered: undefined })
+  expect(humanFlow(local, { tracker: 'none', qaMode: 'human-pr' })).toEqual({ headers: ['QA bot first'], offered: undefined })
+  // A board asks its waiting status too, and offers its pass status.
+  expect(humanFlow(facts(), { tracker: 'jira', qaMode: 'human-pr' })).toEqual({
+    headers: ['QA bot first', 'QA waiting', 'QA signals'],
+    offered: ['Ticket status', 'PR approval', 'Only being told'],
+  })
+  expect(humanFlow(local, { tracker: 'other', qaMode: 'human-staging' })).toEqual({
+    headers: ['QA bot first', 'QA waiting', 'QA signals'],
+    offered: ['Ticket status', 'Only being told'],
+  })
+})
+
+test('questionnaire: the signals are picked together, each leading to its own name question', () => {
+  const { qa, after } = qaFlow(facts())
+  const signals = after(after(qa, { qaHuman: true })[0], { qaHuman: true, tracker: 'jira', qaMode: 'human-pr' }).find(question => question.key === 'qaSignals')
+  if (signals === undefined) throw new Error('no signals question')
+  expect(signals.multiSelect).toBe(true)
+  expect(resolveAnswer(signals, 'Ticket status, PR approval').values).toEqual({ qaSignals: 'ticket-status,pr-approval' })
+  expect(resolveAnswer(signals, 'pr-approval').values).toEqual({ qaSignals: 'pr-approval' })
+  expect(resolveAnswer(signals, 'Only being told').values).toEqual({ qaSignals: '' })
+  const unclear = resolveAnswer(signals, 'PR approval, Slack')
+  expect(unclear.values).toEqual({ qaSignals: 'pr-approval' })
+  expect(unclear.note).toContain('"Slack" named none of the choices')
+  expect(after(signals, { qaSignals: 'ticket-status,pr-approval' }).map(question => question.header)).toEqual(['QA pass', 'QA approvers'])
+  expect(after(signals, { qaSignals: '' })).toEqual([])
 })
 
 test('questionnaire: a personal setup asks only the personal questions (D61)', () => {
@@ -258,6 +328,8 @@ type Setup = {
   world: World
   /** Each question the person saw, by its chip. */
   asked: string[]
+  /** The choices each question offered, by its chip. */
+  offered: Record<string, string[]>
   /** The person's answer per chip; absent, the first option; `null` dismisses it. */
   answers: Record<string, string | null>
   /** Edits that got past the plugin. */
@@ -270,7 +342,7 @@ const godmode = ($: Engine, args = '') => $.command.run({ command: 'godmode', ar
 
 /** Mounts the world and the person beneath the plugin; registers every hook before the first `$` call. */
 const mount = (on: On, world: World, answers: Setup['answers'] = {}, beneath?: (on: On) => void): Setup => {
-  const setup: Setup = { world, asked: [], answers, edited: [], spawned: [], contexts: [] }
+  const setup: Setup = { world, asked: [], offered: {}, answers, edited: [], spawned: [], contexts: [] }
   mountWorld(on, world)
   on('agent.list', () => ({ value: [] }))
   on('ui.toast', () => ({ value: undefined }) as never)
@@ -288,6 +360,7 @@ const mount = (on: On, world: World, answers: Setup['answers'] = {}, beneath?: (
       const question = (input.questions as { question: string; header: string; options: { label: string }[] }[])[0]
       const header = question?.header ?? ''
       setup.asked.push(header)
+      setup.offered[header] = question?.options.map(option => option.label) ?? []
       const answer = setup.answers[header]
       if (answer === null) return { deny: 'The person dismissed the question.' }
       return { result: { questions: input.questions, answers: { [question?.question ?? '']: answer ?? question?.options[0]?.label ?? '' } } } as never
@@ -318,7 +391,7 @@ const sharedNote = (world: World, dir = `${REPO}/.godmode`) => JSON.parse(world.
 const personalNote = (world: World, dir = `${REPO}/.godmode`) => JSON.parse(world.files.get(`${dir}/personal.json`) ?? 'null') as { answers: Record<string, unknown> }
 
 test('setup, no conventions: the preset is written, the note lands, and the next /godmode is coding mode', async ($, on) => {
-  const setup = mount(on, webApp(), { Permissions: 'Free', Indicator: 'Band' })
+  const setup = mount(on, webApp(), { Permissions: 'Free', Indicator: 'Band', QA: 'No' })
 
   await godmode($)
   // The PM dispatches the setup agent, which runs on Opus whatever the call asked (D33, D39).
@@ -336,8 +409,9 @@ test('setup, no conventions: the preset is written, the note lands, and the next
 
   const answers = resultOf(await tool($, 'setup_questionnaire'))
   // A web app with its commands found and GitHub signed in: no gap to ask about.
-  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'Indicator'])
-  expect(answers).toContain('- qa: true')
+  // No people test, and the runnable UI makes the QA agent the default (D69).
+  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA agent', 'Indicator'])
+  expect(answers).toContain('- qaMode: "bot"')
 
   const wrote = resultOf(await tool($, 'setup_write_preset'))
   expect(wrote).toContain('- wrote AGENTS.md from required/AGENTS.md')
@@ -351,6 +425,8 @@ test('setup, no conventions: the preset is written, the note lands, and the next
 
   const done = resultOf(await tool($, 'setup_finish', { answers: { singleTestCommand: 'npx vitest run <file>' } }))
   expect(done).toContain('setup is done')
+  // The PM learns the QA mode from the report.
+  expect(done).toContain('\nQA mode: bot (')
 
   const shared = sharedNote(setup.world)
   expect(shared.storage).toBe('committed')
@@ -362,7 +438,7 @@ test('setup, no conventions: the preset is written, the note lands, and the next
     baseBranch: 'main',
     singleTestCommand: 'npx vitest run <file>',
     tracker: 'none',
-    qa: true,
+    qaMode: 'bot',
   })
   expect(personalNote(setup.world).answers).toEqual({ permissions: 'free', attribution: false, indicator: 'band' })
   expect(shared.conventions.map(file => file.path)).toEqual([
@@ -479,10 +555,12 @@ test('setup asks only the gaps, never reference repos, and skips what the person
   const answers = resultOf(
     await tool($, 'setup_questionnaire', {
       extra: [{ key: 'e2eCommand', question: 'Which end-to-end suite runs before merge?', options: ['None', 'make e2e'] }],
-      given: { tracker: 'no tracker', storage: 'outside' },
+      given: { tracker: 'no tracker', storage: 'outside', qaHuman: 'no', qaMode: 'none' },
     }),
   )
-  expect(setup.asked).toEqual(['Tests', 'e2eCommand', 'Permissions', 'Attribution', 'QA', 'Indicator'])
+  // The QA answer and its follow-up were given, so neither is asked.
+  expect(setup.asked).toEqual(['Tests', 'e2eCommand', 'Permissions', 'Attribution', 'Indicator'])
+  expect(answers).toContain('- qaMode: "none"')
   expect(answers).toContain('- testCommand: "pytest -q"')
   expect(answers).toContain('- tracker: "none"')
   expect(answers).toContain('- e2eCommand: "None"')
@@ -499,6 +577,147 @@ test('setup that cannot ask stops, saying which questions are left for the PM to
   expect(stopped.deny).toContain('- indicator:')
   expect(stopped.deny).not.toContain('- permissions:')
   expect(setup.asked).toEqual(['Permissions', 'Storage'])
+})
+
+/** A setup run through to its note with the person's answers; resolves the report. */
+const setUp = async ($: Engine) => {
+  await godmode($)
+  await tool($, 'setup_questionnaire')
+  resultOf(await tool($, 'setup_write_preset'))
+  return resultOf(await tool($, 'setup_finish'))
+}
+
+test('setup, people test the PR: where, the bot pass, the board\'s statuses and the approvers land in the shared note (D69, D70, D71)', async ($, on) => {
+  const setup = mount(on, webApp(), {
+    Tracker: 'Jira',
+    QA: 'Yes, people test',
+    'QA where': 'On the PR',
+    'QA bot first': 'No',
+    'QA waiting': 'In QA',
+    'QA signals': 'Ticket status, PR approval',
+    'QA pass': 'Ready to ship',
+    'QA approvers': 'acme/qa',
+  })
+
+  const done = await setUp($)
+
+  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA where', 'QA bot first', 'QA waiting', 'QA signals', 'QA pass', 'QA approvers', 'Indicator'])
+  const answers = sharedNote(setup.world).answers
+  expect(answers).toMatchObject({
+    qaMode: 'human-pr',
+    qaBotFirst: false,
+    qaWaitStatus: 'In QA',
+    qaSignals: 'ticket-status,pr-approval',
+    qaPassStatus: 'Ready to ship',
+    qaApprovers: 'acme/qa',
+  })
+  // The answer that only led to where people test is not kept, and nor is the old on or off.
+  expect(Object.keys(answers)).not.toContain('qaHuman')
+  expect(Object.keys(answers)).not.toContain('qa')
+  expect(Object.keys(personalNote(setup.world).answers).filter(key => key.startsWith('qa'))).toEqual([])
+  expect(done).toContain('\nQA mode: human-pr (')
+  expect(done).toContain('The QA agent tests first: no. Waiting-for-QA status: "In QA". Pass signals: being told, the ticket moved to "Ready to ship", a PR approval from acme/qa.')
+})
+
+test('setup, people test on staging: no PR signal and, with markdown tickets, no board signal (D69, D70)', async ($, on) => {
+  const setup = mount(on, webApp(), { QA: 'Yes, people test', 'QA where': 'On staging' })
+
+  const done = await setUp($)
+
+  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA where', 'QA bot first', 'Indicator'])
+  const answers = sharedNote(setup.world).answers
+  // The runnable UI made the bot pass first the default (D71).
+  expect(answers).toMatchObject({ tracker: 'none', qaMode: 'human-staging', qaBotFirst: true })
+  expect(Object.keys(answers).filter(key => key.startsWith('qa')).sort()).toEqual(['qaBotFirst', 'qaMode'])
+  expect(done).toContain('\nQA mode: human-staging (')
+  expect(done).toContain('Pass signals: being told.')
+})
+
+test('setup, no people and no QA agent: the mode is none, with nothing else asked (D69)', async ($, on) => {
+  const setup = mount(on, webApp(), { QA: 'No', 'QA agent': 'Off' })
+
+  const done = await setUp($)
+
+  expect(setup.asked.filter(header => header.startsWith('QA'))).toEqual(['QA', 'QA agent'])
+  expect(sharedNote(setup.world).answers.qaMode).toBe('none')
+  expect(done).toContain('\nQA mode: none (')
+})
+
+test('setup that cannot ask the QA question lists its follow-ups, so one round of answers covers them', async ($, on) => {
+  const setup = mount(on, webApp(), { QA: null })
+  await godmode($)
+
+  const stopped = await tool($, 'setup_questionnaire')
+
+  expect(setup.asked.at(-1)).toBe('QA')
+  expect(stopped.deny).toContain('- qaHuman: Do people (QA engineers) test changes')
+  expect(stopped.deny).toContain('  if Yes, people test:\n    - qaMode: Where do the people test')
+  expect(stopped.deny).toContain('      if On the PR:\n        - qaBotFirst:')
+  expect(stopped.deny).toContain('  if No:\n    - qaMode: Should a QA agent run the app')
+  expect(stopped.deny).toContain('- indicator:')
+})
+
+test('setup that stops at the tracker lists the board\'s QA questions as conditional, and one round of answers then covers the flow', async ($, on) => {
+  const setup = mount(on, webApp(), { Tracker: null })
+  await godmode($)
+
+  const stopped = await tool($, 'setup_questionnaire')
+
+  expect(setup.asked.at(-1)).toBe('Tracker')
+  // The tracker is unknown, so what only a board brings is listed, marked with its condition.
+  expect(stopped.deny).toContain('      if On staging:\n        - qaBotFirst:')
+  expect(stopped.deny).toContain('        - qaWaitStatus (only if the tracker is Jira or Other): Which status')
+  expect(stopped.deny).toContain('        - qaSignals (only if the tracker is Jira or Other): Being told')
+  expect(stopped.deny).toContain('(Ticket status [only if the tracker is Jira or Other] / PR approval / Only being told)')
+  expect(stopped.deny).toContain('- qaPassStatus: Which status on the board means QA passed?')
+
+  // The PM relays them; the person picks Jira. Every QA dialog is dismissed, so only `given` can answer.
+  for (const header of ['Tracker', 'QA', 'QA where', 'QA bot first', 'QA waiting', 'QA signals', 'QA pass', 'Attribution', 'Indicator']) setup.answers[header] = null
+  const answers = resultOf(
+    await tool($, 'setup_questionnaire', {
+      given: {
+        tracker: 'Jira',
+        attribution: 'No attribution',
+        qaHuman: 'Yes, people test',
+        qaMode: 'On staging',
+        qaBotFirst: 'Yes',
+        qaWaitStatus: 'In QA',
+        qaSignals: 'Ticket status',
+        qaPassStatus: 'QA passed',
+        indicator: 'Band',
+      },
+    }),
+  )
+
+  expect(setup.asked.slice(3)).toEqual(['Permissions', 'Storage'])
+  expect(answers).toContain('- qaWaitStatus: "In QA"')
+  expect(answers).toContain('- qaSignals: "ticket-status"')
+  expect(answers).toContain('- qaPassStatus: "QA passed"')
+})
+
+test('setup asked again on another QA branch keeps none of the earlier branch\'s answers', async ($, on) => {
+  const setup = mount(on, webApp(), {
+    Tracker: 'Jira',
+    QA: 'Yes, people test',
+    'QA where': 'On the PR',
+    'QA waiting': 'In QA',
+    'QA signals': 'Ticket status, PR approval',
+    'QA pass': 'Ready to ship',
+    'QA approvers': 'acme/qa',
+    Indicator: null,
+  })
+  await godmode($)
+  expect((await tool($, 'setup_questionnaire')).deny).toContain('could not ask the person')
+
+  Object.assign(setup.answers, { QA: 'No', 'QA agent': 'Off', Indicator: 'Band' })
+  resultOf(await tool($, 'setup_questionnaire'))
+  resultOf(await tool($, 'setup_write_preset'))
+  resultOf(await tool($, 'setup_finish'))
+
+  const answers = sharedNote(setup.world).answers
+  expect(Object.keys(answers).filter(key => key.startsWith('qa'))).toEqual(['qaMode'])
+  expect(answers.qaMode).toBe('none')
+  expect(answers.tracker).toBe('jira')
 })
 
 test('setup in gitignored storage keeps the conventions under .godmode, excluded from git (D19, D65)', async ($, on) => {
@@ -531,6 +750,62 @@ test('setup outside the repo writes nothing in it, and every agent brief lists t
   expect(setup.spawned[0]?.model).toBe('opus')
 })
 
+test('setup with Jira: the one server is used unasked, the site read, the project picked, and the board\'s statuses offered for the mapping and for QA', async ($, on) => {
+  const jira = makeJira()
+  for (const [index, status] of ['To Do', 'In Progress', 'Code Review', 'In QA', 'QA passed', 'Done'].entries()) {
+    jira.issues.set(`APP-${index + 1}`, { key: `APP-${index + 1}`, summary: `Issue ${index + 1}`, status })
+  }
+  const setup = mount(
+    on,
+    webApp(),
+    {
+      Tracker: 'Jira',
+      'Jira project': 'APP (App)',
+      'Jira mapping': 'Keep it',
+      QA: 'Yes, people test',
+      'QA where': 'On staging',
+      'QA bot first': 'No',
+      'QA waiting': 'In QA',
+      'QA signals': 'Ticket status',
+      'QA pass': 'QA passed',
+    },
+    beneath => mountJira(beneath, jira),
+  )
+
+  await setUp($)
+
+  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Jira project', 'Jira mapping', 'Attribution', 'QA', 'QA where', 'QA bot first', 'QA waiting', 'QA signals', 'QA pass', 'Indicator'])
+  expect(setup.offered['Jira project']).toEqual(['APP (App)', 'OPS (Ops)'])
+  expect(setup.offered['QA waiting']).toEqual(['In QA', 'To Do', 'In Progress', 'Code Review'])
+  expect(setup.offered['QA pass']).toEqual(['QA passed', 'Done', 'To Do', 'In Progress'])
+  const shared = sharedNote(setup.world).answers
+  expect(shared).toMatchObject({
+    tracker: 'jira',
+    jiraCloudId: 'site-1',
+    jiraProject: 'APP',
+    jiraTodoStatus: 'To Do',
+    jiraDoingStatus: 'In Progress',
+    jiraReviewStatus: 'Code Review',
+    jiraDoneStatus: 'Done',
+    qaWaitStatus: 'In QA',
+    qaPassStatus: 'QA passed',
+  })
+  // The server's name is this person's, so it stays out of the team's half (D61).
+  expect(Object.keys(shared)).not.toContain('jiraServer')
+  expect(Object.keys(shared)).not.toContain('jiraStatusMap')
+  expect(personalNote(setup.world).answers.jiraServer).toBe(SERVER)
+})
+
+test('setup with Jira and no Atlassian server connected asks nothing more and says what is missing', async ($, on) => {
+  const setup = mount(on, webApp(), { Tracker: 'Jira', QA: 'No', 'QA agent': 'Off' }, beneath => mountJira(beneath, makeJira({ isDisconnected: true })))
+  await godmode($)
+
+  const answered = resultOf(await tool($, 'setup_questionnaire'))
+
+  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA agent', 'Indicator'])
+  expect(answered).toContain('Note: No Atlassian (Jira) server is connected to this session, so godmode could not read the board.')
+})
+
 test('a teammate\'s personal setup asks three questions and writes only the personal half (D61)', async ($, on) => {
   const world = webApp()
   world.files.set(`${REPO}/AGENTS.md`, '# Rules\n')
@@ -542,8 +817,9 @@ test('a teammate\'s personal setup asks three questions and writes only the pers
   expect(started.context?.[0]).toContain('Scope: personal')
   await tool($, 'setup_questionnaire')
   expect((await tool($, 'setup_write_preset')).deny).toContain('personal setup')
-  resultOf(await tool($, 'setup_finish'))
+  const done = resultOf(await tool($, 'setup_finish'))
 
+  expect(done).toContain('\nQA mode: none (')
   expect(team.asked).toEqual(['Permissions', 'Attribution', 'Indicator'])
   expect(world.files.get(`${REPO}/.godmode/shared.json`)).toBe(shared)
   expect(personalNote(world).answers).toEqual({ permissions: 'locked', attribution: false, indicator: 'hint' })

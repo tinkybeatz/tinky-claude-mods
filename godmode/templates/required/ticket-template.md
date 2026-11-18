@@ -7,7 +7,7 @@ section out only when it truly does not apply.
 ```markdown
 # <id> <title>
 
-Status: todo | doing | review | done
+Status: todo | doing | review | qa | done
 Blocked by: <ticket ids, or none>
 Visible change: yes | no
 

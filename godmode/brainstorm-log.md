@@ -689,56 +689,61 @@ D29-D34, D54, D59, D61, D64, D68. Recorded so a later session knows why it is sh
   `CLAUDE.local.md` that points at the conventions, so a session without godmode on
   still sees them.
 
-### QA modes: what they change, and open questions (2026-11-04)
+### QA modes: build defaults (2026-11-16)
 
-Notes, not decisions. D69-D73 change some earlier decisions; the "(changed by D69)" notes
-above mark where. The work is planned in `build-plan.md` (Step 13, and the order under
-"What comes next").
+Build defaults, not decisions: none gets a D-number, and Gael can overrule any of them
+later. They settle the questions found on 2026-11-04 while planning D69-D73, so Step 13
+of `build-plan.md` can be built without asking. Each takes the simplest choice that keeps
+the loop safe: when unsure, refuse ready or merge rather than allow it. The "(changed by
+D69)" notes above mark where D69-D73 change earlier decisions.
 
-- Shared vs personal (D61): the QA mode is shared, since it replaces D61's shared "QA on
-  or off" and D69 asks it per repo. Where the other new answers go is open (below).
-
-Open questions found while planning, none decided:
-
-- Where the bot pass before human QA (D71), the pass status's name and the named QA
-  people or team (D70) belong under D61: shared or personal.
-- How godmode records "QA passed" when Gael tells the PM, so that the ready gate, which
-  is code, can read it: a ticket field only the main thread may set, like `ready`, or
-  something else.
-- Whether a QA pass counts only at the PR's commit it was given at, as a review verdict
-  does (D53), so that a later commit needs a new QA pass.
-- How a fail shows through each signal. D70 asks only for the pass status's name: which
-  board status, or which PR review (changes requested?), means a fail.
-- Which tickets wait on QA when the tracker is Jira or Other. D73 reads them "from
-  disk", which only holds for markdown tickets: godmode could keep its own list of the
-  tickets it moved to QA, or ask the tracker on each prompt.
-- The name of the board's "waiting for QA" status in Jira or Other, which godmode's `qa`
-  status maps to. Setup asks only for the pass status's name.
-- Markdown tickets (tracker None): their statuses are fixed, and testers outside godmode
-  cannot see gitignored or outside-the-repo tickets, so the "ticket status" signal may
-  only make sense with Jira, Other or committed tickets.
-- Whether human QA skips tickets whose change is not visible, as bot QA does (D36).
-- Whether a human QA fail counts towards the fix-round limit (D56).
-- After a human fail in `human-pr`: whether the bot pass (D71) runs again before the
-  testers, and whether they re-test everything or only what failed (D35's rule was
-  written for bot QA).
-- D72 says a staging fail "opens a new fix ticket and PR"; D52 says filing a ticket
-  never starts a build. Whether the fix starts on its own or waits for Gael's go.
-- `human-staging`: whether a PR approval still means anything once the PR is merged;
-  whether the fix ticket goes through QA itself; when the original ticket closes.
-- `human-pr` on GitHub: check whether QA people can approve a PR that is still a draft,
-  since godmode keeps it a draft until QA passes.
-- Git hosts other than GitHub (D55) and local branches (D54) have no PR approval for
-  the hook to read.
-- `/godmode` and QA results: D70 has the PM check on `/godmode`, but D46 keeps
-  switching on quiet, and D57 makes the resume lines the one thing it shows.
-- The prompt hook's cost: each waiting ticket means a `gh` call on every prompt, and
-  spike 6 says long sweeps do not belong in a hook that holds work up. A limit, or
-  keeping each answer for a short while, may be needed; a timer is ruled out (D73).
-- D73's Jira fallback has the PM check Jira itself, so D63's thin main thread must let
-  that read through, or the ticket list tool must do it.
-- Resume (D57): whether a ticket waiting in `qa` counts as in progress. It should not
-  restart dev work, and in `human-staging` its worktree is already gone.
-- Changing the QA mode later in change-setup (D22) while tickets sit in the `qa` status.
-- Notes written before D69 hold QA on or off. Until Gael says yes to the update notice
-  (D60), how they are read (on as `bot`, off as `none`?).
+- QA mode under D61: shared, since it replaces D61's shared "QA on or off".
+- Bot pass first (D71), pass status name, named QA people or team (D70): default: shared,
+  like the mode; they say how the repo is tested, and D61 shares what quality rests on.
+- Recording "QA passed" when Gael says it: default: a `qaResult` ticket field (passed or
+  failed, at the PR's commit) only the main thread sets with `ticket_move`, like `ready`.
+- A pass at a commit: default: it counts only at the commit it was given at; a later
+  commit needs a new pass, as a review verdict does (D53).
+- How a fail shows: default: a "changes requested" review from the named people, or the
+  ticket moved out of the waiting status to anything but the pass status. No new
+  question.
+- A fail's reason: default: the tester's latest comment on the ticket or PR; with none,
+  the PM asks Gael for it before the fix round.
+- Which tickets wait with Jira or Other: default: godmode keeps its own list of the
+  tickets it moved to `qa`, in the personal settings, so the hook still reads disk (D73).
+- The board's "waiting for QA" status in Jira or Other: default: setup asks it beside the
+  pass status, offering the board's statuses when it can read them; shared, like that one.
+- Ticket-status signal with markdown tickets: default: not offered with tracker None;
+  there the signals are being told and a PR review. Testers never edit ticket files (D24).
+- Tickets with no visible change: default: human QA skips them too, as bot QA does (D36);
+  testers would have nothing to try.
+- Fix-round limit: default: a human QA fail counts towards D56's limit, one count per
+  ticket whatever started the round, so the stop comes sooner, never later.
+- After a human fail in `human-pr`: default: review re-checks the changed lines, the bot
+  pass (when on) re-tests what testers flagged, then back to `qa`; the PM tells testers
+  what failed and what changed, and what they re-test is theirs to choose.
+- Staging fix ticket (D72 vs D52): default: it is filed and waits for Gael's go like any
+  ticket (D52), and the PM tells Gael it filed it. Filing never builds.
+- The fix ticket's own QA: default: it goes through the repo's QA mode like any ticket.
+- When the original closes in `human-staging`: default: it stops being watched once its
+  fix ticket is filed, and closes when the fix ticket passes QA, never before.
+- PR approval after the merge in `human-staging`: default: ignored; the signals there are
+  being told and the board status.
+- QA approvals on a draft PR: default: assumed to work on GitHub, and checked while 13.6
+  is built; if they do not, setup drops the PR signal from `human-pr`. A check, not a
+  question.
+- Hosts with no PR approval (D54, D55): default: the PR signal is offered only on GitHub
+  through `gh`; elsewhere being told and the board status remain.
+- `/godmode` and QA results: default: switching on shows none (D46, D57); the next
+  prompt's line carries them (D73), and `/godmode report` lists them (D70).
+- The prompt hook's cost: default: each ticket's answer is kept 5 minutes on disk, each
+  `gh` call stops after 3 seconds, at most 10 tickets are checked per prompt, and the rest
+  read "still waiting, not checked". Kept answers are not a timer (D73).
+- D73's Jira fallback and D63: default: the PM checks through the ticket list tool, which
+  routes to Jira (D24) and which D63 already allows; no new exception.
+- Resume (D57): default: a ticket in `qa` is not in progress: no dev restart and no resume
+  line; the prompt line and the report show it instead.
+- Changing the QA mode with tickets in `qa` (D22): default: a ticket leaves `qa` only with
+  a recorded pass, whatever the new mode; Gael saying it passed counts.
+- Notes written before D69: default: `qa: true` reads as `bot` and `false` as `none` until
+  Gael says yes to the update notice (D60), as 13.0 and 13.1 already plan.

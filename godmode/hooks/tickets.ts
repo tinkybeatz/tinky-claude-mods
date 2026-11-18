@@ -1,17 +1,29 @@
 import type { EngineInterface, ToolSpec } from 'claude-code'
 
-import { readNote } from './storage'
+import { jiraBackend } from './jira'
+import { readNote, trackerDirOf } from './storage'
 import type { Answer } from './storage'
 
-/** Where a ticket stands (D24). `done` tickets move to `tickets/done/`. */
-export type TicketStatus = 'todo' | 'doing' | 'review' | 'done'
+/**
+ * Where a ticket stands (D24). `qa` waits on QA after a clean review (D69) and stays in
+ * `tickets/` with the open ones; `done` tickets move to `tickets/done/`.
+ */
+export type TicketStatus = 'todo' | 'doing' | 'review' | 'qa' | 'done'
 
-export const TICKET_STATUSES: readonly TicketStatus[] = ['todo', 'doing', 'review', 'done']
+export const TICKET_STATUSES: readonly TicketStatus[] = ['todo', 'doing', 'review', 'qa', 'done']
 
 /** The tracker the setup chose (D23): `none` keeps markdown files, `jira` and `other` reach a real tracker. */
 export type TrackerKind = 'none' | 'jira' | 'other'
 
 export const TRACKERS: readonly TrackerKind[] = ['none', 'jira', 'other']
+
+/** The person's QA word on a ticket's PR (D69, D70). */
+export const QA_RESULTS = ['passed', 'failed'] as const
+
+export type QaWord = (typeof QA_RESULTS)[number]
+
+/** A QA result counts only at the commit it was given at, as a review verdict does (D53). */
+export type QaResult = { result: QaWord; commit: string }
 
 /** A ticket's short header: everything `list` reads, none of the body. */
 export type TicketHeader = {
@@ -28,8 +40,17 @@ export type TicketHeader = {
   visibleChange: boolean
   /** Set only when the person said go for this ticket, so dispatch may start it (D52). */
   ready: boolean
+  /** The last QA result recorded at the PR's commit; only the main thread records one, like `ready`. */
+  qaResult?: QaResult
+  /**
+   * The ticket this one fixes after people failed it on staging (D72). Once this one
+   * records a QA pass, that one may leave qa for done without its own.
+   */
+  fixFor?: string
   /** The day the ticket was filed, `YYYY-MM-DD`. */
   created: string
+  /** The ticket's status on a real tracker's board, by the board's own name (Jira); absent for files. */
+  trackerStatus?: string
 }
 
 /** What a new ticket holds: the header's own fields and the ticket shape from the reference loop. */
@@ -51,13 +72,22 @@ export type TicketDraft = {
   refs?: string
   blockedBy?: string[]
   visibleChange: boolean
+  /** The ticket this one fixes (D72); only the main thread sets it. */
+  fixFor?: string
 }
 
 /** A change to a ticket's header; fields left out stay as they are. */
-export type TicketChange = Partial<Pick<TicketHeader, 'status' | 'ready' | 'branch' | 'pr' | 'blockedBy' | 'visibleChange'>>
+export type TicketChange = Partial<Pick<TicketHeader, 'status' | 'ready' | 'branch' | 'pr' | 'blockedBy' | 'visibleChange' | 'qaResult'>>
 
-/** Which tickets `list` returns: absent `statuses`, every one not done. */
-export type TicketFilter = { statuses?: readonly TicketStatus[] }
+/**
+ * Which tickets `list` returns: absent `statuses`, every one not done. `around` adds one
+ * ticket whatever its status and, with `withFixes`, the tickets filed to fix it (D72), so a
+ * gate can read the open tickets and those few, never every done one.
+ */
+export type TicketFilter = { statuses?: readonly TicketStatus[]; around?: { id: string; withFixes?: boolean } }
+
+/** Every status but done: the tickets still in play. */
+export const OPEN_STATUSES: readonly TicketStatus[] = TICKET_STATUSES.filter(status => status !== 'done')
 
 export type TicketComment = { author: string; text: string }
 
@@ -67,9 +97,16 @@ export type TicketComment = { author: string; text: string }
  */
 export interface TicketBackend {
   readonly tracker: TrackerKind
+  /**
+   * For a tracker godmode cannot reach ("Other"): what the PM must do in the tracker itself
+   * to mirror `change`, added to the tool's answer.
+   */
+  mirror?(change: string): string
   create(draft: TicketDraft): Promise<TicketHeader>
   move(id: string, change: TicketChange): Promise<TicketHeader>
   list(filter: TicketFilter): Promise<TicketHeader[]>
+  /** `list`, with lines for the PM beside the tickets, such as an issue the tracker no longer has. */
+  listNoted?(filter: TicketFilter): Promise<{ headers: TicketHeader[]; notes: string[] }>
   comment(id: string, comment: TicketComment): Promise<TicketHeader>
 }
 
@@ -112,6 +149,9 @@ export const renderHeader = (header: TicketHeader) =>
     `blockedBy: ${header.blockedBy.join(', ')}`,
     `branch: ${oneLine(header.branch ?? '')}`,
     `pr: ${oneLine(header.pr ?? '')}`,
+    // Written only once recorded, so a ticket without one reads as tickets did before.
+    ...(header.qaResult === undefined ? [] : [`qaResult: ${header.qaResult.result} ${header.qaResult.commit}`]),
+    ...(header.fixFor === undefined ? [] : [`fixFor: ${header.fixFor}`]),
     `created: ${header.created}`,
     '---',
     '',
@@ -120,6 +160,14 @@ export const renderHeader = (header: TicketHeader) =>
     .join('\n')
 
 const isStatus = (value: string): value is TicketStatus => TICKET_STATUSES.includes(value as TicketStatus)
+
+const isQaWord = (value: unknown): value is QaWord => QA_RESULTS.some(word => word === value)
+
+/** `passed a1b2c3d` as a QA result; undefined for an empty or unreadable field. */
+const qaResultOf = (field: string | undefined): QaResult | undefined => {
+  const [result, commit] = (field ?? '').split(/\s+/)
+  return isQaWord(result) && commit !== undefined && commit !== '' ? { result, commit } : undefined
+}
 
 /**
  * Splits a ticket file into its header and the rest; a string says what is wrong with it.
@@ -148,6 +196,8 @@ export const parseTicket = (text: string): { header: TicketHeader; body: string 
       pr: optional('pr'),
       visibleChange: fields.get('visibleChange') === 'yes',
       ready: fields.get('ready') === 'yes',
+      qaResult: qaResultOf(fields.get('qaResult')),
+      fixFor: optional('fixFor'),
       created: fields.get('created') ?? '',
     },
     body: text.slice(match[0].length),
@@ -197,6 +247,9 @@ export const describeTicket = (header: TicketHeader) =>
     ...(header.branch === undefined ? [] : [`branch ${header.branch}`]),
     ...(header.pr === undefined ? [] : [`PR ${header.pr}`]),
     `visible change: ${header.visibleChange ? 'yes' : 'no'}`,
+    ...(header.qaResult === undefined ? [] : [`QA ${header.qaResult.result} at ${header.qaResult.commit.slice(0, 7)}`]),
+    ...(header.fixFor === undefined ? [] : [`fix for ${header.fixFor}`]),
+    ...(header.trackerStatus === undefined ? [] : [`on the board: "${header.trackerStatus}"`]),
   ].join(' | ')
 
 /*
@@ -245,14 +298,14 @@ export function markdownBackend($: EngineInterface, dir: string): TicketBackend 
     return { ...file, id, ...parsed }
   }
 
-  /** Blockers as ids, each an existing ticket, so a typo is caught when it is written. */
-  const checkBlockers = async (raw: readonly string[], self?: string) => {
+  /** Blockers (or the ticket a fix is for) as ids, each an existing ticket, so a typo is caught when it is written. */
+  const checkBlockers = async (raw: readonly string[], self?: string, field = 'blockedBy') => {
     const known = new Set((await allFiles()).map(file => `T-${file.number}`))
     return raw.map(entry => {
       const id = normaliseId(entry)
-      if (id === undefined) throw new TicketError(`\`${entry}\` in blockedBy is not a ticket id; ids look like T-3.`)
+      if (id === undefined) throw new TicketError(`\`${entry}\` in ${field} is not a ticket id; ids look like T-3.`)
       if (id === self) throw new TicketError(`${id} cannot block itself.`)
-      if (!known.has(id)) throw new TicketError(`blockedBy names ${id}, and there is no such ticket.`)
+      if (!known.has(id)) throw new TicketError(`${field} names ${id}, and there is no such ticket.`)
       return id
     })
   }
@@ -273,6 +326,7 @@ export function markdownBackend($: EngineInterface, dir: string): TicketBackend 
         const counterPath = `${folder}/${NEXT_ID_FILE}`
         const counter = (await $.fs.exists(counterPath)) ? Number.parseInt(await $.fs.read(counterPath), 10) || 1 : 1
         const number = Math.max(counter, ...files.map(file => file.number + 1))
+        const [fixFor] = draft.fixFor === undefined ? [] : await checkBlockers([draft.fixFor], undefined, 'fixFor')
         const header: TicketHeader = {
           id: `T-${number}`,
           title: oneLine(draft.title),
@@ -280,6 +334,7 @@ export function markdownBackend($: EngineInterface, dir: string): TicketBackend 
           blockedBy: await checkBlockers(draft.blockedBy ?? []),
           visibleChange: draft.visibleChange,
           ready: false,
+          ...(fixFor === undefined ? {} : { fixFor }),
           created: new Date(await $.clock.now()).toISOString().slice(0, 10),
         }
         await $.fs.write(`${folder}/T-${number}-${slugOf(draft.title)}.md`, `${renderHeader(header)}\n${renderBody(header.id, draft)}`)
@@ -300,13 +355,19 @@ export function markdownBackend($: EngineInterface, dir: string): TicketBackend 
       }),
 
     list: async filter => {
-      const statuses = filter.statuses ?? TICKET_STATUSES.filter(status => status !== 'done')
-      const files = statuses.includes('done') ? await allFiles() : await filesIn(folder, false)
+      const statuses = filter.statuses ?? OPEN_STATUSES
+      const around = filter.around === undefined ? undefined : normaliseId(filter.around.id)
+      const withFixes = around !== undefined && filter.around?.withFixes === true
+      const isAround = (header: TicketHeader) => header.id === around || (withFixes && header.fixFor !== undefined && normaliseId(header.fixFor) === around)
+      const isDoneRead = statuses.includes('done') || around !== undefined
+      const files = isDoneRead ? await allFiles() : await filesIn(folder, false)
       const headers: TicketHeader[] = []
       for (const file of files.sort((a, b) => a.number - b.number)) {
+        // A done ticket is read only when asked for: by status, as `around` itself, or as a possible fix of it.
+        if (file.isDone && !statuses.includes('done') && !withFixes && `T-${file.number}` !== around) continue
         const parsed = parseTicket(await $.fs.read(file.path))
         if (typeof parsed === 'string') throw new TicketError(`${file.path} cannot be read: ${parsed}.`)
-        if (statuses.includes(parsed.header.status)) headers.push(parsed.header)
+        if (statuses.includes(parsed.header.status) || isAround(parsed.header)) headers.push(parsed.header)
       }
       return headers
     },
@@ -321,21 +382,43 @@ export function markdownBackend($: EngineInterface, dir: string): TicketBackend 
   }
 }
 
-/**
- * Jira (D23): reached through the Atlassian connector once it is built. Until then it says
- * what is missing and never falls back to markdown (D25).
- */
-export function jiraBackend(): TicketBackend {
-  throw new TicketError(
-    'The Jira tracker is not built yet: godmode still needs its mapping of create, move, list and comment onto the Atlassian connector. No ticket was written, and nothing fell back to markdown tickets.',
-  )
-}
+/** A Jira failure, or anything the backend throws, as a ticket error the model reads. */
+const asTicketError = (error: unknown) => (error instanceof TicketError ? error : new TicketError(error instanceof Error ? error.message : String(error)))
 
-/** "Other" (D25): the mapping found at setup (a connector or a CLI), not built yet; never a silent fallback. */
-export function otherBackend(): TicketBackend {
-  throw new TicketError(
-    'The "Other" tracker is not built yet: godmode still needs the mapping the setup finds (a connector or a command-line tool) and saves in the note. No ticket was written, and nothing fell back to markdown tickets.',
-  )
+/** A backend whose every failure reaches the model as a ticket error. */
+const readable = (backend: TicketBackend): TicketBackend => ({
+  ...backend,
+  ...(backend.listNoted === undefined
+    ? {}
+    : { listNoted: async (filter: TicketFilter) => (await backend.listNoted?.(filter).catch((error: unknown) => Promise.reject(asTicketError(error)))) ?? { headers: [], notes: [] } }),
+  create: draft => backend.create(draft).catch((error: unknown) => Promise.reject(asTicketError(error))),
+  move: (id, change) => backend.move(id, change).catch((error: unknown) => Promise.reject(asTicketError(error))),
+  list: filter => backend.list(filter).catch((error: unknown) => Promise.reject(asTicketError(error))),
+  comment: (id, comment) => backend.comment(id, comment).catch((error: unknown) => Promise.reject(asTicketError(error))),
+})
+
+/**
+ * "Other" (D25): a tracker godmode cannot reach. The ticket tools keep godmode's own copy
+ * of each ticket, markdown files with markdown ids in its personal tracker folder, and every
+ * answer tells the PM to tell the person, in one line, what to change in the tracker: the
+ * PM's own tools are limited (D63), so it never tries the tracker itself. Nothing is ever
+ * said to have reached the tracker (D25: no silent fallback).
+ */
+export function otherBackend($: EngineInterface, name = 'the tracker'): TicketBackend {
+  let local: Promise<TicketBackend> | undefined
+  const files = () => {
+    local ??= trackerDirOf($).then(dir => markdownBackend($, dir))
+    return local
+  }
+  return {
+    tracker: 'other',
+    create: async draft => (await files()).create(draft),
+    move: async (id, change) => (await files()).move(id, change),
+    list: async filter => (await files()).list(filter),
+    comment: async (id, comment) => (await files()).comment(id, comment),
+    mirror: change =>
+      `godmode cannot reach ${name}, and neither can you: this is only godmode's own record. Tell the person in one line what to do in ${name} themselves: ${change}. Never try it yourself.`,
+  }
 }
 
 /** Ways of saying "no tracker", all meaning None: markdown tickets kept by godmode (D23). */
@@ -361,11 +444,23 @@ export const trackerOf = (answers: Readonly<Record<string, Answer>>): TrackerKin
   throw new TicketError(`The setup note names the tracker \`${String(value)}\`, which godmode does not know (${TRACKERS.join(', ')}). Fix it with \`/godmode setup\`.`)
 }
 
-/** The backend for a tracker, its markdown files kept in the note's folder `dir`. */
-export function backendFor($: EngineInterface, tracker: TrackerKind, dir: string): TicketBackend {
-  if (tracker === 'jira') return jiraBackend()
-  if (tracker === 'other') return otherBackend()
+/**
+ * The backend for a tracker, its markdown files kept in the note's folder `dir`. `answers`
+ * are the note's (shared, then personal); a Jira backend given none reads them itself.
+ */
+export function backendFor($: EngineInterface, tracker: TrackerKind, dir: string, answers?: Readonly<Record<string, Answer>>): TicketBackend {
+  if (tracker === 'jira') return readable(jiraBackend($, answers))
+  if (tracker === 'other') return otherBackend($, typeof answers?.trackerName === 'string' && answers.trackerName.trim() !== '' ? answers.trackerName.trim() : undefined)
   return markdownBackend($, dir)
+}
+
+/**
+ * The tickets a gate reads (the tickets of a PR, a move's check): every open one (not done),
+ * and with `around`, that ticket and the tickets filed to fix it (D72) whatever their status.
+ * Never every done ticket, which a Jira project would search on each move, ready and merge.
+ */
+export function openTicketsOf($: EngineInterface, tracker: TrackerKind, dir: string, around?: TicketFilter['around']): Promise<TicketHeader[]> {
+  return backendFor($, tracker, dir).list({ statuses: OPEN_STATUSES, ...(around === undefined ? {} : { around }) })
 }
 
 /** The project's ticket backend, from its setup note. */
@@ -375,7 +470,7 @@ export async function ticketBackendOf($: EngineInterface): Promise<TicketBackend
     throw new TicketError('godmode is not set up in this project yet, so it has nowhere to keep tickets. Finish the setup first.')
   }
   if (found.status === 'unreadable') throw new TicketError(`godmode cannot read its setup note at ${found.path}: ${found.reason}.`)
-  return backendFor($, trackerOf(found.shared.answers), found.dir)
+  return backendFor($, trackerOf(found.shared.answers), found.dir, { ...found.shared.answers, ...(found.personal?.answers ?? {}) })
 }
 
 export type TicketToolName = 'ticket_create' | 'ticket_move' | 'ticket_list' | 'ticket_comment'
@@ -407,6 +502,9 @@ export const TICKET_TOOLS: readonly (ToolSpec & { name: TicketToolName })[] = [
         refs: text('Links, files and decisions the work relies on.'),
         blockedBy: blockedBySchema,
         visibleChange: visibleChangeSchema,
+        fixFor: text(
+          'The ticket this one fixes, when people failed it on staging after its merge, e.g. T-3. Once this ticket records a QA pass, that one may move from qa to done without its own. Only the main thread sets it.',
+        ),
       },
       required: ['title', 'ask', 'visibleChange'],
     },
@@ -415,17 +513,32 @@ export const TICKET_TOOLS: readonly (ToolSpec & { name: TicketToolName })[] = [
   {
     name: 'ticket_move',
     description:
-      'Change a ticket\'s status (todo, doing, review, done) or header: branch, PR, blockers, visible change. `ready` marks a ticket the person said go for; only the main thread may set it.',
+      `Change a ticket's status (${TICKET_STATUSES.join(', ')}) or header: branch, PR, blockers, visible change. \`ready\` marks a ticket the person said go for, \`qaResult\` records the QA word on its PR, \`visibleChange\` says whether people test it, and \`moreFixRounds\` lets a ticket the fix-round limit stopped go on; only the main thread may set them. A ticket leaves qa only with a QA pass recorded at its PR's current commit, or with the main thread's \`override\` reason.`,
     inputSchema: {
       type: 'object',
       properties: {
         id: idSchema,
         status: statusSchema,
         ready: { type: 'boolean', description: 'True only once the person said go for this ticket.' },
+        qaResult: {
+          type: 'string',
+          enum: [...QA_RESULTS],
+          description:
+            'The QA word the person or a tester gave on the ticket\'s PR, recorded at its current commit: passed, or failed. A fail before the merge sends the ticket back to doing for a fix round.',
+        },
         branch: text('The ticket\'s branch.'),
         pr: text('The PR number or link.'),
         blockedBy: blockedBySchema,
-        visibleChange: visibleChangeSchema,
+        visibleChange: { ...visibleChangeSchema, description: `${visibleChangeSchema.description} Only the main thread changes it.` },
+        override: text(
+          'Main thread only, on the person\'s word: why this move takes the ticket out of qa, or closes it, without a recorded QA pass, or moves it to qa without the QA agent\'s pass (the change was reverted, its branch is gone, an app the QA agent cannot run, ...). It never passes over a QA agent fail at the PR\'s current commit in human-pr with the QA agent first: that fail is a fix round. Needs a status; the reason is written in the ticket\'s comments.',
+        ),
+        moreFixRounds: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Main thread only, once the person said to go on after the fix-round limit stopped this ticket: how many more fix rounds it may have.',
+        },
       },
       required: ['id'],
     },
@@ -433,7 +546,8 @@ export const TICKET_TOOLS: readonly (ToolSpec & { name: TicketToolName })[] = [
   },
   {
     name: 'ticket_list',
-    description: 'List tickets, headers only (id, status, ready, title, blockers, branch, PR). By default every ticket not done.',
+    description:
+      'List tickets, headers only (id, status, ready, title, blockers, branch, PR). By default every ticket not done. With Jira, the tickets godmode filed or moved, each with its status on the board.',
     inputSchema: {
       type: 'object',
       properties: { status: { type: 'array', items: statusSchema, description: 'Only tickets in these statuses.' } },
@@ -454,8 +568,27 @@ export const TICKET_TOOLS: readonly (ToolSpec & { name: TicketToolName })[] = [
 
 export const TICKET_TOOL_NAMES: readonly TicketToolName[] = TICKET_TOOLS.map(tool => tool.name)
 
+/**
+ * What a move carries besides its change: `override` is the main thread's reason for a
+ * move that needs no QA pass, `moreFixRounds` the rounds the person allows past the
+ * fix-round limit (D56), and `isMain` whether the main thread moves it.
+ */
+export type MoveOptions = { override?: string; moreFixRounds?: number; isMain?: boolean }
+
+/**
+ * The loop's check of a move before it is written (D69): it fills in the QA result's
+ * commit, may change the status, and throws a `TicketError` to refuse. `written` runs
+ * once the move is written, and its line is added to the answer.
+ */
+export type MoveCheck = (
+  id: string,
+  change: TicketChange,
+  qaWord: QaWord | undefined,
+  options?: MoveOptions,
+) => Promise<{ change: TicketChange; written?: () => Promise<string | undefined> }>
+
 /** Who made a tool call: `agentId` is absent on the main thread, where the PM runs. */
-export type TicketCaller = { agentId?: string }
+export type TicketCaller = { agentId?: string; checkMove?: MoveCheck }
 
 const stringField = (input: Record<string, unknown>, key: string, isRequired = false) => {
   const value = input[key]
@@ -492,6 +625,67 @@ const statusField = (value: unknown) => {
   throw new TicketError(`\`${String(value)}\` is not a status; use one of ${TICKET_STATUSES.join(', ')}.`)
 }
 
+const qaWordField = (value: unknown) => {
+  if (value === undefined || value === null) return undefined
+  if (isQaWord(value)) return value
+  throw new TicketError(`\`${String(value)}\` is not a QA result; use one of ${QA_RESULTS.join(', ')}.`)
+}
+
+/** The ticket a new one fixes (D72): the PM files the fix, so only the main thread links it. */
+const fixForField = (input: Record<string, unknown>, caller: TicketCaller) => {
+  const value = stringField(input, 'fixFor')?.trim()
+  if (value === undefined || value === '') return undefined
+  if (caller.agentId !== undefined) throw new TicketError('Only the main thread files a fix ticket with fixFor: a fix ticket\'s pass lets the original ticket close.')
+  return value
+}
+
+/**
+ * The main thread's reason for moving a ticket out of qa, or closing it, without a QA pass:
+ * the way out when no pass can come (D69's "leaves qa only with a pass" otherwise holds).
+ * In human-pr with the QA agent first (D71), it also moves a ticket to qa without the QA
+ * agent's pass, but never over a QA agent fail at the PR's current commit: the loop
+ * refuses that, as a fail is a fix round.
+ */
+const overrideField = (input: Record<string, unknown>, caller: TicketCaller, change: TicketChange, qaWord: QaWord | undefined) => {
+  const value = stringField(input, 'override')?.trim()
+  if (value === undefined || value === '') return undefined
+  if (caller.agentId !== undefined) throw new TicketError('Only the main thread overrides the QA rules, on the person\'s word.')
+  if (change.status === undefined) throw new TicketError('An override moves a ticket: give the status it moves to.')
+  if (qaWord !== undefined) throw new TicketError('Give a QA result or an override, not both: an override is for a ticket that cannot get a pass.')
+  return value
+}
+
+/**
+ * The fix rounds the person allows past the limit (D56): their word, heard only by the
+ * main thread, so an agent cannot lift the stop on its own ticket.
+ */
+const moreFixRoundsField = (input: Record<string, unknown>, caller: TicketCaller) => {
+  const value = input.moreFixRounds
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) throw new TicketError('`moreFixRounds` must be a whole number, 1 or more.')
+  if (caller.agentId !== undefined) throw new TicketError('Only the main thread allows more fix rounds, once the person said to go on.')
+  return value
+}
+
+/** Writes an override's reason in the ticket, so the move without a pass stays explained. */
+const recordOverride = async (backend: TicketBackend, header: TicketHeader, override: string | undefined) => {
+  if (override === undefined) return undefined
+  await backend.comment(header.id, { author: 'PM', text: `Moved to ${header.status} on the person's word, without the usual check: ${override}` })
+  return `The override's reason is written in ${header.id}'s comments.`
+}
+
+/** An answer with the backend's mirror line under it, for a tracker godmode cannot reach. */
+const withMirror = (backend: TicketBackend, answer: string, change: string) => (backend.mirror === undefined ? answer : `${answer}\n${backend.mirror(change)}`)
+
+/** What a move changed, in words, for the mirror line. */
+const movedWhat = (header: TicketHeader, change: TicketChange) => {
+  const fields = Object.keys(change).filter(key => key !== 'status')
+  return [
+    ...(change.status === undefined ? [] : [`move ${header.id} to ${header.status}`]),
+    ...(fields.length === 0 ? [] : [`set ${fields.join(', ')} on ${header.id}`]),
+  ].join(', and ') || `update ${header.id}`
+}
+
 /**
  * Serves one ticket tool call on any backend: checks the model's input, routes it, and
  * answers the text the model reads. A `TicketError` is the caller's to show as an error.
@@ -516,8 +710,9 @@ export const runTicketTool = async (
       refs: stringField(input, 'refs'),
       blockedBy: listField(input, 'blockedBy'),
       visibleChange: booleanField(input, 'visibleChange', true) ?? false,
+      fixFor: fixForField(input, caller),
     })
-    return `Filed ${describeTicket(header)}`
+    return withMirror(backend, `Filed ${describeTicket(header)}`, `file a ticket titled "${header.title}" (godmode's ${header.id})`)
   }
   if (name === 'ticket_move') {
     const id = stringField(input, 'id', true) ?? ''
@@ -536,20 +731,42 @@ export const runTicketTool = async (
     const blockedBy = listField(input, 'blockedBy')
     if (blockedBy !== undefined) change.blockedBy = blockedBy
     const visibleChange = booleanField(input, 'visibleChange')
-    if (visibleChange !== undefined) change.visibleChange = visibleChange
-    if (Object.keys(change).length === 0) throw new TicketError('Nothing to change: give a status or a header field.')
-    return `Updated ${describeTicket(await backend.move(id, change))}`
+    if (visibleChange !== undefined) {
+      // Whether people test a ticket decides the QA gate (D36, D69), so an agent cannot turn it off.
+      if (caller.agentId !== undefined) throw new TicketError('Only the main thread changes whether a ticket is a visible change: it decides whether people test it.')
+      change.visibleChange = visibleChange
+    }
+    const qaWord = qaWordField(input.qaResult)
+    // A QA result is the person's or a tester's word (D70), heard only by the main thread.
+    if (qaWord !== undefined && caller.agentId !== undefined) {
+      throw new TicketError('Only the main thread records a QA result, once the person or a tester said how QA went.')
+    }
+    const override = overrideField(input, caller, change, qaWord)
+    const moreFixRounds = moreFixRoundsField(input, caller)
+    if (qaWord === undefined && moreFixRounds === undefined && Object.keys(change).length === 0) {
+      throw new TicketError('Nothing to change: give a status or a header field.')
+    }
+    if (caller.checkMove === undefined) {
+      if (qaWord !== undefined) throw new TicketError('godmode cannot record a QA result here: it needs the PR\'s current commit, which only the loop reads.')
+      if (moreFixRounds !== undefined) throw new TicketError('godmode cannot allow more fix rounds here: only the loop counts them.')
+      const header = await backend.move(id, change)
+      return withMirror(backend, [`Updated ${describeTicket(header)}`, await recordOverride(backend, header, override)].filter(part => part !== undefined).join('\n'), movedWhat(header, change))
+    }
+    const checked = await caller.checkMove(id, change, qaWord, { override, moreFixRounds, isMain: caller.agentId === undefined })
+    const header = await backend.move(id, checked.change)
+    const line = await checked.written?.()
+    return withMirror(backend, [`Updated ${describeTicket(header)}`, line, await recordOverride(backend, header, override)].filter(part => part !== undefined).join('\n'), movedWhat(header, checked.change))
   }
   if (name === 'ticket_list') {
     const raw = input.status
     const statuses = raw === undefined || raw === null ? undefined : (Array.isArray(raw) ? raw : [raw]).map(statusField)
-    const headers = await backend.list({ statuses })
-    if (headers.length === 0) return statuses === undefined ? 'No open tickets.' : `No tickets in ${statuses.join(', ')}.`
-    return headers.map(describeTicket).join('\n')
+    const { headers, notes } = backend.listNoted === undefined ? { headers: await backend.list({ statuses }), notes: [] } : await backend.listNoted({ statuses })
+    const listed = headers.length === 0 ? (statuses === undefined ? 'No open tickets.' : `No tickets in ${statuses.join(', ')}.`) : headers.map(describeTicket).join('\n')
+    return withMirror(backend, [listed, ...notes].join('\n'), 'check these tickets there, as the tracker may have moved on')
   }
   const id = stringField(input, 'id', true) ?? ''
   const body = stringField(input, 'text', true) ?? ''
   const author = stringField(input, 'author')?.trim() || (caller.agentId === undefined ? 'PM' : `agent ${caller.agentId}`)
   const header = await backend.comment(id, { author, text: body })
-  return `Commented on ${header.id}.`
+  return withMirror(backend, `Commented on ${header.id}.`, `add the comment to ${header.id}`)
 }

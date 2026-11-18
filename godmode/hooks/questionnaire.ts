@@ -1,5 +1,6 @@
 import type { ScanFacts } from '../types'
 import type { SetupScope } from '../types'
+import { qaSignalsOf } from './role'
 import type { Answer } from './storage'
 import { trackerKindOf } from './tickets'
 
@@ -10,8 +11,11 @@ import { trackerKindOf } from './tickets'
  * `setup.ts` asks them.
  */
 
-/** One choice: the label the person picks, and the answer it records. */
-export type Choice = { label: string; value: Answer }
+/**
+ * One choice: the label the person picks, and the answer it records. `onlyIf` says when
+ * it applies, set only while an answer it depends on is still unknown (the PM's outline).
+ */
+export type Choice = { label: string; value: Answer; onlyIf?: string }
 
 /** Which half of the note an answer goes in (D61). */
 export type NoteHalf = 'shared' | 'personal'
@@ -30,20 +34,73 @@ export type Question = {
    * where text that names no choice falls back to the first choice.
    */
   freeText?: (text: string) => Record<string, Answer>
+  /** Several choices may be picked; the answer records their values comma-joined. */
+  multiSelect?: true
+  /**
+   * The questions this answer leads to, asked right after it, given every answer so far
+   * (D69's QA flow: where people test, or whether the QA agent does).
+   */
+  followUps?: (answers: Readonly<Record<string, Answer>>) => Question[]
+  /** When the question applies, set only while an answer it depends on is still unknown (the PM's outline). */
+  onlyIf?: string
 }
 
 /** A question the setup agent adds for a gap of its own (D29). */
 export type ExtraQuestion = { key: string; question: string; options: string[]; header?: string }
 
-/** The keys of the fixed questions; an extra question may not reuse one. */
-export const FIXED_KEYS: readonly string[] = ['permissions', 'storage', 'tracker', 'attribution', 'qa', 'indicator', 'gitHost', 'stack', 'testCommand', 'startCommand']
+/** The QA flow's keys (D69, D70, D71); `qa` is the on or off answer notes before D69 hold. */
+export const QA_KEYS: readonly string[] = ['qa', 'qaHuman', 'qaMode', 'qaBotFirst', 'qaWaitStatus', 'qaSignals', 'qaPassStatus', 'qaApprovers']
 
-/** Answers that stay one person's (D61), even when the setup agent passes them. */
-export const PERSONAL_KEYS: readonly string[] = ['permissions', 'attribution', 'autoMerge', 'agentCap', 'fixRoundLimit', 'indicator', 'trackerAccount']
+/**
+ * One more round's answers over a setup run's earlier ones. A round that answers the QA flow
+ * again replaces every earlier QA answer, so a branch not taken this time leaves nothing.
+ */
+export const mergeAnswers = (earlier: Readonly<Record<string, Answer>>, round: Readonly<Record<string, Answer>>): Record<string, Answer> => {
+  const qaAgain = Object.keys(round).some(key => QA_KEYS.includes(key))
+  const kept = qaAgain ? Object.fromEntries(Object.entries(earlier).filter(([key]) => !QA_KEYS.includes(key))) : earlier
+  return { ...kept, ...round }
+}
+
+/** The Jira questions' keys: the server, the site, the project, and the board's name for each status. */
+export const JIRA_KEYS: readonly string[] = ['jiraServer', 'jiraCloudId', 'jiraProject', 'jiraStatusMap', 'jiraTodoStatus', 'jiraDoingStatus', 'jiraReviewStatus', 'jiraDoneStatus']
+
+/** The keys of the fixed questions; an extra question may not reuse one. */
+export const FIXED_KEYS: readonly string[] = [
+  'permissions',
+  'storage',
+  'tracker',
+  'attribution',
+  ...QA_KEYS,
+  ...JIRA_KEYS,
+  'indicator',
+  'gitHost',
+  'stack',
+  'testCommand',
+  'startCommand',
+  'autoMerge',
+  'agentCap',
+  'fixRoundLimit',
+]
+
+/**
+ * Answers that steer the questionnaire but are not written into the note: the storage
+ * answer is where the note goes, and `qaHuman` only leads to the `qaMode` it records.
+ */
+export const UNRECORDED_KEYS: readonly string[] = ['storage', 'qaHuman', 'jiraStatusMap']
+
+/** Where PRs live, as the questionnaire and the scan settled it. */
+export const isGitHubHost = (facts: ScanFacts, answers: Readonly<Record<string, Answer>>) =>
+  answers.gitHost === 'github' || (answers.gitHost === undefined && facts.git.host === 'github')
+
+/**
+ * Answers that stay one person's (D61), even when the setup agent passes them. The Jira
+ * server is one: each person's session names its Atlassian connector its own way.
+ */
+export const PERSONAL_KEYS: readonly string[] = ['permissions', 'attribution', 'autoMerge', 'agentCap', 'fixRoundLimit', 'indicator', 'trackerAccount', 'jiraServer']
 
 export const isPersonalKey = (key: string) => PERSONAL_KEYS.includes(key) || key.startsWith('permission.')
 
-const PERMISSIONS: Question = {
+export const PERMISSIONS: Question = {
   key: 'permissions',
   header: 'Permissions',
   question:
@@ -70,7 +127,7 @@ const STORAGE: Question = {
   half: 'shared',
 }
 
-const TRACKER: Question = {
+export const TRACKER: Question = {
   key: 'tracker',
   header: 'Tracker',
   question:
@@ -87,7 +144,7 @@ const TRACKER: Question = {
   },
 }
 
-const ATTRIBUTION: Question = {
+export const ATTRIBUTION: Question = {
   key: 'attribution',
   header: 'Attribution',
   question: 'Should commits and PRs carry AI attribution (a "Co-Authored-By" line or a "Generated with" footer naming the AI)?',
@@ -98,7 +155,7 @@ const ATTRIBUTION: Question = {
   half: 'personal',
 }
 
-const INDICATOR: Question = {
+export const INDICATOR: Question = {
   key: 'indicator',
   header: 'Indicator',
   question:
@@ -111,18 +168,208 @@ const INDICATOR: Question = {
   half: 'personal',
 }
 
-/** QA defaults on only when the scan found an app to click through (D34). */
-const qaQuestion = (facts: ScanFacts): Question => {
-  const why = facts.hasUi ? `The scan found a runnable UI (${facts.uiReason ?? 'an app'}), so it defaults on.` : 'The scan found no runnable UI, so it defaults off.'
-  const on: Choice = { label: facts.hasUi ? 'On (default)' : 'On', value: true }
-  const off: Choice = { label: facts.hasUi ? 'Off' : 'Off (default)', value: false }
+/**
+ * A question the QA agent's work answers: the scan's runnable-UI finding only picks which
+ * choice is the default (D34, D69, D71), since the agent needs an app it can run.
+ */
+const uiDefault = (facts: ScanFacts, yes: Choice, no: Choice) => {
+  const marked = (choice: Choice): Choice => ({ ...choice, label: `${choice.label} (default)` })
+  return facts.hasUi
+    ? { why: `The scan found a runnable UI (${facts.uiReason ?? 'an app'}), so it defaults to ${yes.label.toLowerCase()}.`, choices: [marked(yes), no] }
+    : { why: `The scan found no runnable UI, so it defaults to ${no.label.toLowerCase()}.`, choices: [marked(no), yes] }
+}
+
+/** No people test: the QA agent tests, or nobody does (D69). */
+const qaAgentQuestion = (facts: ScanFacts): Question => {
+  const { why, choices } = uiDefault(facts, { label: 'On', value: 'bot' }, { label: 'Off', value: 'none' })
   return {
-    key: 'qa',
-    header: 'QA',
+    key: 'qaMode',
+    header: 'QA agent',
     question: `Should a QA agent run the app and try each visible change after review, before it is ready for you? ${why}`,
-    choices: facts.hasUi ? [on, off] : [off, on],
+    choices,
     half: 'shared',
   }
+}
+
+/** In a human mode, whether the QA agent tests before the people do (D71). */
+const botFirstQuestion = (facts: ScanFacts): Question => {
+  const { why, choices } = uiDefault(facts, { label: 'Yes', value: true }, { label: 'No', value: false })
+  return {
+    key: 'qaBotFirst',
+    header: 'QA bot first',
+    question: `Should the QA agent try each visible change first, so the people only get changes that already passed it? ${why}`,
+    choices,
+    half: 'shared',
+  }
+}
+
+/** A status on the board, by its exact name: two common names to pick, or the board's own typed under Other. */
+const boardStatusQuestion = (key: 'qaWaitStatus' | 'qaPassStatus', header: string, question: string, names: [string, string]): Question => ({
+  key,
+  header,
+  question: `${question} Pick one, or type its exact name under Other.`,
+  choices: names.map(name => ({ label: name, value: name })),
+  half: 'shared',
+  freeText: text => ({ [key]: text.trim() }),
+})
+
+// Common names, until `withBoardStatuses` offers the statuses read from a Jira board.
+const WAIT_STATUS = boardStatusQuestion('qaWaitStatus', 'QA waiting', 'Which status on the board means a ticket waits for QA? godmode moves a ticket there after review.', ['Ready for QA', 'In QA'])
+const PASS_STATUS = boardStatusQuestion('qaPassStatus', 'QA pass', 'Which status on the board means QA passed?', ['QA passed', 'Done'])
+
+/** Which board statuses a status question puts first: likely names for waiting, then for passing. */
+const LIKELY: Readonly<Record<string, { is: RegExp; isNot?: RegExp }>> = {
+  qaWaitStatus: { is: /qa|test/i, isNot: /pass|done|ship|accept/i },
+  qaPassStatus: { is: /pass|ship|accept|verified|done/i },
+}
+
+/**
+ * A board-status question offering the statuses read from the board (Jira), the likely ones
+ * first, every one named in the question; any other question as it is.
+ */
+export const withBoardStatuses = (question: Question, statuses: readonly string[]): Question => {
+  const likely = LIKELY[question.key]
+  if (likely === undefined || statuses.length === 0) return question
+  const isLikely = (name: string) => likely.is.test(name) && !(likely.isNot?.test(name) ?? false)
+  const ranked = [...statuses.filter(isLikely), ...statuses.filter(name => !isLikely(name))]
+  const choices = ranked.slice(0, 4).map(name => ({ label: name.replace(/,/g, ' '), value: name }))
+  const stem = question.question.replace(/ Pick one, or type its exact name under Other\.$/, '')
+  return {
+    ...question,
+    question: `${stem} The board's statuses: ${statuses.join(', ')}. Pick one, or type its exact name under Other.`,
+    choices: choices.length >= 2 ? choices : [...choices, ...question.choices].slice(0, 4),
+  }
+}
+
+const APPROVERS: Question = {
+  key: 'qaApprovers',
+  header: 'QA approvers',
+  question: 'Whose approval on the PR counts as a QA pass? Type their GitHub logins, comma-separated, or a team as `org/team`, under Other.',
+  choices: [
+    { label: 'Decide later', value: '' },
+    { label: 'Nobody yet', value: '' },
+  ],
+  half: 'shared',
+  freeText: text => ({ qaApprovers: text.trim() }),
+}
+
+/**
+ * Jira and Other have a board whose statuses testers move tickets through; markdown tickets
+ * do not (D24). Undefined while the tracker is unanswered.
+ */
+const hasBoard = (answers: Readonly<Record<string, Answer>>) => (answers.tracker === undefined ? undefined : trackerKindOf(answers.tracker) !== 'none')
+
+const BOARD_ONLY = 'the tracker is Jira or Other'
+const GITHUB_ONLY = 'PRs are on GitHub'
+
+/**
+ * Whether PRs are on GitHub; undefined while the host question, which could still answer
+ * GitHub, is unanswered.
+ */
+const prsOnGitHub = (facts: ScanFacts, answers: Readonly<Record<string, Answer>>) => {
+  if (isGitHubHost(facts, answers)) return true
+  const couldStill = answers.gitHost === undefined && hostQuestion(facts)?.choices.some(choice => choice.value === 'github') === true
+  return couldStill ? undefined : false
+}
+
+/**
+ * Keeps what may apply: a known true as it is, an unknown marked with the answer it waits
+ * on, so one round of the PM's answers covers it too; a known false is left out.
+ */
+const unlessRuledOut = <T extends { onlyIf?: string }>(holds: boolean | undefined, item: T, condition: string): T[] => {
+  if (holds === false) return []
+  return holds === undefined ? [{ ...item, onlyIf: condition }] : [item]
+}
+
+/**
+ * The pass signals besides being told (D70), each only where godmode can read it: the
+ * board status with Jira or Other, a PR approval on GitHub and only before the merge.
+ * Undefined when none applies.
+ */
+const signalsQuestion = (facts: ScanFacts, answers: Readonly<Record<string, Answer>>): Question | undefined => {
+  const offered: Choice[] = [
+    ...unlessRuledOut<Choice>(hasBoard(answers), { label: 'Ticket status', value: 'ticket-status' }, BOARD_ONLY),
+    ...unlessRuledOut<Choice>(answers.qaMode === 'human-pr' ? prsOnGitHub(facts, answers) : false, { label: 'PR approval', value: 'pr-approval' }, GITHUB_ONLY),
+  ]
+  if (offered.length === 0) return undefined
+  // Every signal waiting on an unknown answer: the question itself applies only if one holds.
+  const conditions = offered.map(choice => choice.onlyIf)
+  const onlyIf = conditions.every(condition => condition !== undefined) ? conditions.join(' or ') : undefined
+  return {
+    ...(onlyIf === undefined ? {} : { onlyIf }),
+    key: 'qaSignals',
+    header: 'QA signals',
+    question:
+      'Being told always counts as a QA result. Which other signals should godmode watch? Ticket status: a tester moves the ticket to the board\'s pass status. PR approval: named people or a team approve the PR.',
+    choices: [...offered, { label: 'Only being told', value: '' }],
+    half: 'shared',
+    multiSelect: true,
+    followUps: picked => {
+      const signals = qaSignalsOf(picked)
+      return [...(signals.includes('ticket-status') ? [PASS_STATUS] : []), ...(signals.includes('pr-approval') ? [APPROVERS] : [])]
+    },
+  }
+}
+
+/** People test: on the PR or on staging, then the bot pass first, the board's waiting status and the signals. */
+const whereQuestion = (facts: ScanFacts): Question => ({
+  key: 'qaMode',
+  header: 'QA where',
+  question: 'Where do the people test: on the PR before it merges, or on staging after the merge?',
+  choices: [
+    { label: 'On the PR', value: 'human-pr' },
+    { label: 'On staging', value: 'human-staging' },
+  ],
+  half: 'shared',
+  followUps: answers => {
+    const signals = signalsQuestion(facts, answers)
+    return [botFirstQuestion(facts), ...unlessRuledOut(hasBoard(answers), WAIT_STATUS, BOARD_ONLY), ...(signals === undefined ? [] : [signals])]
+  },
+})
+
+/** The QA mode (D69): whether people test first, then where they test, or else whether the QA agent does. */
+export const qaQuestion = (facts: ScanFacts): Question => ({
+  key: 'qaHuman',
+  header: 'QA',
+  question: 'Do people (QA engineers) test changes before they count as done?',
+  choices: [
+    { label: 'Yes, people test', value: true },
+    { label: 'No', value: false },
+  ],
+  half: 'shared',
+  followUps: answers => [answers.qaHuman === true ? whereQuestion(facts) : qaAgentQuestion(facts)],
+})
+
+/** A count the loop reads, asked only by a change-setup: three common values, or another typed under Other. */
+const countQuestion = (key: 'fixRoundLimit' | 'agentCap', header: string, question: string, counts: readonly number[]): Question => ({
+  key,
+  header,
+  question: `${question} Pick one, or type another number under Other.`,
+  choices: counts.map(count => ({ label: String(count), value: count })),
+  half: 'personal',
+  freeText: text => {
+    const count = Number.parseInt(text.trim(), 10)
+    return Number.isFinite(count) && count >= 1 ? { [key]: count } : {}
+  },
+})
+
+/** Fix rounds on one ticket before the PM stops and asks (D56); the loop's default is 3. */
+export const FIX_ROUNDS = countQuestion('fixRoundLimit', 'Fix rounds', 'How many fix rounds may one ticket take before the PM stops and asks you? Without an answer it is 3.', [2, 3, 5])
+
+/** Agents running at once (D58); the loop's default is 5. */
+export const AGENT_CAP = countQuestion('agentCap', 'Agent cap', 'How many godmode agents may run at once? Without an answer it is 5.', [3, 5, 8])
+
+/** Arming auto-merge (D53), off unless the person turns it on. */
+export const AUTO_MERGE: Question = {
+  key: 'autoMerge',
+  header: 'Auto-merge',
+  question:
+    'May godmode arm auto-merge on your PRs once review (and QA, where it runs) passed? Off: a PR merges only when you say so. With people testing the PR, auto-merge stays refused either way.',
+  choices: [
+    { label: 'Off', value: false },
+    { label: 'On', value: true },
+  ],
+  half: 'personal',
 }
 
 /** A command the scan could not find: picked from the two plain answers, or typed under Other. */
@@ -139,7 +386,7 @@ const commandQuestion = (key: 'testCommand' | 'startCommand', question: string, 
 })
 
 /** The host question, only when `origin` exists and is not a GitHub godmode can reach (D54, D55). */
-const hostQuestion = (facts: ScanFacts): Question | undefined => {
+export const hostQuestion = (facts: ScanFacts): Question | undefined => {
   const { git } = facts
   if (!git.hasGit || git.origin === undefined || git.host === 'github') return undefined
   const isGitHub = /(^|\.)github\.com$/.test(git.remoteHost ?? '')
@@ -217,26 +464,59 @@ export const extraQuestion = (extra: ExtraQuestion): Question | string => {
 
 /**
  * Every question a setup asks, in order. `full`: the gaps, then the person's own choices
- * (D18, D19, D23, D15, D34, D68). `personal`, a teammate on a committed note (D61): only
- * the personal ones, the team's answers being in the note already.
+ * (D18, D19, D23, D15, D69, D68), the QA question bringing its follow-ups. `personal`, a
+ * teammate on a committed note (D61): only the personal ones, the team's answers being in
+ * the note already.
  */
 export const questionsFor = (facts: ScanFacts, scope: SetupScope, extras: readonly Question[] = []): Question[] => {
   if (scope === 'personal') return [PERMISSIONS, ATTRIBUTION, INDICATOR, ...extras.filter(question => question.half === 'personal')]
   return [...gapQuestions(facts), ...extras, PERMISSIONS, STORAGE, TRACKER, ATTRIBUTION, qaQuestion(facts), INDICATOR]
 }
 
-const fold = (text: string) => text.trim().toLowerCase().replace(/\s*\(default\)$/, '')
+// A label may carry a mark: `(default)` from the scan, `(current)` or `(suggested)` in a change-setup.
+const fold = (text: string) => text.trim().toLowerCase().replace(/\s*\((default|current|suggested)\)$/, '')
+
+const choiceNamed = (question: Question, text: string) =>
+  question.choices.find(candidate => candidate.label === text) ??
+  question.choices.find(candidate => fold(candidate.label) === fold(text) || fold(String(candidate.value)) === fold(text))
+
+/** A multi-select answer: the dialog joins the picked labels with commas; each part names a choice, or is left out. */
+const resolvePicks = (question: Question, text: string): { values: Record<string, Answer>; note?: string } => {
+  const parts = text.split(',').map(part => part.trim()).filter(part => part !== '')
+  const picked = parts.map(part => choiceNamed(question, part))
+  const unknown = parts.filter((_part, index) => picked[index] === undefined)
+  const values = [...new Set(picked.flatMap(choice => (choice === undefined || choice.value === '' ? [] : [String(choice.value)])))]
+  const recorded = { values: { [question.key]: values.join(',') } }
+  if (unknown.length === 0) return recorded
+  return { ...recorded, note: `"${unknown.join(', ')}" named none of the choices for ${question.key}, so it was left out; change it with \`/godmode setup\`.` }
+}
+
+/**
+ * A question for the PM to relay when nobody could be asked, with what each choice would
+ * ask next indented under it, so one round of answers can cover the whole flow.
+ */
+export const outline = (question: Question, answers: Readonly<Record<string, Answer>>, depth = 0): string[] => {
+  const pad = '  '.repeat(depth)
+  const label = (choice: Choice) => (choice.onlyIf === undefined ? choice.label : `${choice.label} [only if ${choice.onlyIf}]`)
+  const when = question.onlyIf === undefined ? '' : ` (only if ${question.onlyIf})`
+  const lines = [`${pad}- ${question.key}${when}: ${question.question} (${question.choices.map(label).join(' / ')})`]
+  for (const choice of question.choices) {
+    const after = { ...answers, [question.key]: choice.value }
+    const below = (question.followUps?.(after) ?? []).flatMap(followUp => outline(followUp, after, depth + 2))
+    if (below.length > 0) lines.push(`${pad}  if ${choice.label}:`, ...below)
+  }
+  return lines
+}
 
 /**
  * What an answer records: the choice it names (by label, or by value), else what its
  * free text means; on a closed question, text naming no choice takes the first choice,
- * and `note` says so.
+ * and `note` says so. A multi-select answer records every choice it names.
  */
 export const resolveAnswer = (question: Question, raw: string | boolean | number): { values: Record<string, Answer>; note?: string } => {
   const text = String(raw)
-  const choice =
-    question.choices.find(candidate => candidate.label === text) ??
-    question.choices.find(candidate => fold(candidate.label) === fold(text) || fold(String(candidate.value)) === fold(text))
+  if (question.multiSelect === true) return resolvePicks(question, text)
+  const choice = choiceNamed(question, text)
   if (choice !== undefined) return { values: { [question.key]: choice.value } }
   if (question.freeText !== undefined) return { values: question.freeText(text) }
   const fallback = question.choices[0] as Choice

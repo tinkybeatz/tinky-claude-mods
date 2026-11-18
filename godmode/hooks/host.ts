@@ -272,10 +272,8 @@ export function localHost($: EngineInterface, project: Project, dir: string): Gi
       }
       return open
     },
-    headCommit: async ref => {
-      await find(ref)
-      return branchHead(ref)
-    },
+    // The branch's own head, open for review or not: a merged branch still holds the commit QA passed at.
+    headCommit: async ref => branchHead(ref),
   }
 }
 

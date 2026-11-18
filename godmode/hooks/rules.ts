@@ -1,6 +1,9 @@
 import { prNumberOf } from './host'
+import { qaModeOf } from './role'
+import type { QaMode } from './role'
 import { effectiveModel } from './storage'
 import type { AgentRole, Answer, ModelTier, PersonalNote, SharedNote } from './storage'
+import type { TicketHeader } from './tickets'
 
 /*
  * The loop's rules as plain data and pure functions (Step 7, D37): what a preset allows,
@@ -115,6 +118,12 @@ export type LoopSettings = {
   isDraftsOnly: boolean
   /** No ready or merge without a clean verdict at the PR's current commit (D53). */
   isMergeGateOn: boolean
+  /** How the project is tested (D69); `human-pr` adds a QA pass to the ready and merge gate. */
+  qaMode: QaMode
+  /** In a human QA mode, the QA agent tests before people do (D71). */
+  isQaBotFirst: boolean
+  /** Fix rounds on one ticket before the PM stops and asks (D56); a human QA fail counts too. */
+  fixRoundLimit: number
   /** The open PRs' files go into a dev brief, and a dev agent's edit to one is blocked (D47, D48). */
   isContentionOn: boolean
   /** How long a sweep of the open PRs stays fresh for the edit check, in milliseconds. */
@@ -146,6 +155,8 @@ export const SETTING = {
   mainThreadTools: 'mainThreadTools',
   draftsOnly: 'draftsOnly',
   mergeGate: 'mergeGate',
+  qaMode: 'qaMode',
+  fixRoundLimit: 'fixRoundLimit',
   contention: 'contention',
   contentionRefreshSeconds: 'contentionRefreshSeconds',
   worktreeGuard: 'worktreeGuard',
@@ -222,6 +233,9 @@ export const settingsOf = (answers: Readonly<Record<string, Answer>>): LoopSetti
     mainThreadTools: tools === undefined ? [] : tools.split(',').map(tool => tool.trim()).filter(tool => tool !== ''),
     isDraftsOnly: booleanOf(answers[SETTING.draftsOnly], true),
     isMergeGateOn: booleanOf(answers[SETTING.mergeGate], true),
+    qaMode: qaModeOf(answers),
+    isQaBotFirst: booleanOf(answers.qaBotFirst, false),
+    fixRoundLimit: Math.floor(numberOf(answers[SETTING.fixRoundLimit], 3, 1)),
     isContentionOn: booleanOf(answers[SETTING.contention], true),
     contentionRefreshMs: numberOf(answers[SETTING.contentionRefreshSeconds], 60, 0) * 1000,
     isWorktreeGuardOn: booleanOf(answers[SETTING.worktreeGuard], true),
@@ -255,11 +269,16 @@ export type ShellStep = {
   isUndo?: boolean
   /** Files the command reads its message or body from (`git commit -F`, `gh pr create --body-file`). */
   bodyFiles: string[]
+  /** A raw host API call (`gh api`) that merges or marks ready: gated as that PR step, asked as a host write. */
+  isApi?: boolean
 }
 
-/** The words of one simple command; quotes group words, and are dropped. */
+/**
+ * The words of one simple command; quotes group words, and are dropped. A quote the chain
+ * split cut in two (`bash -c "a && b"`) is dropped from the word's ends too.
+ */
 export const wordsOf = (segment: string) =>
-  [...segment.matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g)].map(match => match[1] ?? match[2] ?? match[3] ?? '')
+  [...segment.matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g)].map(match => match[1] ?? match[2] ?? (match[3] ?? '').replace(/^["']+|["']+$/g, ''))
 
 /**
  * A shell line split into its chains (`&&`, `||`, `;`, new lines), each a pipeline of
@@ -274,12 +293,16 @@ export const pipelinesOf = (command: string) =>
 
 const WRAPPERS = new Set(['sudo', 'command', 'env', 'time', 'exec', 'nohup', '(', '{'])
 
-/** A simple command's words with leading `FOO=bar`, `sudo`, `(` and the like left out. */
+/**
+ * A simple command's words with leading `FOO=bar`, `sudo`, `(` and the like left out, and
+ * the program by its name alone: `/usr/bin/gh` is `gh`.
+ */
 const commandWords = (segment: string) => {
   const words = wordsOf(segment.replace(/^[({]+/, ''))
   let start = 0
   while (start < words.length && (WRAPPERS.has(words[start] ?? '') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[start] ?? ''))) start += 1
-  return words.slice(start)
+  const [program, ...args] = words.slice(start)
+  return program === undefined ? [] : [program.replace(/^.*\//, ''), ...args]
 }
 
 /** git's own options before the subcommand, the ones that take a value. */
@@ -373,17 +396,55 @@ const prArgument = (args: readonly string[]) => {
   return undefined
 }
 
-/** A gh command as a loop action, or undefined when it writes nothing the presets gate. */
-const ghStep = (words: readonly string[]): ShellStep | undefined => {
-  const [, group = '', sub = '', ...args] = words
-  if (group === 'api') {
-    const rest = words.slice(2)
-    const method = valuesOf(rest, ['-X', '--method'])[0]?.toUpperCase()
-    const hasFields = hasAny(rest, ['-f', '-F', '--field', '--raw-field', '--input'])
-    const isMutation = rest.some(arg => /^\s*mutation\b/.test(arg) || /query=\s*mutation\b/.test(arg))
-    const isWrite = method !== undefined ? method !== 'GET' && method !== 'HEAD' : hasFields || isMutation
-    return isWrite ? { action: 'host-write', verb: 'gh api', bodyFiles: [] } : undefined
+/** gh's own options that take a value, written before the command group or the subcommand. */
+const GH_GLOBAL_VALUE_OPTIONS = new Set(['-R', '--repo', '--hostname'])
+
+/** The gh command group, its subcommand and their arguments, past gh's own options (`gh -R o/r pr merge`, `gh pr -R o/r merge`). */
+const ghParts = (words: readonly string[]) => {
+  let index = 1
+  const take = () => {
+    while (index < words.length && (words[index] ?? '').startsWith('-')) index += GH_GLOBAL_VALUE_OPTIONS.has(words[index] ?? '') ? 2 : 1
+    index += 1
+    return words[index - 1] ?? ''
   }
+  const group = take()
+  // `gh api` takes its endpoint and options straight after the group.
+  if (group === 'api') return { group, sub: '', args: words.slice(index) }
+  const sub = take()
+  return { group, sub, args: words.slice(index) }
+}
+
+/** The GitHub GraphQL mutations that arm auto-merge, merge or mark ready, as the PR steps they stand for. */
+const GRAPHQL_PR_STEPS: readonly { pattern: RegExp; action: 'pr-ready' | 'pr-merge'; isAuto: boolean }[] = [
+  { pattern: /\benablePullRequestAutoMerge\b/, action: 'pr-merge', isAuto: true },
+  { pattern: /\bmergePullRequest\b/, action: 'pr-merge', isAuto: false },
+  { pattern: /\bmarkPullRequestReadyForReview\b/, action: 'pr-ready', isAuto: false },
+]
+
+/**
+ * A `gh api` call as a loop action. A REST merge (`PUT .../pulls/12/merge`) or a GraphQL
+ * mutation that merges, arms auto-merge or marks ready is that PR step, so the verdict and
+ * QA gates hold it as they hold `gh pr merge`. A GraphQL call names the PR by node id, so
+ * its number stays unknown. `text` is the whole shell line, since a query can span lines.
+ */
+const ghApiStep = (args: readonly string[], text: string): ShellStep | undefined => {
+  const method = valuesOf(args, ['-X', '--method'])[0]?.toUpperCase()
+  const merged = args.map(arg => /(?:^|\/)pulls\/(\d+)\/merge\/?$/.exec(arg)?.[1]).find(number => number !== undefined)
+  if (method === 'PUT' && merged !== undefined) return { action: 'pr-merge', verb: 'gh api', pr: merged, isAuto: false, isApi: true, bodyFiles: [] }
+  if (args.some(arg => arg === 'graphql' || /\/graphql$/.test(arg))) {
+    const found = GRAPHQL_PR_STEPS.find(candidate => candidate.pattern.test(text))
+    if (found !== undefined) return { action: found.action, verb: 'gh api', isAuto: found.isAuto, isApi: true, bodyFiles: [] }
+  }
+  const hasFields = hasAny(args, ['-f', '-F', '--field', '--raw-field', '--input'])
+  const isMutation = args.some(arg => /^\s*mutation\b/.test(arg) || /query=\s*mutation\b/.test(arg))
+  const isWrite = method !== undefined ? method !== 'GET' && method !== 'HEAD' : hasFields || isMutation
+  return isWrite ? { action: 'host-write', verb: 'gh api', bodyFiles: [] } : undefined
+}
+
+/** A gh command as a loop action, or undefined when it writes nothing the presets gate. `text` is the whole shell line. */
+const ghStep = (words: readonly string[], text = words.join(' ')): ShellStep | undefined => {
+  const { group, sub, args } = ghParts(words)
+  if (group === 'api') return ghApiStep(args, text)
   if (group !== 'pr') return undefined
   const verb = `gh pr ${sub}`
   const bodyFiles = valuesOf(args, ['-F', '--body-file'])
@@ -401,15 +462,31 @@ const ghStep = (words: readonly string[]): ShellStep | undefined => {
   return undefined
 }
 
-/** Every write the presets gate in a shell line, in order. */
-export const classifyShell = (command: string): ShellStep[] =>
+const SHELLS = new Set(['bash', 'sh', 'zsh'])
+
+/** The script of `bash -c '...'` (or `-lc`, `-ec`), whose commands run as if typed. */
+const shellScriptOf = (words: readonly string[]) => {
+  const flag = words.findIndex((word, index) => index > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(word))
+  return flag === -1 ? undefined : words.slice(flag + 1).join(' ')
+}
+
+/** The writes in a shell line; `text` is the outermost line, which a `bash -c` script came from. */
+const stepsIn = (command: string, text: string): ShellStep[] =>
   pipelinesOf(command).flatMap(chain =>
     chain.flatMap(segment => {
       const words = commandWords(segment)
-      const step = words[0] === 'git' ? gitStep(words) : words[0] === 'gh' ? ghStep(words) : undefined
+      const program = words[0] ?? ''
+      if (SHELLS.has(program)) {
+        const script = shellScriptOf(words)
+        return script === undefined ? [] : stepsIn(script, text)
+      }
+      const step = program === 'git' ? gitStep(words) : program === 'gh' ? ghStep(words, text) : undefined
       return step === undefined ? [] : [step]
     }),
   )
+
+/** Every write the presets gate in a shell line, in order. */
+export const classifyShell = (command: string): ShellStep[] => stepsIn(command, command)
 
 /** The verbs whose text is a commit message or a PR text, where attribution is looked for (D15). */
 export const carriesText = (step: ShellStep) =>
@@ -428,6 +505,83 @@ export const attributionIn = (text: string) => {
     if (found !== undefined) return found.trim()
   }
   return undefined
+}
+
+// ---------------------------------------------------------------------------
+// QA modes (D69): what the gates read from a ticket
+
+/** A ticket as the QA rules read it. */
+export type QaTicket = Pick<TicketHeader, 'id' | 'status' | 'visibleChange' | 'qaResult'>
+
+const shortCommit = (commit: string) => commit.slice(0, 7)
+
+/** Whether people test the project's changes, on the PR or on staging (D69). */
+export const isHumanQaMode = (qaMode: QaMode) => qaMode === 'human-pr' || qaMode === 'human-staging'
+
+/**
+ * Whether people test a ticket before it is done: a human QA mode, and a change a user
+ * would see. A ticket with no visible change skips human QA, as it skips bot QA (D36).
+ */
+export const waitsOnPeople = (qaMode: QaMode, ticket: Pick<TicketHeader, 'visibleChange'>) => isHumanQaMode(qaMode) && ticket.visibleChange
+
+/** The way out of qa without a pass: the main thread's override, on the person's word. */
+export const OVERRIDE_HINT =
+  'If the person says the ticket should move on anyway, the main thread moves it with ticket_move and an `override` reason, which is written in the ticket.'
+
+/** Whether a QA pass holds at a commit: only at the commit it was given at, as a verdict does (D53). */
+export const hasQaPassAt = (result: TicketHeader['qaResult'], head: string | undefined) =>
+  head !== undefined && result?.result === 'passed' && result.commit === head
+
+const RECORD_PASS = 'Once the person or a tester says it passed, record that with ticket_move (qaResult: passed)'
+
+const qaRule = () => `To change how this project is tested, ${howToChange(SETTING.qaMode)}.`
+
+/**
+ * Why a PR may not be marked ready or merged in `human-pr` before people passed it at its
+ * current commit (D69), or undefined when QA does not hold it. `ticket` is the PR's ticket,
+ * undefined when no ticket names the PR.
+ */
+export const qaGateRefusal = (settings: LoopSettings, pr: string, doing: string, ticket: QaTicket | undefined, head: string): string | undefined => {
+  if (settings.qaMode !== 'human-pr') return undefined
+  const label = `PR #${pr}`
+  if (ticket === undefined) {
+    return `In this project people test a PR before it is ${doing} (QA mode human-pr), and no ticket names ${label}, so godmode cannot tell whether it waits on QA. Set the PR on its ticket with ticket_move (pr: ${pr}), then try again. Nothing ran. ${qaRule()}`
+  }
+  if (!waitsOnPeople(settings.qaMode, ticket) || hasQaPassAt(ticket.qaResult, head)) return undefined
+  const result = ticket.qaResult
+  if (result !== undefined && result.commit !== head) {
+    return `${ticket.id}'s QA ${result.result} was recorded at commit ${shortCommit(result.commit)}, and ${label} is now at ${shortCommit(head)}: a new commit needs a new QA pass before it is ${doing}. Move ${ticket.id} to qa (ticket_move status: qa) and ask the testers to test again. ${RECORD_PASS}. Nothing ran. ${qaRule()}`
+  }
+  if (result?.result === 'failed') {
+    return `QA failed for ${ticket.id} at ${label}'s current commit ${shortCommit(head)}, so it cannot be ${doing}. Run the fix round, have the change reviewed again, and send it back to the testers; it is ${doing} only once they pass the new commit. Nothing ran. ${qaRule()}`
+  }
+  if (ticket.status !== 'qa') {
+    const first = settings.isQaBotFirst ? ', once the QA agent passed it,' : ''
+    return `In this project people test a PR before it is ${doing} (QA mode human-pr), and ${ticket.id} is not waiting in qa yet (it is in ${ticket.status}). Move it to qa${first} with ticket_move (status: qa) and tell the testers. ${RECORD_PASS}. Nothing ran. ${qaRule()}`
+  }
+  return `${label} is waiting on people's QA (QA mode human-pr): ${ticket.id} has no pass recorded at its current commit ${shortCommit(head)}, so it cannot be ${doing}. ${RECORD_PASS}; a fail is recorded with qaResult: failed and starts a fix round. Nothing ran. ${qaRule()}`
+}
+
+/**
+ * Why a move needs a QA pass it lacks, or undefined (D69). A ticket leaves `qa` only with a
+ * pass at its PR's current commit, whatever the mode (build default); in a human mode a
+ * visible change is not done without one either. `head` is undefined when the ticket names
+ * no PR.
+ */
+export const qaMoveRefusal = (qaMode: QaMode, ticket: QaTicket, result: TicketHeader['qaResult'], head: string | undefined) => {
+  if (hasQaPassAt(result, head)) return undefined
+  const why =
+    ticket.status === 'qa'
+      ? `${ticket.id} is waiting in qa, and leaves it only with a QA pass recorded at its PR's current commit.`
+      : `${ticket.id} is a visible change in QA mode ${qaMode}, so it is done only once people passed it; it waits in qa${qaMode === 'human-staging' ? ' after the merge' : ''} until then.`
+  const detail =
+    head === undefined
+      ? ` ${ticket.id} names no PR or branch, so there is no commit to hold a pass: set its PR with ticket_move (pr). ${OVERRIDE_HINT}`
+      : result !== undefined && result.commit !== head
+        ? ` Its last QA result (${result.result}) was recorded at ${shortCommit(result.commit)}, and the PR is now at ${shortCommit(head)}: a new commit needs a new pass.`
+        : ''
+  const fail = qaMode === 'human-staging' ? '' : ' A fail is recorded with qaResult: failed and sends it back for a fix round.'
+  return `${why}${detail} ${RECORD_PASS}.${fail} Nothing changed.`
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +626,7 @@ const isStatusCheck = (words: readonly string[]) => {
     return false
   }
   if (program === 'gh') {
-    const [group = '', sub = ''] = rest
+    const { group, sub } = ghParts(words)
     if (group === 'pr') return ['list', 'view', 'status', 'checks'].includes(sub)
     if (group === 'run') return ['list', 'view', 'watch'].includes(sub)
     if (group === 'auth' || group === 'repo') return sub === 'status' || sub === 'view'
@@ -491,10 +645,10 @@ const isFilter = (words: readonly string[]) => {
   return false
 }
 
-/** The PR actions the PM itself takes: relaying a verdict, marking ready, merging on the person's go. */
+/** The PR actions the PM itself takes: relaying a verdict, marking ready, merging on the person's go; never a raw API call. */
 const isPmLoopAction = (words: readonly string[]) => {
   const step = words[0] === 'gh' ? ghStep(words) : undefined
-  return step !== undefined && ['pr-comment', 'pr-ready', 'pr-merge'].includes(step.action)
+  return step !== undefined && step.isApi !== true && ['pr-comment', 'pr-ready', 'pr-merge'].includes(step.action)
 }
 
 /** Whether a shell line is a quick status check (or the PM's own PR action) the main thread may run. */
@@ -512,16 +666,24 @@ export const isMainThreadShell = (command: string) => {
   )
 }
 
-export type MainThreadCall = { tool: string; command?: unknown; run_in_background?: unknown }
+export type MainThreadCall = { tool: string; command?: unknown; run_in_background?: unknown; file_path?: unknown }
+
+/** godmode's own folders the PM reads its role and rules from: under the plugin's root, never a project's. */
+const OWN_FOLDERS: readonly string[] = ['agents', 'rules']
+
+/** Whether a read is of godmode's own role or rule files, which the PM may read beyond the per-prompt limit. */
+const isOwnFile = (path: unknown, pluginRoot: string | undefined) =>
+  typeof path === 'string' && pluginRoot !== undefined && OWN_FOLDERS.some(folder => isInside(path, `${pluginRoot}/${folder}`))
 
 /** What the main thread may do, or why not. */
 export type MainThreadVerdict = { isAllowed: true; isRead?: boolean } | { isAllowed: false; reason: string }
 
 /**
  * Whether the main thread may make a call (D63): talking, the ticket tools, dispatching
- * agents and shells, quick status checks, and a couple of reads per prompt.
+ * agents and shells, quick status checks, and a couple of reads per prompt. Reading
+ * godmode's own role and rules (under `pluginRoot`) is the PM's job, so it never counts.
  */
-export const mainThreadVerdict = (call: MainThreadCall, settings: LoopSettings, readsThisPrompt: number): MainThreadVerdict => {
+export const mainThreadVerdict = (call: MainThreadCall, settings: LoopSettings, readsThisPrompt: number, pluginRoot?: string): MainThreadVerdict => {
   const { tool } = call
   if (MAIN_THREAD_TOOLS.has(tool) || tool.startsWith('mcp__godmode__') || settings.mainThreadTools.includes(tool)) return { isAllowed: true }
   const refuse = (what: string, setting: string = SETTING.thinMainThread): MainThreadVerdict => ({
@@ -529,6 +691,7 @@ export const mainThreadVerdict = (call: MainThreadCall, settings: LoopSettings, 
     reason: `godmode keeps the main thread thin: ${what} is work for an agent, not the PM. Dispatch a researcher or a shell to do it, and keep this thread for talking, tickets and dispatch. To loosen the rule, ${howToChange(setting)}.`,
   })
   if (tool === 'Read') {
+    if (isOwnFile(call.file_path, pluginRoot)) return { isAllowed: true }
     if (readsThisPrompt < settings.mainThreadReadLimit) return { isAllowed: true, isRead: true }
     return refuse(
       `reading more than ${settings.mainThreadReadLimit} file${settings.mainThreadReadLimit === 1 ? '' : 's'} in one prompt`,

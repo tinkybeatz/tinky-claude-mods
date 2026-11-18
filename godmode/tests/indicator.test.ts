@@ -42,7 +42,7 @@ test('the band style draws GODMODE above the prompt, and only that style does', 
     plugin: 'godmode',
     surface: 'terminal',
     component: 'AbovePrompt',
-    props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 9 }, view: {} },
+    props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 9 }, view: {} },
   })
   expect(await band.find({ text: 'GODMODE' })).toBeDefined()
 
@@ -73,7 +73,7 @@ test('the band yields to a survey', async ($, on) => {
     plugin: 'godmode',
     surface: 'terminal',
     component: 'AbovePrompt',
-    props: { hasSurvey: true, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 9 }, view: {} },
+    props: { hasSurvey: true, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 9 }, view: {} },
   })
   expect(await band.find({ text: 'GODMODE' })).toBeUndefined()
 })
@@ -84,7 +84,7 @@ test('nothing shows while godmode is off', async ($, on) => {
     plugin: 'godmode',
     surface: 'terminal',
     component: 'AbovePrompt',
-    props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 9 }, view: {} },
+    props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 9 }, view: {} },
   })
   expect(await band.find({ text: 'GODMODE' })).toBeUndefined()
 })

@@ -229,3 +229,118 @@ Learned while building `godmode` 0.5.0 (setup mode).
 - **Test hooks run in the order they were made.** A catch-all `on('ui.render', ...)` made
   first answers before a narrower one made later, which then never runs. Make the hook
   that records what the plugin passed down before any catch-all.
+
+Learned while building `godmode` Step 13.1 against types from 2.1.322.
+
+- **A `.catch` no longer sees a `re-entry` kind.** `HookFailure.kind` is `throw` or
+  `timeout` only, and a hook's own `$` call (`$.ui.ask` included) skips the calling hook,
+  so a guard's `.catch` passes on with `next.called` alone. Comparing with `'re-entry'` is
+  a type error.
+- **`AbovePrompt` props gained `isCollapsed`.** A test that mounts the band must pass it,
+  or the type check fails.
+- **`$.ui.ask` takes `{ options, header, multiSelect: true }`** and resolves the picked
+  labels comma-joined, so a multi-select label must not hold a comma.
+
+Learned while fixing `godmode` Step 13.5 (the per-prompt QA check).
+
+- **GitHub's team-membership 404 does not mean "not a member".** The
+  `orgs/<org>/teams/<slug>/memberships/<login>` endpoint answers 404 for a non-member, and
+  also when `gh` lacks the `read:org` scope or cannot see the team. godmode reads
+  `orgs/<org>/teams/<slug>` in the same round, and only when that answers does a 404 mean
+  "not a member".
+
+Learned while building `godmode` Step 9 (`/godmode try`).
+
+- **A long-running child comes from `$.process.spawn`, not `$.process.run`.** `run` holds
+  until the child exits (ten minutes at most). A `spawn` stream read in an unawaited loop
+  outlives the hook that started it; `stream.return()` or a module reload kills the child.
+  Killing it does not always end a server it started (`npm run dev` runs one as its own
+  child), so godmode also ends what still listens on the port it handed out.
+- **`$.clock.sleep` counts against a hook's 10-second budget**, unlike every other `$` call.
+  A `command.run` hook that waits for an app to answer polls for at most 8 seconds, then
+  answers and keeps watching from a `$.clock.every` timer.
+- **A test answers `$.process.spawn` with an async generator hook beneath the plugin.** It
+  yields `{ stream, text }` chunks and returns `{ value: { code, signal } }`; a bare result
+  is refused ("returned neither { value } nor { deny }"). Its `next.signal` aborts when the
+  plugin ends the stream, which is how a test sees the child stopped. A hook that waits on
+  the mocked clock needs the test to `clock.advance` while the call is pending.
+- **Background work must catch its own rejections.** A loop or timer still running when a
+  test ends calls `$` on an unloaded module, and the rejection fails the test file ("a
+  rejection nothing handled").
+
+Learned while building `godmode` Step 10 (context7) against Claude Code 2.1.323.
+
+- **An MCP server can sit inline in `plugin.json` under `mcpServers`**, the same shape as
+  `.mcp.json`. godmode lists context7 there as a remote `http` server
+  (`https://mcp.context7.com/mcp`), which needs no Node package and no API key. A live
+  `claude -p --plugin-dir` run connected it as `plugin:<plugin>:context7`, with the tools
+  `mcp__plugin_<plugin>_context7__resolve-library-id` and `..._query-docs`.
+- **A remote MCP server makes `validate` ask for a privacy policy.** It reports
+  `PRIVACY_URL_MISSING` among the plugin directory's problems; validation still passes.
+  The fix is `privacyPolicyUrl` in `plugin.json`, or a "Privacy" link in the README.
+
+Learned while building `godmode`'s Jira and "Other" ticket backends (Step 5).
+
+- **A test answers `$.mcp.call` and `$.tool.list` beneath the plugin like any `$` call.**
+  `on('mcp.call', (_$, e) => ({ value: { content: [{ type: 'text', text }], isError } }))`,
+  with `e.server`, `e.tool` and `e.args`; `on('tool.list', () => ({ value: [{ name, description,
+  mcp: true }] }))`. A hook beneath that returns a promise that never settles plays a server
+  that hangs. `godmode/tests/jira-world.ts` is a pretend Atlassian server built that way.
+- **`$.mcp.call` takes no time limit.** godmode races it against `$.clock.sleep(ms, { signal })`
+  and aborts the sleep once the call answers. A sleep counts against the hook's 10-second
+  budget where a `$` call in flight does not, so only the prompt hook's 3-second reads get a
+  limit; the ticket tools wait on Jira unbounded.
+- **Atlassian's MCP servers differ in their Jira tools.** One takes `issueTypeName` on
+  `createJiraIssue`, has `getTransitionsForJiraIssue` and `addCommentToJiraIssue`; the other
+  takes `issueType`, has `addOrEditJiraIssueComment` and no transitions list. Both refuse an
+  argument their schema lacks, so godmode tells them apart by the tool names
+  `$.tool.list()` gives (`mcp__<server>__<tool>`, the server being the part before the last
+  `__`), never by a fixed server name.
+- **A runtime import cycle between hook files is avoided with type-only imports.**
+  `tickets.ts` builds the Jira backend from `jira.ts`, so `jira.ts` imports only types from
+  `tickets.ts` and `questionnaire.ts`, throws its own `JiraError`, and `tickets.ts` turns
+  every Jira failure into a `TicketError` for the model.
+
+Learned while building `godmode` Step 8 (`/godmode report` and resume).
+
+- **A plugin's `command.run` text reaches the model too, not only the person.** The types
+  say a `{ text }` answer stays in requests unless every plugin hooking the command ships
+  with Claude Code. So `/godmode report`'s QA lines, which tell the PM to record a result
+  with `ticket_move`, reach the PM without a separate `context` entry.
+
+Learned while fixing `godmode`'s Jira backend (Step 13 fix round, schemas read 2026-11-16).
+
+- **The "Atlassian MCP" server has no transitions list among its tools.** Its
+  `transitionJiraIssue` takes `transitionId` (or `transitionName`, the transition's own
+  name, never the target status), and the ids come from the `listJiraIssueTransitions`
+  operation run through `executeRead({ name, cloudId, inputs })`; `discover` names it when
+  that name fails, and takes `query` alone, no `cloudId`. Its answer reports the status the
+  issue landed in, which a board's automation can make differ from the target.
+- **One unknown key makes Jira refuse a whole `key in (...)` search**, deleted or merely
+  hidden from the person alike ("An issue with key 'APP-6' does not exist for field
+  'key'"). godmode drops the keys the error quotes and searches again, and archives their
+  side files into `jira/archived/` so the next search is clean.
+- **`$.tool.list()` misses deferred MCP tools**, and an agent's own list can leave out
+  `mcp__*`, while `$.mcp.call` still reaches the server. godmode calls the setup's named
+  server directly, and with none named tries the usual connector names
+  (`claude.ai Atlassian MCP`, `claude.ai Atlassian Rovo`, ...) before saying none is
+  connected. A server found by name has unseen tools: `getVisibleJiraProjects` answering
+  marks the shape with a transitions list.
+- **A test plays an unconnected MCP server with `{ deny }` from `mcp.call`**: the
+  plugin's `$.mcp.call` rejects, as a live call to a server the session lacks does.
+
+Learned while fixing `godmode`'s try, QA gates and resume (2026-11-16, types from 2.1.322).
+
+- **`$.process.spawn` gives no pid.** godmode's try runs `/bin/sh -c '<wrapper>' godmode-try
+  <command>`: the wrapper starts the command with `set -m` (its own process group), turns
+  `set +m` again so no `[1]+ Done` job notice lands in the output, prints
+  `godmode-try-pgid=<pgid> wrapper=<pid>` on stderr, and traps TERM to kill the group. A
+  SIGKILLed wrapper leaves the group running with its leader re-parented to 1, so "the
+  leader's parent is still the recorded wrapper" is how a later session tells a live try
+  from a leftover one.
+- **Listing an MCP server in the manifest defers nothing.** `$.mcp.connect` only connects a
+  server the manifest lists, and a listed server joins every session at its start, godmode
+  on or off. To hold its tools back, a mod refuses their calls at `tool.check`.
+- **context7 links no privacy policy of its own.** Its site's footer has only "Legal",
+  which leads to Upstash's legal page (Upstash's privacy policy and a "Context7 Addendum"
+  PDF). Nothing there was verified as context7's own policy, so `privacyPolicyUrl` stays unset.

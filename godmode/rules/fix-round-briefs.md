@@ -31,7 +31,9 @@ Short, and complete on its own:
 
 - Start a re-review at the new commit. The reviewer checks each earlier finding and only
   the lines changed since.
-- After a QA failure, also re-run QA on the items it flagged, once the re-review is
-  clean.
+- After a QA agent's failure, also re-run it on the items it flagged, once the re-review
+  is clean.
+- After the human testers' failure, the QA agent re-tests what they flagged only when it
+  tests before them; then the ticket goes back to them in `qa`.
 - If the agent disagrees with a finding, put both views to the reviewer in the
   re-review brief. If they still disagree, bring it to the person.

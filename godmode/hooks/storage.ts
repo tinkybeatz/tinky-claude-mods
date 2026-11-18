@@ -177,6 +177,18 @@ export const noteDir = (project: Project, mode: StorageMode, claudeDir: string |
 }
 
 /**
+ * Where godmode keeps its own records of a real tracker's tickets (Jira's side files, the
+ * "Other" tracker's local copies): under Claude Code's configuration folder whatever the
+ * storage mode, so they stay one person's (D61) and never reach a commit.
+ */
+export async function trackerDirOf($: EngineInterface, project?: Project) {
+  const at = project ?? (await projectOf($))
+  const dir = noteDir(at, 'outside', await claudeDirOf($))
+  if (dir === undefined) throw new Error('no home folder to keep the tracker\'s records in')
+  return `${dir}/tracker`
+}
+
+/**
  * The ignore lines a storage mode needs: committed mode ignores the personal note alone
  * (D61) in `.gitignore`, for every clone; gitignored mode the whole folder, in
  * `.git/info/exclude` (see `ensureExcluded`).
@@ -337,6 +349,17 @@ export async function writePersonalNote($: EngineInterface, dir: string, answers
   const personal: PersonalNote = { writtenAt: new Date(await $.clock.now()).toISOString(), answers, models }
   const path = `${dir.replace(/[\\/]+$/, '')}/${PERSONAL_NOTE}`
   await $.fs.write(path, `${JSON.stringify(personal, null, 2)}\n`)
+  return path
+}
+
+/**
+ * Writes only the shared half, as given: a change-setup (D22) keeps the conventions'
+ * fingerprints it did not re-check, so an edit made outside it is still noticed. Resolves the
+ * path written.
+ */
+export async function writeSharedNote($: EngineInterface, dir: string, shared: SharedNote) {
+  const path = `${dir.replace(/[\\/]+$/, '')}/${SHARED_NOTE}`
+  await $.fs.write(path, `${JSON.stringify(shared, null, 2)}\n`)
   return path
 }
 

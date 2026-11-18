@@ -54,6 +54,40 @@ test('gh commands read as PR actions, with the PR they name', () => {
   expect(actions('gh pr view 9 && gh pr list')).toEqual([])
 })
 
+test('a gh merge behind a path, gh\'s own -R flag or a bash -c script names the same PR step', () => {
+  for (const command of [
+    'gh pr -R acme/app merge 12',
+    'gh --repo acme/app pr merge 12',
+    'gh pr --repo=acme/app merge 12',
+    '/usr/bin/gh pr merge 12',
+    'bash -c "gh pr merge 12"',
+    'sh -c \'gh pr merge 12 --squash\'',
+    'zsh -lc "git status && gh pr merge 12"',
+  ]) {
+    expect([command, classifyShell(command).at(-1)?.action, classifyShell(command).at(-1)?.pr]).toEqual([command, 'pr-merge', '12'])
+  }
+  expect(classifyShell('bash -c "gh pr ready 12 && gh pr merge 12"').map(step => [step.action, step.pr])).toEqual([
+    ['pr-ready', '12'],
+    ['pr-merge', '12'],
+  ])
+  expect(isMainThreadShell('gh -R acme/app pr view 12')).toBe(true)
+})
+
+test('a gh api call that merges, arms auto-merge or marks ready is that PR step; a GraphQL one names no PR number', () => {
+  expect(classifyShell('gh api -X PUT repos/acme/app/pulls/12/merge -f merge_method=squash')[0]).toMatchObject({ action: 'pr-merge', pr: '12', isApi: true })
+  expect(classifyShell('gh api --method PUT /repos/acme/app/pulls/12/merge')[0]).toMatchObject({ action: 'pr-merge', pr: '12' })
+  const ready = classifyShell('gh api graphql -f query=\'mutation {\n  markPullRequestReadyForReview(input: {pullRequestId: "PR_1"}) { clientMutationId }\n}\'')[0]
+  expect(ready).toMatchObject({ action: 'pr-ready', isApi: true })
+  expect(ready?.pr).toBeUndefined()
+  expect(classifyShell('gh api graphql -f query=\'mutation { enablePullRequestAutoMerge(input: {pullRequestId: "PR_1"}) { clientMutationId } }\'')[0]).toMatchObject({
+    action: 'pr-merge',
+    isAuto: true,
+  })
+  // Reading whether a PR merged stays a read, and the main thread never merges through the API.
+  expect(actions('gh api repos/acme/app/pulls/12/merge')).toEqual([])
+  expect(isMainThreadShell('gh api -X PUT repos/acme/app/pulls/12/merge')).toBe(false)
+})
+
 test('AI attribution lines are found, and ordinary text is not', () => {
   expect(attributionIn('fix\n\nCo-Authored-By: Claude Opus <noreply@anthropic.com>')).toBe('Co-Authored-By: Claude Opus <noreply@anthropic.com>')
   expect(attributionIn('Body\n\nGenerated with [Claude Code](https://claude.com/claude-code)')).toBe('Generated with [Claude Code]')
@@ -142,6 +176,18 @@ test('the main thread\'s tools: talking, tickets and dispatch pass, heavier work
     if (!verdict.isAllowed) expect(verdict.reason).toContain('/godmode setup')
   }
   expect(mainThreadVerdict({ tool: 'Grep' }, settingsOf({ mainThreadTools: 'Grep' }), 0)).toEqual({ isAllowed: true })
+})
+
+test('the PM reading godmode\'s own role and rules never counts towards the reads per prompt', () => {
+  const settings = settingsOf({})
+  const root = '/plugins/godmode'
+  for (const path of [`${root}/agents/pm.md`, `${root}/rules/writing-tickets.md`]) {
+    expect(mainThreadVerdict({ tool: 'Read', file_path: path }, settings, 2, root)).toEqual({ isAllowed: true })
+  }
+  // The rest of the plugin, a path that climbs out of its folders, and a project's own agents/ are ordinary reads.
+  for (const path of [`${root}/hooks/loop.ts`, `${root}/agents/../hooks/loop.ts`, '/work/app/agents/pm.md']) {
+    expect(mainThreadVerdict({ tool: 'Read', file_path: path }, settings, 2, root).isAllowed).toBe(false)
+  }
 })
 
 test('roles, model floors, paths and ticket ids', () => {

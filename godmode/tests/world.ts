@@ -37,6 +37,8 @@ export type World = {
   runs: Run[]
   /** Answers a command before the world's own git does; undefined passes it on. */
   answer?: (run: Run) => RunAnswer | undefined
+  /** Makes a command's run reject with this reason, as a timeout does; undefined lets it run. Sees the run's time limit. */
+  reject?: (run: Run & { timeoutMs?: number }) => string | undefined
   /** The tools the plugin declared, by short name. */
   tools: string[]
   /** GitHub, when the repo's `origin` is there; absent, the project has no PR host. */
@@ -225,7 +227,7 @@ const run = (world: World, argv: readonly string[], init: { cwd?: string; stdin?
   return answer(1, '')
 }
 
-/** Answers the plugin's calls from `world`, beneath the plugin. */
+/** Answers the plugin's calls from `world`, beneath the plugin; resolves the clock the world reads. */
 export const mountWorld = (on: On, world: World) => {
   on('fs.read', (_$, e) => {
     try {
@@ -246,14 +248,19 @@ export const mountWorld = (on: On, world: World) => {
     world.files.set(e.path, e.text)
     return { value: undefined } as never
   })
-  on('process.run', (_$, e) => ({ value: run(world, e.argv, e.init) }))
+  on('process.run', (_$, e) => {
+    const refusal = world.reject?.({ argv: [...e.argv], cwd: e.init?.cwd, stdin: e.init?.stdin, timeoutMs: e.init?.timeoutMs })
+    if (refusal === undefined) return { value: run(world, e.argv, e.init) }
+    world.runs.push({ argv: [...e.argv], cwd: e.init?.cwd, stdin: e.init?.stdin })
+    return { deny: refusal } as never
+  })
   on('session.root', () => ({ value: world.sessionRoot }))
   on('tool.register', (_$, e) => {
     world.tools.push(e.name)
     return { value: { tool: `mcp__godmode__${e.name}` } } as never
   })
   mock.env(on, world.env)
-  mock.clock(on, { now: NOW })
+  return mock.clock(on, { now: NOW })
 }
 
 /** A `$` over `world` for calling the storage helpers directly. */

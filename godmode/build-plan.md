@@ -2,8 +2,8 @@
 
 Built from `brainstorm-log.md` (D1–D63, session 1, 2026-10-15), with later decisions
 folded in where they change a step: D64–D68 in session 2, and the QA modes of D69–D73 on
-2026-11-04 (Step 13). Each step names the decisions it implements. Where the plan and
-the log disagree, the log wins.
+2026-11-04 (Step 13), with the build defaults of 2026-11-16. Each step names the
+decisions it implements. Where the plan and the log disagree, the log wins.
 
 Target: a Claude Code mod in `tinky-claude-mods/godmode/`, independent of dispatch-panel
 (D43), self-contained (D2), working on any stack (D1).
@@ -23,15 +23,27 @@ Target: a Claude Code mod in `tinky-claude-mods/godmode/`, independent of dispat
 M1 comes before setup on purpose: the loop is what the conventions serve, so it is
 proven first on a repo set up by hand.
 
-## Status (2026-11-04)
+## Status (2026-11-16)
 
-- Built: M0 (`spikes.md`), M1 (0.1.0 to 0.4.0) and M2 (0.5.0). The first live test
-  (`LIVE-TEST.md`) has not been reported yet.
-- D69–D73 replaced QA on or off with four QA modes. M3 gains Step 13, and some parts
-  already built change with it: the setup's QA question, the ticket statuses, the merge
-  gate, and the PM's and QA agent's briefs.
-- The QA modes leave open questions, listed in the log's entry "QA modes: what they
-  change, and open questions (2026-11-04)". Step 13 names the ones each part waits on.
+- Built: M0 (`spikes.md`), M1 (0.1.0 to 0.4.0) and M2 (0.5.0).
+- M3 is built and reviewed: Step 13 (the QA modes, every part from 13.0 to 13.7), Step
+  7's fix-round limit, Step 5's Jira and Other backends, and Steps 8, 9, 10 and 11. The
+  order under "What comes next" is done.
+- D69–D73 replaced QA on or off with four QA modes. The questions they left are settled
+  by build defaults, in the log's entry "QA modes: build defaults (2026-11-16)". They are
+  not decisions, and Gael can overrule any of them.
+- Left, in order: the parts of Step 12 that ship it (the version bump, the marketplace
+  entry and the README), then the first full live test (`LIVE-TEST.md`), then the rest
+  of M4 (the dogfooding), and last Step 14.
+- Known limits:
+  - context7 connects in every session, even while godmode is off. A server the manifest
+    lists joins each session at its start and the API cannot defer it, so godmode only
+    refuses its tools while off.
+  - `plugin.json` has no `privacyPolicyUrl` yet: context7 links no privacy policy of its
+    own.
+  - `/godmode try` does not run on Windows: it needs `/bin/sh` and process groups.
+  - On resume, telling that a dev agent stopped to ask the person something is a
+    heuristic, read from the agent's last report.
 
 ## What comes next (M3 order)
 
@@ -45,7 +57,7 @@ Each item says what it waits on. Tests come with each item, not at the end.
    on the other.
 3. **13.3** loop gating per QA mode, after 13.1 and 13.2.
 4. **Step 7's rest**: the stop after too many fix rounds (D56), after 13.3, since a
-   human QA fail may count towards it (open).
+   human QA fail counts towards it (build default).
 5. **13.4** the PM and QA agent briefs, after 13.3.
 6. **13.5** the prompt-hook check, after 13.2; then **13.6** the signals, after 13.3 and
    13.5.
@@ -58,7 +70,7 @@ Each item says what it waits on. Tests come with each item, not at the end.
 11. **Step 11**, change-setup, after 13.1, so a project can change its QA mode later.
 12. **Step 10**, context7. It waits on nothing.
 
-Then M4 (Step 12).
+Then M4 (Step 12), and last, Step 14: make the GitHub page pretty.
 
 ---
 
@@ -207,8 +219,8 @@ Every block says why and what unblocks it; every rule is a setting (D37).
   → fixes if needed (reviewer re-checks changed lines, QA re-tests what it flagged) →
   ready for Gael. Since D69 this is the `bot` QA mode; the other three modes are in
   Step 13.3.
-- **Fix-round limit**: after 3 on one ticket, stop and ask (D56). Whether a human QA
-  fail counts is open.
+- **Fix-round limit**: after 3 on one ticket, stop and ask (D56). A human QA fail
+  counts too (build default).
 - **Merge**: PRs always drafts; no ready or merge without a clean verdict at the PR's
   current commit; auto-merge off unless Gael says so (D53). In `human-pr`, also no
   ready before QA passes (D69, Step 13.3).
@@ -221,9 +233,9 @@ Every block says why and what unblocks it; every rule is a setting (D37).
   or three suggested next. Since D70, also the tickets waiting on QA and the latest
   signal for each, read the same way as the prompt-hook check (Step 13.5).
 - Resume on `/godmode`: tickets in progress matched with worktrees, branches and PRs;
-  one line per resumed ticket. A ticket waiting in `qa` must not restart dev work;
-  whether it gets a line, and whether `/godmode` shows QA results at all (D46, D70), is
-  open.
+  one line per resumed ticket. A ticket waiting in `qa` is not in progress: it restarts
+  no dev work and gets no resume line, and `/godmode` shows no QA results (D46, D57); the
+  next prompt's line and the report carry them (build defaults).
 - Update notice from the note's version (step 2).
 
 ## Step 9 — `/godmode try` (D49)
@@ -242,7 +254,8 @@ Every block says why and what unblocks it; every rule is a setting (D37).
 - `/godmode setup` opens a conversation; the main thread applies the change (e.g. adding
   Jira after two months) to settings and conventions, then updates the note.
 - Changing the QA mode or its signals goes through here too (D69). What happens to
-  tickets already in `qa` when the mode changes is open.
+  tickets already in `qa` when the mode changes: they leave `qa` only with a recorded
+  pass, whatever the new mode (build default).
 
 ## Step 12 — Ship
 
@@ -257,8 +270,8 @@ Every block says why and what unblocks it; every rule is a setting (D37).
 
 QA is one of four modes per repo, asked at setup: `human-pr`, `human-staging`, `bot` and
 `none` (D69). This replaces QA on or off (D34). It is part of M3, in the order under
-"What comes next". Each part names the open questions it waits on; they are listed in
-the log's entry of 2026-11-04.
+"What comes next". Each part names the build defaults it follows, from the log's entry
+"QA modes: build defaults (2026-11-16)". They are not decisions; Gael can overrule any.
 
 0. **Tell the PM the QA mode.** First, and a fix for a gap that exists in 0.5.0: on a
    coding-mode `/godmode` the PM gets `agents/pm.md` but never the project's QA answer,
@@ -272,7 +285,10 @@ the log's entry of 2026-11-04.
    status (its exact name) and a PR approval from named QA people or a team (D70). The
    scan's runnable-UI finding only suggests the defaults. The answers go into the note
    and its types. The mode is shared, since it replaces D61's shared "QA on or off".
-   Open: whether the bot pass and the signals are shared or personal.
+   Default: the bot pass, the pass status and the named people are shared, like the
+   mode. With Jira or Other, setup also asks the board's "waiting for QA" status, offering
+   its statuses when it can read them. The board-status signal is not offered with
+   tracker None, and the PR-approval signal only on GitHub.
    **Projects set up before D69 must keep working.** Their note holds `qa: true` or
    `false`; the code reads `true` as `bot` and `false` as `none`, so an update never
    breaks a project, and a test loads a note written by 0.5.0. The update notice (D60)
@@ -290,32 +306,59 @@ the log's entry of 2026-11-04.
      goes to `qa`, not `done` (D69);
    - `bot`: Step 7's flow (D35);
    - `none`: straight to ready.
-   Open: how "QA passed" is recorded when Gael says it; whether a pass holds only at the
-   PR's commit; whether human QA skips tickets with no visible change; whether a human
-   fail counts towards the fix-round limit.
+   Defaults: Gael's word is recorded as a `qaResult` field (passed or failed, at the PR's
+   commit) that only the main thread sets with `ticket_move`, like `ready`; a pass holds
+   only at that commit; a ticket with no visible change skips human QA too (D36); a human
+   fail counts towards the fix-round limit; a ticket leaves `qa` only with a recorded
+   pass, whatever the mode.
 4. **The PM and QA agent briefs.** Waits on 3. `agents/pm.md` gets the flow per mode;
    `agents/qa.md` also covers the pass before the human testers (D71); a text rule says
    what the PM does with the prompt-hook line, including checking Jira itself when the
-   hook cannot (D73). Open: whether the bot pass runs again after a human fail.
+   hook cannot (D73). Default: after a human fail, review re-checks the changed lines,
+   the bot pass (when on) re-tests what the testers flagged, then the ticket goes back to
+   `qa`, and the PM tells the testers what failed and what changed.
 5. **The prompt-hook check (D73).** Waits on 2. On each prompt, the `prompt.submit` hook
    reads the tickets in `qa` from the ticket store, never from the PM's memory, and adds
    one fresh line per ticket, so compaction cannot lose it. The first version says
-   "still waiting" only. Open: which tickets wait when the tracker is Jira or Other (they
-   are not on disk), and the cost of a `gh` call per ticket on every prompt.
+   "still waiting" only. Defaults: with Jira or Other, godmode keeps its own list of the
+   tickets it moved to `qa`, in the personal settings, and the hook reads that; each
+   ticket's answer is kept 5 minutes on disk, each `gh` call stops after 3 seconds, and
+   at most 10 tickets are checked per prompt, the rest reading "still waiting, not
+   checked".
 6. **Signals.** Waits on 3 and 5. Being told by Gael always counts (D70). The hook reads
    what it can reach itself: a PR approval from the named people through `gh`, and a
    markdown ticket's status from disk. A Jira status depends on spike 10: either the
    hook reads it, or its line tells the PM to check (D73). A fail starts a fix round in
-   `human-pr`, and part 7 in `human-staging`. Open: how a fail shows through each signal;
-   approvals on a draft PR; hosts with no PR approval to read.
+   `human-pr`, and part 7 in `human-staging`. Defaults: a fail is a "changes requested"
+   review from the named people, or the ticket moved out of the waiting status to
+   anything but the pass status, with the tester's latest comment as the reason (none:
+   the PM asks Gael); check here that GitHub takes a review on a draft PR, and if not,
+   setup drops the PR signal from `human-pr`; the PR signal exists only on GitHub; in
+   `human-staging` an approval on the merged PR is ignored; the PM's Jira check goes
+   through the ticket list tool, which D63 already allows.
 7. **The staging fix ticket (D72).** Waits on 2 and 6. A fail after the merge opens a
-   new ticket that links the original and carries the tester's reason. Open: whether its
-   build starts on its own or waits for Gael's go (D52); whether it goes through QA
-   itself; when the original ticket closes.
+   new ticket that links the original and carries the tester's reason. Defaults: it waits
+   for Gael's go like any ticket (D52), and the PM tells Gael it filed it; it goes
+   through the repo's QA mode like any ticket; the original stops being watched once the
+   fix ticket is filed, and closes when the fix ticket passes QA.
 8. **Tests**, written with each part: the questionnaire for each answer; the `qa` status
    in the markdown backend; the gate per mode (ready refused in `human-pr` without a
-   pass, merge allowed in `human-staging`); the prompt line from a ticket store on disk,
-   with `gh` answered beneath the plugin; a fail opening a linked ticket.
+   pass or at a later commit than the pass, merge allowed in `human-staging`); the prompt
+   line from a ticket store on disk, with `gh` answered beneath the plugin; a fail
+   opening a linked ticket that is not marked ready.
+
+---
+
+## Step 14 — Make the GitHub page pretty (last step)
+
+An idea of Gael's, not a decision yet: once godmode works end to end, give its GitHub
+page something visual that explains it at a glance.
+
+- Counted already: a diagram of the whole loop (idea, ticket, go, dev, draft PR, review,
+  fix rounds, QA, ready, merge), drawn for the README.
+- Before building anything, invite Gael to reflect on what else would be nice on the
+  page (for example a short screen recording, a picture of the panel and the indicator,
+  a "what you get" section). Decide together, one point at a time.
 
 ---
 
@@ -332,4 +375,4 @@ the log's entry of 2026-11-04.
 - **Thin main thread too strict** (D63): the "couple of files" threshold is a setting to
   tune during dogfooding.
 - **A slow prompt** (D73): the QA check runs on every prompt, so each waiting ticket's
-  `gh` call adds to the wait before the model answers.
+  `gh` call adds to the wait before the model answers. 13.5's defaults bound it.

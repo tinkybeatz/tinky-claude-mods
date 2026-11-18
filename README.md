@@ -6,9 +6,7 @@ function hooks. This repository holds several mods, one folder each.
 | Mod | What it does |
 | --- | --- |
 | [`dispatch-panel`](dispatch-panel/) | A side panel listing dispatched agents and background shells, with their purpose, input and output tokens and duration, in Active and Finished tabs, coloured by what each agent is doing. |
-
-`godmode` (an agentic dev loop for any project) is being built in [`godmode/`](godmode/).
-It is not in the marketplace yet.
+| [`godmode`](godmode/) | An agentic development loop for any project: a PM main thread files tickets and dispatches dev, review, QA and research agents, with hard rules in code. Being tested; expect changes. |
 
 ## Installing on a new machine
 
@@ -25,6 +23,7 @@ from GitHub with no clone.
 
 ```
 /plugin install dispatch-panel@tinky-claude-mods
+/plugin install godmode@tinky-claude-mods
 ```
 
 Pick the **user** scope so it loads in every project. The mod runs at once, with no

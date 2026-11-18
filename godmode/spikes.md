@@ -285,3 +285,26 @@ reaches the model on both kinds of account (D64).
 **Not settled.** How `$.ui.ask` from a hook serving a background subagent's tool call
 shows in an interactive session (the same open check as spike 4). Headless, it rejects,
 and the setup tools then stop and hand the questions back for the PM to ask.
+
+## 10. Can hook code read Jira itself? (2026-11-16, Step 13)
+
+**Yes, by the types; not yet confirmed live.** `$.mcp.call(server, tool, args?)` calls a
+tool of an MCP server the session has connected, with the engine's own connection and
+credentials, and resolves `{ content, isError, structuredContent? }` (2.1.322 types,
+`claude-code.d.ts` around line 2868; the result type around line 6383). It asks no
+permission: the plugin's call is the grant, though other plugins' `mcp.call` hooks see
+it. The server is named as `/mcp` lists it (the underscore spelling works too). A
+throwaway `prompt.submit` hook calling a Jira issue read type-checks; no real Jira call
+was made.
+
+**Limits.** Only servers the session has connected: `$.mcp.connect` covers a mod's own
+manifest servers, not a claude.ai connector. Server names differ per person, so godmode
+must not hard-code one; it finds the server from `$.tool.list()` or a setup answer.
+`$.tool.call` with an `mcp__` name is the other route, but it returns `{ deny }` where a
+permission would be asked, so `$.mcp.call` fits better.
+
+**Consequence for D73.** The prompt hook reads a Jira ticket's status itself, like it
+calls `gh`: a 3-second limit per call, answers kept 5 minutes, at most 10 tickets per
+prompt. When the server is missing, the call fails or returns `isError`, the line falls
+back to telling the PM to check that ticket. To confirm in a live session before 13.5
+relies on it.

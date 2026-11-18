@@ -9,6 +9,11 @@
       "name": "dispatch-panel",
       "source": "./dispatch-panel",
       "description": "A side panel listing dispatched agents and background shells, with purpose, tokens and duration"
+    },
+    {
+      "name": "godmode",
+      "source": "./godmode",
+      "description": "An agentic development loop: a PM main thread that files tickets and dispatches dev, review, QA and research agents, for any project"
     }
   ]
 }
