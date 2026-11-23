@@ -383,3 +383,35 @@ Learned while fixing `godmode` after its first live test (0.7.0, 2026-11-23).
 - **A dialog cuts a long question off**, options and all. Put long text (a summary, the
   rules to save, the changes to save) in a `$.ui.log` line just before the question, and
   keep the question short.
+- **`$.ui.log` takes one line, and so does a dialog question.** A new line inside either
+  renders as a stray character. `$.ui.ask` has no preview field. godmode logs a text of
+  several lines one call per line and folds questions onto one line
+  (`hooks/ui-text.ts`).
+- **JQL's `currentUser()` is the account behind the connector's token**, so
+  `(reporter = currentUser() OR creator = currentUser())` finds the person's own tickets
+  with no account lookup.
+- **Checked against a real board (2026-11-23): the "Atlassian MCP" server's custom fields.**
+  An explicit `fields` list is honoured exactly: custom fields come back only when named
+  by id, and `view: "evidence"` then adds nothing. With no `fields`, the evidence view
+  lists under `fields.customFields`, by label, each `{ id, value }`, and only the fields
+  that ticket holds, so a bug's fields show only on a bug. The session saves any answer
+  over about 50,000 characters to a file; ten issues with their descriptions already pass
+  that, and each person field (reporter, creator, assignee) costs about a kilobyte per issue.
+
+Learned while building `godmode` 0.8.0 (D78: the project's rules, and the side pane).
+
+- **`validate` refuses a module that hooks `turn.step` (or any event) twice without a
+  matcher**, the second registration in another file of the same mod included ("registered
+  twice without a matcher; the first is at ..."), and every hook of the mod stops. godmode's
+  side pane, ported from `dispatch-panel`, exports helpers (`paneStep`, `paneAction`,
+  `paneSpawned`, `paneReceived`) that godmode's existing `turn.step`, catch-all `tool.call`,
+  `agent.spawn` and `session.receive` hooks call, instead of hooking those events again. A
+  second hook with a matcher (`{ tool: 'Bash' }`) is fine.
+- **A runtime import cycle between hook files is avoided by repeating atoms.** `indicator.tsx`
+  reads the side pane's `paneFallback` and `paneClosed` through atoms of its own, with the same
+  keys, rather than importing `pane.tsx`, which imports `loop.ts`, which imports `indicator.tsx`.
+- **In a test, a hook beneath that answers `ui.close` must return `{ value: undefined }`**; a
+  bare `undefined` fails the test ("returned no result"). A test that calls
+  `$.session.start` needs `on('session.start', (_$, e) => e)` beneath.
+- **The "Atlassian MCP" server answers `atlassianUserInfo` as `{ data: { accountId } }`**
+  (checked live, read-only, 2026-11-23); the other shape is `{ account_id, name }`.

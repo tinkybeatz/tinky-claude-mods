@@ -3,11 +3,11 @@ import { expect, test } from 'claude-code/testing'
 import {
   attributionIn,
   classifyShell,
-  controlledRefusal,
   isInside,
   isMainThreadShell,
   mainThreadVerdict,
   relativeTo,
+  riskyRefusal,
   roleOf,
   settingsOf,
   spawnModel,
@@ -96,7 +96,8 @@ test('AI attribution lines are found, and ordinary text is not', () => {
 test('settings take their defaults, and every rule can be changed', () => {
   const defaults = settingsOf({})
   expect(defaults).toMatchObject({
-    prApproval: 'ask',
+    care: 'careful',
+    mergeConditions: [],
     isAttributionAllowed: true,
     isAutoMergeOn: false,
     agentCap: 5,
@@ -113,7 +114,7 @@ test('settings take their defaults, and every rule can be changed', () => {
   })
 
   const changed = settingsOf({
-    prApproval: 'when-passed',
+    care: 'not-careful',
     attribution: false,
     autoMerge: 'yes',
     agentCap: 3,
@@ -121,15 +122,30 @@ test('settings take their defaults, and every rule can be changed', () => {
     mainThreadReadLimit: '0',
     mainThreadTools: 'WebSearch, Grep',
   })
-  expect(changed.prApproval).toBe('when-passed')
+  expect(changed.care).toBe('not-careful')
   expect(changed.isAttributionAllowed).toBe(false)
   expect(changed.isAutoMergeOn).toBe(true)
   expect(changed.agentCap).toBe(3)
   expect(changed.isThinMainThread).toBe(false)
   expect(changed.mainThreadReadLimit).toBe(0)
   expect(changed.mainThreadTools).toEqual(['WebSearch', 'Grep'])
-  // A note's old tier and an unknown approval answer change nothing (D74).
-  expect(settingsOf({ permissions: 'locked', prApproval: 'always' }).prApproval).toBe('ask')
+  // A note's old tier and approval answer change nothing (D74, D78): approving is a risky action Care decides.
+  expect(settingsOf({ permissions: 'locked', prApproval: 'when-passed' }).care).toBe('careful')
+  // Not careful pre-fills merging on its own; an answer of the person's wins over it.
+  expect(settingsOf({ care: 'not-careful' }).isAutoMergeOn).toBe(true)
+  expect(settingsOf({ care: 'not-careful', autoMerge: false }).isAutoMergeOn).toBe(false)
+})
+
+test('merge conditions: the project\'s own list, possibly empty; a note from before D78 keeps what its merge waited on', () => {
+  expect(settingsOf({ mergeConditions: 'none' }).mergeConditions).toEqual([])
+  expect(settingsOf({ mergeConditions: 'approvals,ci', humanReviewCount: 2, humanReviewers: 'alice' }).mergeConditions).toEqual([
+    { kind: 'approvals', count: 2, reviewers: 'alice' },
+    { kind: 'ci' },
+  ])
+  // 0.7.x: code review and people testing the PR were the merge's conditions.
+  expect(settingsOf({ humanReview: true, humanReviewCount: 1, qaMode: 'human-pr' }).mergeConditions).toEqual([{ kind: 'approvals', count: 1, reviewers: '' }, { kind: 'qa' }])
+  expect(settingsOf({ humanReview: false, qaMode: 'bot' }).mergeConditions).toEqual([])
+  expect(settingsOf({ mergeConditions: 'approvals' }).humanReview).toEqual({ count: 1, reviewers: '' })
 })
 
 test('branch deletions and a push\'s branch are read from the shell line', () => {
@@ -139,11 +155,14 @@ test('branch deletions and a push\'s branch are read from the shell line', () =>
   expect(classifyShell('git push --force-with-lease origin godmode/t-1-x')[0]).toMatchObject({ action: 'force-push', branch: 'godmode/t-1-x' })
 })
 
-test('a controlled action\'s refusal says to ask for it explicitly, and names the call that records the ask', () => {
-  const refusal = controlledRefusal([{ action: 'approve-pr', target: '9' }])
-  expect(refusal).toContain('ask for it explicitly and it goes through')
-  expect(refusal).toContain('mcp__godmode__allow_once (action: approve-pr, target: 9)')
+test('a risky action\'s refusal names the exact ask that lets it run and the call that records it, never a rule to switch off', () => {
+  const refusal = riskyRefusal([{ action: 'force-push', target: 'feature-x', state: 'feature-x is on origin' }])
+  expect(refusal).toContain('force-pushing over pushed work (feature-x: feature-x is on origin)')
+  expect(refusal).toContain('"force-push feature-x"')
+  expect(refusal).toContain('mcp__godmode__allow_once (action: force-push, target: feature-x)')
   expect(refusal).toContain('An agent never records an ask itself')
+  expect(refusal).not.toMatch(/\/godmode setup|switch|turn (it )?off|setting/i)
+  expect(riskyRefusal([{ action: 'approve-pr', target: '9' }])).toContain('"approve #9"')
 })
 
 test('the main thread may run quick status checks and the PM\'s own PR actions, nothing heavier', () => {
@@ -163,13 +182,23 @@ test('the main thread\'s tools: talking, tickets and dispatch pass, heavier work
   expect(mainThreadVerdict({ tool: 'Bash', command: 'npm test', run_in_background: true }, settings, 0)).toEqual({ isAllowed: true })
   expect(mainThreadVerdict({ tool: 'Read' }, settings, 1)).toEqual({ isAllowed: true, isRead: true })
 
-  for (const call of [{ tool: 'Read' }, { tool: 'Edit' }, { tool: 'Grep' }, { tool: 'WebFetch' }, { tool: 'Bash', command: 'npm test' }, { tool: 'mcp__other__thing' }]) {
+  for (const call of [{ tool: 'Read' }, { tool: 'Edit' }, { tool: 'Grep' }, { tool: 'WebFetch' }, { tool: 'Bash', command: 'npm test' }]) {
     const verdict = mainThreadVerdict(call, settings, 2)
     expect(verdict.isAllowed).toBe(false)
-    if (!verdict.isAllowed) expect(verdict.reason).toContain('their ask is never a reason to refuse')
-    if (!verdict.isAllowed) expect(verdict.reason).toContain('/godmode setup')
+    if (!verdict.isAllowed) expect(verdict.reason).toContain(`allow_once (action: main-thread, target: ${call.tool})`)
+    if (!verdict.isAllowed) expect(verdict.reason).not.toMatch(/\/godmode setup|loosen|setting/i)
   }
   expect(mainThreadVerdict({ tool: 'Grep' }, settingsOf({ mainThreadTools: 'Grep' }), 0)).toEqual({ isAllowed: true })
+  // The person asked the PM to do it here: it runs, for that tool.
+  expect(mainThreadVerdict({ tool: 'Edit' }, settings, 0, undefined, ['Edit'])).toEqual({ isAllowed: true })
+  expect(mainThreadVerdict({ tool: 'Grep' }, settings, 0, undefined, ['Edit']).isAllowed).toBe(false)
+})
+
+test('the main thread: any tool that is not actual work is the PM\'s, one added later included', () => {
+  const settings = settingsOf({})
+  for (const tool of ['mcp__other__thing', 'SomeToolAddedLater', 'Artifact', 'mcp__claude_ai_Atlassian__getJiraIssue']) {
+    expect(mainThreadVerdict({ tool }, settings, 5)).toEqual({ isAllowed: true })
+  }
 })
 
 test('the PM reading godmode\'s own role and rules never counts towards the reads per prompt', () => {

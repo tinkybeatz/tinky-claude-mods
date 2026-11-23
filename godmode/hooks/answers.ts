@@ -1,3 +1,4 @@
+import { CARE, conditionIdsIn, WHO } from './project-rules'
 import { QA_MODES, QA_SIGNALS } from './role'
 import type { Answer } from './storage'
 
@@ -155,6 +156,26 @@ const count = (topic: string): Rule => ({
   },
 })
 
+/** A count of 0 or more: "none" is 0. */
+const countOrNone = (topic: string): Rule => ({
+  topic,
+  check: value => {
+    const text = typedText(value)
+    const number = typeof value === 'number' ? value : NONE_WORDS.test(text) ? 0 : Number(/^(\d+)/.exec(text)?.[1] ?? Number.NaN)
+    return Number.isInteger(number) && number >= 0 ? ok(number) : bad(`${shown(value)} is not a whole number: type one, such as 1, or none`)
+  },
+})
+
+/** The merge conditions list (D78): known ids comma-joined, or `none`. */
+const conditions: Rule = {
+  topic: 'merging',
+  check: value => {
+    const ids = conditionIdsIn(typedText(value))
+    if (ids !== undefined) return ok(ids.length === 0 ? 'none' : ids.join(','))
+    return NONE_WORDS.test(typedText(value)) ? ok('none') : bad(`${shown(value)} names no merge condition: use approvals, ci, up-to-date, qa, or none`)
+  },
+}
+
 const YES = /^(true|yes|y|on|allow(ed)?)$/i
 const NO = /^(false|no|n|off|none)$/i
 
@@ -177,15 +198,40 @@ const oneOf = (topic: string, values: readonly string[]): Rule => ({
   },
 })
 
+/** One of `values`, or the first of `words` the typed text holds. */
+const worded = (topic: string, values: readonly string[], words: readonly (readonly [RegExp, string])[]): Rule => ({
+  topic,
+  check: value => {
+    const text = typedText(value).toLowerCase()
+    if (values.includes(text)) return ok(text)
+    const found = words.find(([pattern]) => pattern.test(text))?.[1]
+    return found === undefined ? bad(`${shown(value)} is not one of ${values.join(', ')}`) : ok(found)
+  },
+})
+
 /** Text kept on one line; a number or a yes/no stays as it is (notes before D69 hold `qa: true`). */
 const plain = (topic?: string): Rule => ({ ...(topic === undefined ? {} : { topic }), check: value => ok(typeof value === 'string' ? typedText(value) : value) })
 
 /** Each answer key's rule; a key ending in `Command` is a command, any other key plain text. */
 export const ANSWER_RULES: Readonly<Record<string, Rule>> = {
-  prApproval: oneOf('prApproval', APPROVAL_POLICIES),
+  who: worded('who', WHO, [
+    [/\b(not alone|others?|team|together|colleagues?|people)\b/i, 'others'],
+    [/\b(alone|solo|myself|just me|only me)\b/i, 'alone'],
+  ]),
+  care: worded('care', CARE, [
+    [/\b(not|just do|no need|don'?t ask)\b/i, 'not-careful'],
+    [/\b(careful|ask)\b/i, 'careful'],
+  ]),
+  mergeConditions: conditions,
+  mergeApprovals: countOrNone('merging'),
+  mergeCi: flag('merging'),
+  mergeUpToDate: flag('merging'),
+  qaAgent: flag('qa'),
+  confirmed: flag('who'),
+  prApproval: oneOf('care', APPROVAL_POLICIES),
   attribution: flag('attribution'),
-  indicator: oneOf('indicator', ['mode', 'hint', 'band']),
-  autoMerge: flag('autoMerge'),
+  indicator: oneOf('indicator', ['mode', 'hint', 'band', 'pane']),
+  autoMerge: flag('merging'),
   agentCap: count('agentCap'),
   fixRoundLimit: count('fixRoundLimit'),
   // `tickets.ts` reads a tracker in any words, so the rule only tidies it.
@@ -207,6 +253,9 @@ export const ANSWER_RULES: Readonly<Record<string, Rule>> = {
   qaPassStatus: status('qa'),
   qaSignals: signals,
   qaApprovers: people,
+  humanReview: flag('merging'),
+  humanReviewCount: count('merging'),
+  humanReviewers: { ...people, topic: 'merging' },
   baseBranch: branch('branch name', false),
   branchPrefix: branch('branch prefix', true),
   stack: plain(),

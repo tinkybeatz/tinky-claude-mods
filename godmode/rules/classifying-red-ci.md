@@ -18,5 +18,6 @@ reading; `gh pr checks` and `gh run view --log-failed` give it).
   flake touches the area the PR changed, treat it as real.
 - Never re-run more than once on the same commit without telling the person.
 - Never disable, skip or retry-loop a test to get green. That is a finding, not a fix.
-- A merge waits for the required checks to finish. A merge never goes in while a check
-  is still running.
+- Where green CI is one of the project's merge conditions, a merge waits for the checks
+  to finish: godmode reads them live, and names the ones still running or failing. Past
+  that, only the person's "merge anyway" merges it.

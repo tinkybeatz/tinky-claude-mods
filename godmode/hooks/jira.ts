@@ -697,11 +697,84 @@ async function missingRequired($: EngineInterface, server: string, settings: Jir
   return required.filter(field => !given.has(field.id.toLowerCase()) && !given.has(field.name.toLowerCase())).map(field => `${field.name} (${field.id})`)
 }
 
-/** What a board scan reads: the latest issues with the fields it needs, the person's account, and each issue type's fields. */
-export type BoardData = { project: string; site: string; issues: unknown[]; account?: string; typeFields: Record<string, FieldMeta[]> }
+/**
+ * What a board scan reads: the person's own latest tickets (they reported or created them),
+ * the team's latest, each issue type's fields, and the issue types the project has.
+ */
+export type BoardData = { project: string; site: string; own: unknown[]; team: unknown[]; typeFields: Record<string, FieldMeta[]>; types: string[] }
 
-/** The fields every scan reads: what the type, placement, parents, labels and templates are inferred from. */
-const SCAN_FIELDS: readonly string[] = ['summary', 'issuetype', 'status', 'parent', 'labels', 'components', 'priority', 'reporter', 'creator', 'description']
+/**
+ * The fields every scan reads: the type, parent, title, description, labels, components and
+ * priority. The people are left out: whose tickets they are is the search's own filter, and
+ * each person field weighs about a kilobyte per issue.
+ */
+const SCAN_FIELDS: readonly string[] = ['summary', 'issuetype', 'parent', 'labels', 'components', 'priority', 'description']
+
+/** Custom fields that say nothing about filing: Jira's own bookkeeping, service-desk fields, reports. */
+const UNREAD_CUSTOM = /^(rank|development|request participants|organizations|request type|satisfaction|\[chart\].*|time to .*|team id|flagged)$/i
+
+/** A search row's key and fields. */
+const rowParts = (row: unknown) => {
+  const key = isRecord(row) && typeof row.key === 'string' ? row.key : undefined
+  const fields = isRecord(row) && isRecord(row.fields) ? row.fields : undefined
+  return { key, fields }
+}
+
+/**
+ * The custom fields the server without the metadata tools uses, by id: one ticket of each
+ * issue type is read in its "evidence" view, which lists only the fields that ticket holds,
+ * so a bug's fields come from a bug. Labels Jira keeps for its own bookkeeping are left out.
+ */
+async function customFieldIds($: EngineInterface, jira: Jira, rows: readonly unknown[]): Promise<string[]> {
+  const { settings, server } = jira
+  const byType = new Map<string, string>()
+  for (const row of rows) {
+    const { key, fields } = rowParts(row)
+    const type = fields !== undefined && isRecord(fields.issuetype) && typeof fields.issuetype.name === 'string' ? fields.issuetype.name : undefined
+    if (key !== undefined && type !== undefined && !byType.has(type)) byType.set(type, key)
+  }
+  const ids = new Map<string, string>()
+  for (const key of [...byType.values()].slice(0, 8)) {
+    const probe = await callJira($, server.name, JIRA_TOOLS.search, { cloudId: settings.cloudId, jql: `key = ${key}`, maxResults: 1, view: 'evidence' }).catch(() => undefined)
+    for (const row of rowsIn(unwrapped(probe), ['issues', 'values', 'results'])) {
+      const custom = rowParts(row).fields?.customFields
+      for (const [label, entry] of Object.entries(isRecord(custom) ? custom : {})) {
+        if (isRecord(entry) && typeof entry.id === 'string' && !UNREAD_CUSTOM.test(label)) ids.set(entry.id, label)
+      }
+    }
+  }
+  return [...ids.keys()].slice(0, SCAN_CUSTOM_CAP)
+}
+
+/**
+ * The rows with their custom fields added, read by key in pages of 10 with only those
+ * fields, halving a page the session finds too large. A page that still fails leaves its
+ * rows without them.
+ */
+async function withCustomFields($: EngineInterface, jira: Jira, rows: readonly unknown[], ids: readonly string[]): Promise<unknown[]> {
+  const { settings, server } = jira
+  const keys = [...new Set(rows.flatMap(row => rowParts(row).key ?? []))]
+  const custom = new Map<string, unknown>()
+  let size = SCAN_PAGE
+  for (let at = 0; at < keys.length; ) {
+    const batch = keys.slice(at, at + size)
+    try {
+      const found = await callJira($, server.name, JIRA_TOOLS.search, { cloudId: settings.cloudId, jql: `key in (${batch.join(', ')})`, fields: ['issuetype', ...ids], maxResults: batch.length })
+      for (const row of rowsIn(unwrapped(found), ['issues', 'values', 'results'])) {
+        const { key, fields } = rowParts(row)
+        if (key !== undefined && fields !== undefined) custom.set(key, fields.customFields ?? Object.fromEntries(ids.map(id => [id, fields[id]])))
+      }
+      at += batch.length
+    } catch (error) {
+      if (error instanceof JiraTooLarge && size > 1) size = Math.floor(size / 2)
+      else at += batch.length
+    }
+  }
+  return rows.map(row => {
+    const { key, fields } = rowParts(row)
+    return key === undefined || fields === undefined || !custom.has(key) ? row : { ...(row as Record<string, unknown>), fields: { ...fields, customFields: custom.get(key) } }
+  })
+}
 
 /** Jira Cloud's usual sprint field, asked for when no field list names one. */
 const DEFAULT_SPRINT_FIELD = 'customfield_10020'
@@ -709,6 +782,10 @@ const DEFAULT_SPRINT_FIELD = 'customfield_10020'
 /** The most custom fields a scan asks for, and the page size it starts with. */
 const SCAN_CUSTOM_CAP = 15
 const SCAN_PAGE = 10
+
+/** How many of the person's own tickets, and of the team's, a scan reads. */
+export const SCAN_OWN = 40
+export const SCAN_TEAM = 30
 
 /** The custom fields worth reading: the sprint field, then the required ones, then the rest, at most `SCAN_CUSTOM_CAP`. */
 export const scanFieldsOf = (typeFields: Readonly<Record<string, FieldMeta[]>>) => {
@@ -718,37 +795,15 @@ export const scanFieldsOf = (typeFields: Readonly<Record<string, FieldMeta[]>>) 
   return [...SCAN_FIELDS, sprint, ...custom]
 }
 
-/**
- * The raw data of a board scan (D74), read-only and slim: each issue type's fields first (the
- * server with the metadata tools), then the project's latest `count` issues, newest first, with
- * only the fields the inference needs, in pages of 10. The server without the metadata tools
- * takes `view: "evidence"` for its custom fields. A page too large for the session is asked
- * again at half the size, down to one issue, then with the compact view; past that the scan
- * fails. A string says why nothing could be read, in one plain sentence.
- */
-export async function jiraBoardData($: EngineInterface, answers: Readonly<Record<string, Answer>>, count = 30): Promise<BoardData | string> {
-  let jira: Jira
-  try {
-    jira = await openJira($, answers)
-  } catch (error) {
-    return plainError(error)
-  }
+/** One slim search, newest first, in pages of 10 that halve when the session finds them too large; a string says why it failed. */
+async function scanSearch($: EngineInterface, jira: Jira, filter: string, count: number, shape: Record<string, unknown>, isListing: boolean): Promise<unknown[] | string> {
   const { settings, server } = jira
-  const tools = server.tools.size > 0 ? server.tools : await probeTools($, server.name, settings.cloudId)
-  const typeFields: Record<string, FieldMeta[]> = {}
-  if (tools.has(META_TOOLS.types)) {
-    const types = await callJira($, server.name, META_TOOLS.types, { cloudId: settings.cloudId, projectIdOrKey: settings.project }).catch(() => undefined)
-    const names = rowsIn(unwrapped(types), ['issueTypes', 'values', 'results']).flatMap(row => (isRecord(row) && typeof row.name === 'string' ? [row.name] : [])).slice(0, 8)
-    for (const name of names) typeFields[name] = await issueTypeFields($, server.name, settings, tools, name, false)
-  }
-  const isListing = tools.has(JIRA_TOOLS.transitions)
-  const shape = isListing ? { fields: scanFieldsOf(typeFields) } : { fields: [...SCAN_FIELDS], view: 'evidence' }
   const issues: unknown[] = []
   let size = SCAN_PAGE
   let isCompact = false
   while (issues.length < count) {
     const seen = issues.flatMap(issue => (isRecord(issue) && typeof issue.key === 'string' ? [issue.key] : []))
-    const jql = `project = ${jqlText(settings.project)}${seen.length === 0 ? '' : ` AND key not in (${seen.join(', ')})`} ORDER BY created DESC`
+    const jql = `project = ${jqlText(settings.project)}${filter}${seen.length === 0 ? '' : ` AND key not in (${seen.join(', ')})`} ORDER BY created DESC`
     const args = { cloudId: settings.cloudId, jql, maxResults: Math.min(size, count - issues.length), ...shape, ...(isCompact ? { view: 'compact' } : {}) }
     let page: unknown[]
     try {
@@ -763,8 +818,45 @@ export async function jiraBoardData($: EngineInterface, answers: Readonly<Record
     issues.push(...page)
     if (page.length < args.maxResults) break
   }
-  const account = accountIdIn(await callJira($, server.name, 'atlassianUserInfo', {}).catch(() => undefined))
-  return { project: settings.project, site: settings.cloudId, issues, ...(account === undefined ? {} : { account }), typeFields }
+  return issues
+}
+
+/**
+ * The raw data of a board scan (D74), read-only and slim: the project's issue types and each
+ * one's fields (on the server with the metadata tools), then the person's own latest tickets
+ * (`currentUser()` as reporter or creator) and the team's latest, with only the fields the
+ * checklist needs. The server without the metadata tools takes `view: "evidence"` for its
+ * custom fields. A string says why nothing could be read, in one plain sentence.
+ */
+export async function jiraBoardData($: EngineInterface, answers: Readonly<Record<string, Answer>>): Promise<BoardData | string> {
+  let jira: Jira
+  try {
+    jira = await openJira($, answers)
+  } catch (error) {
+    return plainError(error)
+  }
+  const { settings, server } = jira
+  const tools = server.tools.size > 0 ? server.tools : await probeTools($, server.name, settings.cloudId)
+  const typeFields: Record<string, FieldMeta[]> = {}
+  let types: string[] = []
+  if (tools.has(META_TOOLS.types)) {
+    const listed = await callJira($, server.name, META_TOOLS.types, { cloudId: settings.cloudId, projectIdOrKey: settings.project }).catch(() => undefined)
+    types = rowsIn(unwrapped(listed), ['issueTypes', 'values', 'results']).flatMap(row => (isRecord(row) && typeof row.name === 'string' ? [row.name] : []))
+    for (const name of types.slice(0, 8)) typeFields[name] = await issueTypeFields($, server.name, settings, tools, name, false)
+  }
+  const isListing = tools.has(JIRA_TOOLS.transitions)
+  const mine = ' AND (reporter = currentUser() OR creator = currentUser())'
+  const shape = { fields: isListing ? scanFieldsOf(typeFields) : [...SCAN_FIELDS] }
+  const own = await scanSearch($, jira, mine, SCAN_OWN, shape, isListing)
+  if (typeof own === 'string') return own
+  const team = await scanSearch($, jira, '', SCAN_TEAM, shape, isListing)
+  if (typeof team === 'string') return team
+  if (isListing) return { project: settings.project, site: settings.cloudId, own, team, typeFields, types }
+  // The other server returns custom fields only when named by id: learn the ids, then read them by key.
+  const ids = await customFieldIds($, jira, [...own, ...team])
+  if (ids.length === 0) return { project: settings.project, site: settings.cloudId, own, team, typeFields, types }
+  const [ownFull, teamFull] = [await withCustomFields($, jira, own, ids), await withCustomFields($, jira, team, ids)]
+  return { project: settings.project, site: settings.cloudId, own: ownFull, team: teamFull, typeFields, types }
 }
 
 /** Whether a ticket is the person's own (D74): godmode filed it, or their account created it; else why it counts as someone else's. */
@@ -788,16 +880,20 @@ export const creatorIdIn = (value: unknown): string | undefined => {
   return undefined
 }
 
-/** Caches in the person's store: their account per site, and each issue's creator, which never changes. */
-const accountKey = (cloudId: string) => `jiraAccount:${cloudId}`
+/** Each issue's creator, kept in the person's store once read: it never changes. A failed read is never kept. */
 const creatorKey = (cloudId: string, key: string) => `jiraCreator:${cloudId}:${key}`
 
+/** One read, tried again once when it fails (D78): godmode reads live and never keeps a failure. */
+async function readTwice<T>(read: () => Promise<T | undefined>): Promise<T | undefined> {
+  return (await read().catch(() => undefined)) ?? (await read().catch(() => undefined))
+}
+
 /**
- * Whether a Jira ticket is the person's own (D74): godmode filed it (it has a side file), or
- * the person's own Atlassian account created it (the creator, else the reporter; the assignee
- * is not enough). The account and each creator are read once and kept in `$.store`; the
- * issue is read only for a ticket with no side file. Anything that cannot be read counts as
- * someone else's ticket, with the reason.
+ * Whether a Jira ticket is the person's own (D74, D78): godmode filed it (it has a side file),
+ * or the person's own Atlassian account created it (the creator, else the reporter; the
+ * assignee is not enough). The account is read live each time (`atlassianUserInfo`), and the
+ * issue's creator once; each read is tried again once when it fails, and a failure is never
+ * kept. What still cannot be read counts as someone else's, with the reason, so the person is asked.
  */
 export async function jiraOwnership($: EngineInterface, project: Project, rawKey: string): Promise<TicketOwnership> {
   const key = rawKey.trim().toUpperCase()
@@ -809,18 +905,12 @@ export async function jiraOwnership($: EngineInterface, project: Project, rawKey
   }
   if (await $.fs.exists(`${jira.sideDir}/${key}.json`).catch(() => false)) return { isOwn: true }
   const { cloudId } = jira.settings
-  const keptAccount: unknown = await $.store.get(accountKey(cloudId)).catch(() => undefined)
-  let account = typeof keptAccount === 'string' ? keptAccount : undefined
-  if (account === undefined) {
-    account = accountIdIn(await callJira($, jira.server.name, 'atlassianUserInfo', {}).catch(() => undefined))
-    if (account === undefined) return { isOwn: false, why: 'godmode could not read your Atlassian account, so it cannot tell whether you created it' }
-    await $.store.set(accountKey(cloudId), account).catch(() => undefined)
-  }
+  const account = await readTwice(async () => accountIdIn(await callJira($, jira.server.name, 'atlassianUserInfo', {})))
+  if (account === undefined) return { isOwn: false, why: 'godmode could not read your Atlassian account, so it cannot tell whether you created it' }
   const keptCreator: unknown = await $.store.get(creatorKey(cloudId, key)).catch(() => undefined)
   let creator = typeof keptCreator === 'string' ? keptCreator : undefined
   if (creator === undefined) {
-    const issue = await callJira($, jira.server.name, JIRA_TOOLS.read, { cloudId, issueIdOrKey: key, fields: ['creator', 'reporter'] }).catch(() => undefined)
-    creator = creatorIdIn(issue)
+    creator = await readTwice(async () => creatorIdIn(await callJira($, jira.server.name, JIRA_TOOLS.read, { cloudId, issueIdOrKey: key, fields: ['creator', 'reporter'] })))
     if (creator === undefined) return { isOwn: false, why: `godmode could not read who created ${key}` }
     await $.store.set(creatorKey(cloudId, key), creator).catch(() => undefined)
   }
@@ -1123,6 +1213,12 @@ async function watchedSides($: EngineInterface, project: Project) {
     return { id: key, ...(side?.title === undefined ? {} : { title: side.title }), ...(side?.pr === undefined ? {} : { pr: side.pr }), ...(side?.qaResult === undefined ? {} : { qaResult: side.qaResult }) }
   }
   return { sideDir, sides, watched, inQa, fromSides }
+}
+
+/** godmode's Jira tickets its side files record in one of `statuses`, with their PR: no call to Jira. */
+export async function jiraRecorded($: EngineInterface, project: Project, statuses: readonly TicketStatus[]): Promise<JiraWaiting[]> {
+  const { watched, fromSides } = await watchedSides($, project)
+  return watched.filter(([, side]) => side.status !== undefined && statuses.includes(side.status)).map(([key]) => fromSides(key))
 }
 
 /**

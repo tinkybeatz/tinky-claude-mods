@@ -4,7 +4,7 @@ import type { On } from 'claude-code'
 
 import type { ScanFacts } from '../types'
 import { changePlan, changeSetupBrief, pendingUpdates, suggestionsOf, updateOfferLine, withSuggestion } from '../hooks/change-setup'
-import { qaQuestion } from '../hooks/questionnaire'
+import { CARE_QUESTION, peopleQaQuestion, QA_AGENT_QUESTION, WHO_QUESTION } from '../hooks/questionnaire'
 import { BOARD, makeJira, mountJira, SERVER } from './jira-world'
 import type { FakeJira } from './jira-world'
 import { makeWorld, mountWorld, REPO, setUpProject } from './world'
@@ -43,7 +43,7 @@ test('change plan: storage and unknown topics are refused, and update stands for
   expect(changePlan(facts(), ['colours'], {})).toContain('`colours` is not something change-setup asks')
   const update = changePlan(facts(), ['update'], { qa: true }, ['qa'])
   if (typeof update === 'string') throw new Error(update)
-  expect(update.questions.map(question => question.key)).toEqual(['qaHuman'])
+  expect(update.questions.map(question => question.key)).toEqual(['qaMode', 'qaAgent'])
   expect(update.dropped).toContain('qa')
 })
 
@@ -53,10 +53,10 @@ test('update: only a note from before the QA modes, under a newer godmode, lacks
   // Not newer, already answered, or written after the QA modes: nothing to offer.
   expect(pendingUpdates('0.5.0', '0.5.0', { qa: true })).toEqual([])
   expect(pendingUpdates('0.5.0', '0.6.0', { qaMode: 'bot' })).toEqual([])
-  // 0.7.0 replaced the permission tiers and asks the approval question of any older note (D74).
-  expect(pendingUpdates('0.6.0', '0.7.0', { qaMode: 'bot' }).map(entry => entry.topic)).toEqual(['prApproval'])
-  expect(pendingUpdates('0.6.0', '0.7.0', { qaMode: 'bot', prApproval: 'ask' })).toEqual([])
-  expect(pendingUpdates('0.7.0', '0.8.0', { qaMode: 'bot' })).toEqual([])
+  // 0.8.0 asks Who and Care of any older note that lacks them (D78).
+  expect(pendingUpdates('0.7.1', '0.8.0', { qaMode: 'bot', humanReview: false }).map(entry => entry.topic)).toEqual(['start'])
+  expect(pendingUpdates('0.6.0', '0.7.2', { qaMode: 'bot' })).toEqual([])
+  expect(pendingUpdates('0.7.1', '0.8.0', { qaMode: 'bot', who: 'alone', care: 'careful' })).toEqual([])
   expect(updateOfferLine('0.5.0', '0.6.0', pendingUpdates('0.5.0', '0.6.0', {}))).toContain('asks something new since this project\'s setup (0.5.0): the QA mode')
   expect(updateOfferLine('0.5.0', '0.6.0', [])).toBe('This project was set up with godmode 0.5.0; 0.6.0 asks nothing new of it.')
   expect(updateOfferLine('0.6.0', '0.6.0', [])).toBeUndefined()
@@ -64,12 +64,18 @@ test('update: only a note from before the QA modes, under a newer godmode, lacks
 
 test('suggestions: the old qa on reads as no people and the QA agent, offered first and marked', () => {
   const suggestions = suggestionsOf({ qa: true })
-  expect(withSuggestion(qaQuestion(facts()), suggestions).choices.map(choice => choice.label)).toEqual(['No (suggested)', 'Yes, people test'])
-  const agent = qaQuestion(facts()).followUps?.({ qaHuman: false })[0]
-  if (agent === undefined) throw new Error('no QA agent question')
-  // The scan's own default is unmarked: the person's old answer wins.
-  expect(withSuggestion(agent, suggestions).choices.map(choice => choice.label)).toEqual(['On (suggested)', 'Off'])
-  expect(withSuggestion(agent, suggestionsOf({ qaMode: 'none' })).choices.map(choice => choice.label)).toEqual(['Off (current)', 'On'])
+  expect(withSuggestion(peopleQaQuestion(facts()), suggestions).choices.map(choice => choice.label)).toEqual(['No one (suggested)', 'On the PR', 'On staging'])
+  expect(withSuggestion(QA_AGENT_QUESTION, suggestions).choices.map(choice => choice.label)).toEqual(['On (suggested)', 'Off'])
+  expect(withSuggestion(QA_AGENT_QUESTION, suggestionsOf({ qaMode: 'none' })).choices.map(choice => choice.label)).toEqual(['Off (current)', 'On'])
+})
+
+test('suggestions: a 0.7.x note\'s old answers suggest Who and Care (D78)', () => {
+  const team = suggestionsOf({ humanReview: true, autoMerge: true, prApproval: 'when-passed' })
+  expect(withSuggestion(WHO_QUESTION, team).choices[0]?.label).toBe('With others (suggested)')
+  expect(withSuggestion(CARE_QUESTION, team).choices[0]?.label).toBe('Not careful: just do it (suggested)')
+  expect(withSuggestion(CARE_QUESTION, suggestionsOf({ autoMerge: false })).choices[0]?.label).toBe('Careful: ask me first (suggested)')
+  // Nothing in the note tells who works on it: nothing is suggested.
+  expect(withSuggestion(WHO_QUESTION, suggestionsOf({ autoMerge: false })).choices.map(choice => choice.label)).toEqual(['Alone', 'With others'])
 })
 
 test('the PM\'s brief names the topics, the setup as it stands, and the update when one waits', () => {
@@ -149,21 +155,23 @@ const HUMAN_PR = {
 test('changing only the QA mode keeps every other answer and drops the old mode\'s follow-ups (D22)', async ($, on) => {
   const world = makeWorld({ pluginVersion: '0.6.0' })
   await setUpProject(world, { sharedAnswers: HUMAN_PR, personalAnswers: { permissions: 'free', indicator: 'band', jiraServer: SERVER } })
-  const person = mount(on, world, { QA: 'No', 'QA agent': 'On' })
+  const person = mount(on, world, { QA: 'No one', 'QA agent': 'On' })
   const personalBefore = world.files.get(PERSONAL)
 
   await godmode($, 'setup')
   const answered = resultOf(await call($, 'setup_questionnaire', { change: ['qa'] }))
 
   expect(person.asked).toEqual(['QA', 'QA agent'])
-  expect(person.offered.QA?.[0]).toBe('Yes, people test (current)')
+  expect(person.offered.QA?.[0]).toBe('On the PR (current)')
   expect(answered).toContain('Nothing is saved yet')
   expect(sharedNote(world).answers.qaMode).toBe('human-pr')
 
   const done = resultOf(await call($, 'setup_finish'))
 
   expect(person.asked.at(-1)).toBe('Save setup')
-  expect(sharedNote(world).answers).toEqual({ tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', testCommand: 'npm test', qaMode: 'bot' })
+  // People testing the PR was this project's merge condition; nobody testing leaves none.
+  expect(sharedNote(world).answers).toEqual({ tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', testCommand: 'npm test', qaMode: 'bot', mergeConditions: 'none' })
+  expect(world.files.get(`${REPO}/docs/conventions/project-rules.md`)).toContain('Nobody tests changes besides their author.')
   expect(sharedNote(world).godmodeVersion).toBe('0.6.0')
   expect(world.files.get(PERSONAL)).toBe(personalBefore)
   expect(done).toContain('\nQA mode: bot (')
@@ -234,11 +242,11 @@ test('a 0.5.0 note is offered only the QA questions, its qa: true suggesting the
   const done = resultOf(await call($, 'setup_finish'))
 
   expect(person.asked).toEqual(['Update', 'QA', 'QA agent', 'Save setup'])
-  expect(person.offered.QA).toEqual(['No (suggested)', 'Yes, people test'])
+  expect(person.offered.QA).toEqual(['No one (suggested)', 'On the PR', 'On staging'])
   expect(person.offered['QA agent']).toEqual(['On (suggested)', 'Off'])
   const shared = sharedNote(world)
   expect(shared.godmodeVersion).toBe('0.6.0')
-  expect(shared.answers).toEqual({ tracker: 'none', qaMode: 'bot' })
+  expect(shared.answers).toEqual({ tracker: 'none', qaMode: 'bot', mergeConditions: 'none' })
   expect(world.files.get(PERSONAL)).toBe(personalBefore)
   expect(done).toContain('godmode version: 0.5.0 -> 0.6.0')
 })
@@ -372,7 +380,7 @@ for (const ending of CHANGE_ENDS) {
 
     expect(await ending.end($)).toContain('back in coding mode')
 
-    expect((await mainThreadEdit($)).deny).toContain('godmode keeps the main thread thin')
+    expect((await mainThreadEdit($)).deny).toContain('godmode keeps this thread for talking, tickets and dispatch')
     expect((await call($, 'setup_finish')).deny).toContain('not in setup mode')
   })
 }
@@ -413,6 +421,60 @@ test('the live test\'s note: /godmode flags the link and the bare site, and the 
   // The note is clean now: the next switch-on flags nothing.
   await godmode($, 'off')
   expect((await godmode($)).text ?? '').not.toContain('reads the setup')
+})
+
+test('migration: a 0.7.x note is offered Who and Care, its old answers mapped onto the project rules and shown on the summary for a yes (D78)', async ($, on) => {
+  const world = makeWorld({ pluginVersion: '0.8.0' })
+  await setUpProject(
+    world,
+    {
+      sharedAnswers: { tracker: 'none', qaMode: 'human-pr', qaBotFirst: false, humanReview: true, humanReviewCount: 2, humanReviewers: 'alice' },
+      personalAnswers: { autoMerge: true, prApproval: 'when-passed', attribution: false },
+    },
+    '0.7.1',
+  )
+  const logs: string[] = []
+  const person = mount(on, world)
+  on('ui.log', (_$, e) => {
+    logs.push(e.text)
+    return { value: undefined } as never
+  })
+
+  // Old notes keep working before the update: the old code review and people's QA are the merge conditions.
+  const offered = await godmode($, 'setup')
+  expect(offered.text).toContain('two questions, who works on the project and how careful godmode is')
+  resultOf(await call($, 'setup_questionnaire', { change: ['update'] }))
+  expect(person.asked).toEqual(['Update', 'Who', 'Care'])
+  expect(person.offered.Who?.[0]).toBe('With others (suggested)')
+  expect(person.offered.Care?.[0]).toBe('Not careful: just do it (suggested)')
+
+  const done = resultOf(await call($, 'setup_finish'))
+
+  expect(person.asked.at(-1)).toBe('Save setup')
+  expect(person.offered['Save setup']).toEqual(['Save', 'Change something', 'Discard'])
+  expect(logs).toContain('The project rules after this change:')
+  expect(logs.some(line => line.startsWith('Merging      needs 2 approvals from alice + a QA pass from the people who test'))).toBe(true)
+  const shared = sharedNote(world)
+  expect(shared.godmodeVersion).toBe('0.8.0')
+  expect(shared.answers).toEqual({ tracker: 'none', qaMode: 'human-pr', qaBotFirst: false, humanReviewCount: 2, humanReviewers: 'alice', who: 'others', mergeConditions: 'approvals,qa' })
+  expect(personalNote(world).answers).toEqual({ autoMerge: true, attribution: false, care: 'not-careful' })
+  expect(done).toContain('godmode version: 0.7.1 -> 0.8.0')
+})
+
+test('change-setup: "Change something" at the save keeps the round, and the next round adds to it', async ($, on) => {
+  const world = makeWorld({ pluginVersion: '0.8.0' })
+  await setUpProject(world, { sharedAnswers: { tracker: 'none', qaMode: 'none', who: 'alone', mergeConditions: 'none' }, personalAnswers: { care: 'careful', attribution: false } })
+  const person = mount(on, world, { 'Save setup': ['Change something', 'Save'], Approvals: '1 approval', CI: 'Yes' })
+
+  await godmode($, 'setup')
+  resultOf(await call($, 'setup_questionnaire', { change: ['merging'] }))
+  expect(resultOf(await call($, 'setup_finish'))).toContain('wants to change something before saving')
+  expect(sharedNote(world).answers.mergeConditions).toBe('none')
+  resultOf(await call($, 'setup_questionnaire', { change: ['autoMerge'] }))
+  resultOf(await call($, 'setup_finish'))
+
+  expect(person.asked).toEqual(['Approvals', 'Reviewers', 'CI', 'Save setup', 'Merging', 'Save setup'])
+  expect(sharedNote(world).answers).toMatchObject({ mergeConditions: 'approvals,ci', humanReviewCount: 1 })
 })
 
 test('a count typed in words is asked again with the reason, never dropped', async ($, on) => {

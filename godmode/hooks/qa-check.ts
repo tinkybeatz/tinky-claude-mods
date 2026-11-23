@@ -1,9 +1,13 @@
 import type { EngineInterface } from 'claude-code'
 
+import { approversOf, isApprover, parseReviews } from './code-review'
+import type { Approvers, Lookups } from './code-review'
 import { prNumberOf } from './host'
-import { jiraLatestComment, jiraMovedToQa, jiraStatusOf, jiraWaiting, statusMapOf } from './jira'
+import { codeReviewOf } from './code-review'
+import type { CodeReview } from './code-review'
+import { jiraLatestComment, jiraMovedToQa, jiraRecorded, jiraStatusOf, jiraWaiting, statusMapOf } from './jira'
 import type { JiraComment } from './jira'
-import { loopContextOf } from './loop'
+import { loopContextOf, ownLogin } from './loop'
 import type { LoopCache, LoopContext } from './loop'
 import { qaSignalsOf } from './role'
 import type { QaMode, QaSignal } from './role'
@@ -108,6 +112,8 @@ const short = (commit: string) => commit.slice(0, 7)
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+
 const textOf = (value: Answer | undefined) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined)
 
 const sameStatus = (a: string, b: string | undefined) => b !== undefined && a.trim().toLowerCase() === b.trim().toLowerCase()
@@ -130,110 +136,6 @@ export const statusFinding = (status: string, waiting: string, pass: string | un
   if (sameStatus(status, waiting)) return undefined
   if (sameStatus(status, done)) return { kind: 'done-outside', status }
   return { kind: 'fail', how: `it moved from "${waiting}" to "${status}", not to the pass status${pass === undefined ? '' : ` "${pass}"`}` }
-}
-
-/** The named QA people (D70): GitHub logins, and teams written `org/team`. */
-export const approversOf = (value: Answer | undefined) => {
-  const named = (textOf(value) ?? '').split(/[\s,]+/).map(part => part.replace(/^@/, '').trim()).filter(part => part !== '')
-  return {
-    logins: new Set(named.filter(part => !part.includes('/')).map(part => part.toLowerCase())),
-    teams: named.filter(part => /^[^/]+\/[^/]+$/.test(part)),
-  }
-}
-
-type Approvers = ReturnType<typeof approversOf>
-
-/** One reviewer's latest review that decides: an approval, changes requested, or a dismissal. */
-export type LatestReview = { login: string; state: 'APPROVED' | 'CHANGES_REQUESTED' | 'DISMISSED'; commit?: string }
-
-const DECIDING: readonly string[] = ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED']
-
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
-
-/**
- * The PR's head commit and each reviewer's latest deciding review, from `gh pr view --json
- * reviews,headRefOid`; a string says what is wrong with the output. A comment after an
- * approval leaves the approval standing, as on GitHub.
- */
-export const parseReviews = (stdout: string): { head: string; latest: LatestReview[]; mergedBy?: string } | string => {
-  let value: unknown
-  try {
-    value = JSON.parse(stdout)
-  } catch {
-    return 'gh answered something that is not JSON'
-  }
-  if (!isRecord(value) || typeof value.headRefOid !== 'string' || !Array.isArray(value.reviews)) return 'gh answered no head commit or reviews'
-  const latest = new Map<string, LatestReview>()
-  for (const review of value.reviews) {
-    if (!isRecord(review) || !isRecord(review.author) || typeof review.author.login !== 'string') continue
-    const state = String(review.state)
-    if (!DECIDING.includes(state)) continue
-    const commit = isRecord(review.commit) && typeof review.commit.oid === 'string' ? review.commit.oid : undefined
-    latest.set(review.author.login.toLowerCase(), { login: review.author.login, state: state as LatestReview['state'], commit })
-  }
-  // `state` and `mergedBy` are read when the merge signal is on; a merge with no login known is "someone".
-  const isMerged = value.state === 'MERGED'
-  const mergedBy = isMerged ? (isRecord(value.mergedBy) && typeof value.mergedBy.login === 'string' ? value.mergedBy.login : 'someone') : undefined
-  return { head: value.headRefOid, latest: [...latest.values()], ...(mergedBy === undefined ? {} : { mergedBy }) }
-}
-
-/**
- * What one prompt already asked GitHub, shared by all its tickets: team memberships and
- * whether each team can be seen. Each is a promise, so tickets checked side by side wait
- * on the same call instead of making their own.
- */
-type Lookups = Map<string, Promise<boolean | string>>
-
-const lookedUp = (lookups: Lookups, key: string, read: () => Promise<boolean | string>) => {
-  const known = lookups.get(key)
-  if (known !== undefined) return known
-  const reading = read()
-  lookups.set(key, reading)
-  return reading
-}
-
-/** A `gh api` read: what it printed, or what went wrong and whether GitHub said 404. */
-async function ghApi($: EngineInterface, cwd: string, path: string, jq: string): Promise<{ stdout: string } | { said: string; isNotFound: boolean }> {
-  const result = await $.process.run(['gh', 'api', path, '--jq', jq], { cwd, timeoutMs: GH_TIMEOUT_MS }).catch((error: unknown) => messageOf(error))
-  if (typeof result === 'string') return { said: result, isNotFound: false }
-  if (result.exitCode === 0) return { stdout: result.stdout }
-  const said = (result.stderr.trim() || result.stdout.trim()).slice(0, 200) || `exit ${result.exitCode}`
-  return { said, isNotFound: /\b404\b|not found/i.test(said) }
-}
-
-/** Whether `gh` can see a team at all: true, or why not. */
-async function teamVisibility($: EngineInterface, cwd: string, team: string): Promise<boolean | string> {
-  const [org = '', slug = ''] = team.split('/')
-  const read = await ghApi($, cwd, `orgs/${org}/teams/${slug}`, '.slug')
-  return 'stdout' in read ? true : read.said
-}
-
-/** Whether a login is in a team: true, false, or why it could not be read. */
-async function isTeamMember($: EngineInterface, cwd: string, team: string, login: string, lookups: Lookups): Promise<boolean | string> {
-  const [org = '', slug = ''] = team.split('/')
-  // GitHub answers 404 both for "not a member" and for a team gh may not see (no read:org
-  // scope, a secret team). The team is read beside the membership, in the same round, and
-  // only a team gh can see turns a 404 into "not a member".
-  const [membership, isVisible] = await Promise.all([
-    ghApi($, cwd, `orgs/${org}/teams/${slug}/memberships/${login}`, '.state'),
-    lookedUp(lookups, `team:${team}`, () => teamVisibility($, cwd, team)),
-  ])
-  if ('stdout' in membership) return membership.stdout.trim() === 'active'
-  if (membership.isNotFound && isVisible === true) return false
-  const why = membership.isNotFound
-    ? `GitHub answered 404, which also means gh cannot see ${team} or lacks the read:org scope${typeof isVisible === 'string' ? `; reading the team gave: ${isVisible}` : ''}`
-    : membership.said
-  return `the membership of ${team} could not be read (${why})`
-}
-
-/** Whether a reviewer is a named QA person: a listed login, or a member of a listed team. */
-async function isApprover($: EngineInterface, cwd: string, approvers: Approvers, login: string, lookups: Lookups): Promise<boolean | string> {
-  if (approvers.logins.has(login.toLowerCase())) return true
-  const answers = await Promise.all(
-    approvers.teams.map(team => lookedUp(lookups, `member:${team}:${login.toLowerCase()}`, () => isTeamMember($, cwd, team, login, lookups))),
-  )
-  if (answers.includes(true)) return true
-  return answers.find((answer): answer is string => typeof answer === 'string') ?? false
 }
 
 /**
@@ -353,7 +255,12 @@ const watchOf = (context: LoopContext, tracker: TrackerKind): Watch => {
     tracker,
     qaMode: context.settings.qaMode,
     signals,
-    isPrSignalOn: signals.includes('pr-approval') && context.settings.qaMode === 'human-pr' && isGitHub,
+    // With code review on (D77), an approval is a code-review approval: the QA signal counts only the named QA approvers, and none named skips it.
+    isPrSignalOn:
+      signals.includes('pr-approval') &&
+      context.settings.qaMode === 'human-pr' &&
+      isGitHub &&
+      (context.settings.humanReview === undefined || textOf(context.answers.qaApprovers) !== undefined),
     isMergeSignalOn: signals.includes('pr-merged') && context.settings.qaMode === 'human-pr' && isGitHub,
     waitStatus: tracker === 'none' ? 'qa' : (textOf(context.answers.qaWaitStatus) ?? 'qa'),
     passStatus: textOf(context.answers.qaPassStatus),
@@ -497,6 +404,47 @@ export const findingLine = (ticket: { id: string; title?: string }, finding: QaF
     }
     default:
       return `${label}: still waiting${finding.note === undefined ? '' : ` (${finding.note})`}.`
+  }
+}
+
+/** The line for one ticket's code review (D77). */
+export const codeReviewLine = (id: string, pr: string, review: CodeReview) => {
+  const label = `Code review ${id}`
+  if (review.kind === 'approved') return `${label}: approved (${review.have}/${review.need}) at PR #${pr}'s current commit; it merges once QA passes too.`
+  if (review.kind === 'waiting') return `${label}: waiting for code review (${review.have}/${review.need}) on PR #${pr}.`
+  if (review.kind === 'changes') {
+    return `${label}: ${review.by.join(', ')} requested changes on PR #${pr}. Offer the person a fix round from the review comments; start it only on their word or under the fix-round rules.`
+  }
+  return `${label}: could not check (${review.reason}).`
+}
+
+/**
+ * The code-review block for this prompt (D77): with code review on and PRs on GitHub, one line
+ * per ticket in review or qa with a PR, at most `QA_CHECK_CAP`, read fresh from GitHub.
+ * Undefined when there is nothing to say. It never throws.
+ */
+export async function codeReviewBlock($: EngineInterface, cache: LoopCache): Promise<string | undefined> {
+  try {
+    const context = await loopContextOf($, cache)
+    const rule = context?.settings.humanReview
+    if (context === undefined || rule === undefined) return undefined
+    const tracker = trackerOf(context.note.shared.answers)
+    if (!watchOf(context, tracker).isGitHub) return undefined
+    const tickets =
+      tracker === 'jira'
+        ? await jiraRecorded($, context.project, ['review', 'qa'])
+        : await backendFor($, tracker, context.note.dir, context.answers).list({ statuses: ['review', 'qa'] })
+    const withPr = tickets.flatMap(ticket => {
+      const pr = githubPrOf(ticket.pr)
+      return pr === undefined ? [] : [{ id: ticket.id, pr }]
+    })
+    if (withPr.length === 0) return undefined
+    const me = await ownLogin($, cache, context)
+    const lookups = new Map<string, Promise<boolean | string>>()
+    const lines = await Promise.all(withPr.slice(0, QA_CHECK_CAP).map(async ticket => codeReviewLine(ticket.id, ticket.pr, await codeReviewOf($, context.project.root, ticket.pr, rule, me, lookups))))
+    return lines.join('\n')
+  } catch (error) {
+    return `Code review: godmode could not read the PRs' reviews (${messageOf(error)}).`
   }
 }
 

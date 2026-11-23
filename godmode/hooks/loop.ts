@@ -1,36 +1,38 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentSpawnInput, EngineInterface, ToolCallInput, ToolCallResult, ToolSpec } from 'claude-code'
 
-import type { DispatchedAgent, GodmodeMode, PendingReview, Unlock } from '../types'
+import type { DispatchedAgent, GodmodeMode, IndicatorStyle, PendingReview, Unlock } from '../types'
 import { chooseHost, HostError, hostFor, prNumberOf } from './host'
 import type { GitHost, HostKind, PullRequest } from './host'
 import {
-  ACTION_WORDS,
+  ASKS,
   attributionIn,
   carriesText,
   classifyShell,
-  howToChange,
   isHumanQaMode,
   isInside,
   mainThreadVerdict,
   normalisePath,
-  controlledRefusal,
-  CONTROLLED,
   OVERRIDE_HINT,
-  qaGateRefusal,
   qaMoveRefusal,
+  qaPassState,
   relativeTo,
+  riskyRefusal,
   roleOf,
   SCRATCH_FOLDERS,
-  SETTING,
   settingsOf,
   spawnModel,
   targetKey,
   ticketIn,
   waitsOnPeople,
 } from './rules'
-import type { Controlled, ControlledAction, LoopSettings, ShellStep } from './rules'
-import { jiraOwnership } from './jira'
+import type { AskAction, LoopSettings, Risky, ShellStep } from './rules'
+import { approversOf } from './code-review'
+import { jiraOwnership, jiraStatusOf } from './jira'
+import { checkMergeConditions, heldLine, missingLine, readPrView, ticketKeyIn } from './merge-check'
+import type { ConditionCheck, PrView } from './merge-check'
+import { conditionWords } from './project-rules'
+import { qaSignalsOf } from './role'
 import { readNote } from './storage'
 import type { Answer, NoteLookup, Project } from './storage'
 import { indicatorOf } from './indicator'
@@ -49,7 +51,7 @@ const mode = atom({ plugin: 'godmode', key: 'mode' } as const, 'coding' as Godmo
 const agents = atom({ plugin: 'godmode', key: 'agents' } as const, {} as Record<string, DispatchedAgent>)
 const pendingReviews = atom({ plugin: 'godmode', key: 'pendingReviews' } as const, [] as PendingReview[])
 const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
-const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as 'mode' | 'hint' | 'band')
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as IndicatorStyle)
 const unlocks = atom({ plugin: 'godmode', key: 'unlocks' } as const, [] as Unlock[])
 
 type FoundNote = Extract<NoteLookup, { status: 'found' }>
@@ -72,8 +74,8 @@ export type LoopContext = {
 export type LoopCache = {
   context?: { at: number; value?: LoopContext }
   sweep?: { at: number; prs: PullRequest[] }
-  /** The person's own login on the host, once looked up; null when it could not be. */
-  login?: string | null
+  /** The person's own login on the host, once read; a failed read is never kept (D78). */
+  login?: string
 }
 
 /** How long a read of the note stays fresh. `/godmode` reads it again at once. */
@@ -132,23 +134,44 @@ export async function openPullRequests($: EngineInterface, cache: LoopCache, con
   return prs
 }
 
-/** The person's own login on GitHub, so godmode can tell their PRs from others' (D18, D74). */
-async function ownLogin($: EngineInterface, cache: LoopCache, context: LoopContext) {
-  if (cache.login !== undefined) return cache.login ?? undefined
-  const result = await $.process.run(['gh', 'api', 'user', '--jq', '.login'], { cwd: context.project.root }).catch(() => undefined)
-  const login = result?.exitCode === 0 ? result.stdout.trim() : ''
-  cache.login = login === '' ? null : login
-  return cache.login ?? undefined
+/**
+ * The person's own login on GitHub, read live (D78): a read that fails is tried again once,
+ * and a failure is never kept, so the next call reads again. A login read is kept for this load.
+ */
+export async function ownLogin($: EngineInterface, cache: LoopCache, context: LoopContext) {
+  if (cache.login !== undefined) return cache.login
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await $.process.run(['gh', 'api', 'user', '--jq', '.login'], { cwd: context.project.root }).catch(() => undefined)
+    const login = result?.exitCode === 0 ? result.stdout.trim() : ''
+    if (login !== '') {
+      cache.login = login
+      return login
+    }
+  }
+  return undefined
 }
 
-/** Whether a PR is someone else's: only when both its author and the person's login are known. */
-async function isOthersPr($: EngineInterface, cache: LoopCache, context: LoopContext, pr: string) {
+/** Whose a PR is, read live: the person's own (or godmode's, which runs as the person), someone else's, or unknown with why. */
+export type PrOwner = { kind: 'mine' } | { kind: 'others'; author: string } | { kind: 'unknown'; reason: string }
+
+/**
+ * Who opened a PR (D78): its author against the person's own login, both read live. A PR
+ * godmode opened is the person's too, as godmode works through their `gh`. Only GitHub has PRs to own.
+ */
+export async function prOwnerOf($: EngineInterface, cache: LoopCache, context: LoopContext, pr: string, view?: PrView): Promise<PrOwner> {
   const choice = await hostOf($, context)
-  if ('error' in choice || choice.kind !== 'github') return false
+  if ('error' in choice || choice.kind !== 'github') return { kind: 'mine' }
   const find = (prs: readonly PullRequest[]) => prs.find(candidate => candidate.ref === pr || candidate.branch === pr)
-  const found = find(await openPullRequests($, cache, context).catch(() => [])) ?? find(await openPullRequests($, cache, context, true).catch(() => []))
+  let author = view?.author ?? find(await openPullRequests($, cache, context).catch(() => []))?.author
+  if (author === undefined || author === '') {
+    const read = await readPrView($, context.project.root, pr)
+    if ('error' in read) return { kind: 'unknown', reason: read.error }
+    author = read.author
+  }
   const me = await ownLogin($, cache, context)
-  return found !== undefined && found.author !== '' && me !== undefined && found.author !== me
+  if (me === undefined) return { kind: 'unknown', reason: 'gh could not read your own login' }
+  if (author === '') return { kind: 'unknown', reason: `gh named no author for PR #${pr}` }
+  return author.toLowerCase() === me.toLowerCase() ? { kind: 'mine' } : { kind: 'others', author }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +230,7 @@ export async function serveReviewVerdict($: EngineInterface, cache: LoopCache, e
   const caller = e.agentId === undefined ? undefined : (await read($, agents))[e.agentId]
   if (context.settings.verdictFromReviewerOnly && caller?.role !== 'reviewer') {
     return {
-      deny: `Only a reviewer agent records a verdict, so a PR is never cleared by the agent that wrote it or by the PM. Dispatch a godmode:reviewer on the PR. To change the rule, ${howToChange(SETTING.verdictFromReviewerOnly)}.`,
+      deny: 'Only a reviewer agent records a verdict, so godmode\'s own work is never cleared by the agent that wrote it or by the PM. Dispatch a godmode:reviewer on the PR, which records its verdict here.',
     }
   }
   const pr = prRefOf(e.pr)
@@ -260,58 +283,56 @@ async function moveToQa($: EngineInterface, context: LoopContext, ticket: string
   )
 }
 
+/** What a PR godmode marked ready waits on next: the project's merge conditions, and who says "merge". */
+const conditionsNext = (settings: LoopSettings, pr: string) => {
+  const conditions = settings.mergeConditions
+  const what = conditions.length === 0 ? 'The project sets no merge conditions' : `It merges once the project's conditions hold, checked live: ${conditions.map(conditionWords).join(', ')}`
+  const who = settings.isAutoMergeOn ? 'godmode merges it then, on its own' : `the person says "merge" (\`gh pr merge ${pr}\`)`
+  return ` ${what}; ${who}.`
+}
+
 /**
- * What follows a clean review in the project's QA mode. In `human-pr` a visible change
- * moves to qa for people to test, unless the QA agent tests it first (D71); the other
- * modes keep Step 7's flow, where the PM runs bot QA (D35).
+ * What follows a clean review of godmode's own PR (D78): godmode's QA agent first where it
+ * tries godmode's visible changes, then the PR is marked ready, and the project's merge
+ * conditions take over. Where people test the PR, its visible changes move to qa for them.
  */
 async function afterCleanReview($: EngineInterface, context: LoopContext, pr: string) {
-  const plain = ' It may now be marked ready; a new commit needs a new review.'
   const { settings } = context
-  if (settings.qaMode === 'bot') return afterCleanReviewInBot($, context, pr, plain)
-  if (settings.qaMode !== 'human-pr') return plain
-  const gate = 'and the PR is marked ready only once their pass is recorded at its current commit'
   const found = await ticketsOfPr($, context, pr)
-  if ('error' in found || found.tickets.length === 0) {
-    return ` People test this PR before it is marked ready (QA mode human-pr), ${gate}. godmode found no ticket naming PR #${pr}: the PM sets the PR on its ticket and moves that ticket to qa.`
+  const tickets = 'error' in found ? [] : found.tickets
+  const visible = tickets.filter(ticket => ticket.visibleChange)
+  const isAgentFirst = settings.qaMode === 'bot' || (isHumanQaMode(settings.qaMode) && settings.isQaBotFirst)
+  if (isAgentFirst && visible.length > 0) {
+    return ` Next godmode's QA agent tests ${idsOf(visible)} at this commit; once it passes, mark PR #${pr} ready (\`gh pr ready ${pr}\`).`
   }
-  const tested = found.tickets.filter(ticket => waitsOnPeople(settings.qaMode, ticket))
-  if (tested.length === 0) return plain
-  if (settings.isQaBotFirst) {
-    const ids = idsOf(tested)
-    return ` Next the QA agent tests ${ids}; once it passes, ${ids} ${tested.length === 1 ? 'moves' : 'move'} to qa for people to test, ${gate}.`
-  }
+  const lines = [` Mark PR #${pr} ready now (\`gh pr ready ${pr}\`); a new commit needs a new review.${conditionsNext(settings, pr)}`]
+  const rule = settings.humanReview
+  const named = rule === undefined ? [] : rule.reviewers.split(/[\s,]+/).filter(part => part !== '')
+  if (named.length > 0) lines.push(`Request ${named.join(', ')} as reviewers (\`gh pr edit ${pr} --add-reviewer ${named.join(',')}\`).`)
+  if (settings.qaMode === 'human-pr') lines.push(...(await toPeopleQa($, context, visible)))
+  return lines.join(' ')
+}
+
+/** Moves each visible change to qa for the people who test the PR (D69); resolves what was done, and any line to mirror by hand. */
+async function toPeopleQa($: EngineInterface, context: LoopContext, tickets: readonly TicketHeader[]) {
   const lines: string[] = []
-  const mirrors: string[] = []
-  for (const ticket of tested) {
+  for (const ticket of tickets) {
     if (ticket.status === 'qa' || ticket.status === 'done') {
-      lines.push(`${ticket.id} waits in qa for people to test it`)
+      lines.push(`${ticket.id} waits in qa for people to test it.`)
       continue
     }
     const moved = await moveToQa($, context, ticket.id)
-    lines.push(moved === undefined ? `godmode could not move ${ticket.id} to qa, so the PM moves it` : `godmode moved ${ticket.id} to qa`)
-    if (moved?.mirror !== undefined) mirrors.push(moved.mirror)
+    lines.push(moved === undefined ? `godmode could not move ${ticket.id} to qa, so the PM moves it: people test the PR now.` : `godmode moved ${ticket.id} to qa: people test the PR now.`)
+    if (moved?.mirror !== undefined) lines.push(moved.mirror)
   }
-  return [` ${lines.join('; ')}: people test the PR now (QA mode human-pr), ${gate}.`, ...mirrors].join('\n')
-}
-
-/** In `bot`, a clean review of a visible change is followed by the QA agent's test, which the ready gate waits on (D35). */
-async function afterCleanReviewInBot($: EngineInterface, context: LoopContext, pr: string, plain: string) {
-  const found = await ticketsOfPr($, context, pr)
-  if ('error' in found || found.tickets.length === 0) {
-    return ` The QA agent tests a visible change before its PR is marked ready (QA mode bot). godmode found no ticket naming PR #${pr}: the PM sets the PR on its ticket with ticket_move (pr: ${pr}).`
-  }
-  const tested = found.tickets.filter(ticket => ticket.visibleChange)
-  if (tested.length === 0) return plain
-  return ` Next the QA agent tests ${idsOf(tested)} at this commit; the PR is marked ready only once its pass is recorded there (QA mode bot).`
+  return lines
 }
 
 /** After a merge in `human-staging`, each visible change the PR carries goes to qa, not done: people test it on staging (D69). */
 async function afterStagingMerge($: EngineInterface, context: LoopContext, pr: string) {
   const found = await ticketsOfPr($, context, pr)
   const tickets = 'error' in found ? [] : found.tickets
-  const rule = 'people test it on staging after the merge (QA mode human-staging), and it leaves qa only once their pass is recorded with ticket_move (qaResult: passed)'
-  if (tickets.length === 0) return [`godmode found no ticket naming PR #${pr}. If it has one with a visible change, move that ticket to qa, not done: ${rule}.`]
+  const rule = 'people test it on staging after the merge, and it leaves qa once their pass is recorded with ticket_move (qaResult: passed)'
   const lines: string[] = []
   for (const ticket of tickets) {
     if (!waitsOnPeople(context.settings.qaMode, ticket) || ticket.status === 'qa' || ticket.status === 'done') continue
@@ -408,13 +429,11 @@ export const QA_VERDICT_TOOL: ToolSpec & { name: 'qa_verdict' } = {
  * moves to qa for people to test (D71), as it does after a clean review without the pre-pass.
  */
 async function afterBotPass($: EngineInterface, context: LoopContext, ticket: TicketHeader) {
-  const { qaMode } = context.settings
-  if (!waitsOnPeople(qaMode, ticket)) return ' With a clean review at this commit, its PR may now be marked ready.'
-  if (qaMode === 'human-staging') return ' With a clean review at this commit, its PR may be merged on the person\'s go; people then test it on staging.'
-  if (ticket.status === 'qa' || ticket.status === 'done') return ` ${ticket.id} waits in qa for people to test it.`
-  return (await moveToQa($, context, ticket.id))
-    ? ` godmode moved ${ticket.id} to qa: people test it now (QA mode human-pr), and the PR is marked ready only once their pass is recorded at its current commit.`
-    : ` godmode could not move ${ticket.id} to qa, so the PM moves it: people test it next (QA mode human-pr).`
+  const { settings } = context
+  const pr = ticket.pr === undefined ? undefined : prRefOf(ticket.pr)
+  const ready = pr === undefined ? ' With a clean review at this commit, its PR may now be marked ready.' : ` With a clean review at this commit, mark PR #${pr} ready now (\`gh pr ready ${pr}\`).${conditionsNext(settings, pr)}`
+  if (settings.qaMode !== 'human-pr' || !ticket.visibleChange) return ready
+  return `${ready} ${(await toPeopleQa($, context, [ticket])).join(' ')}`
 }
 
 /** Serves `qa_verdict`: checks who calls, reads the commit of the ticket's PR (or branch), records the result there. */
@@ -636,7 +655,7 @@ async function fixRoundRefusal($: EngineInterface, context: LoopContext, ticket:
   const count = entry.count + (fresh.length > 0 ? 1 : 0)
   const allowed = allowedOf(settings, entry)
   if (count > allowed) {
-    return `This would be ${roundOf(count, allowed)} on ${ticket.id}, past the fix-round limit, so ${start.stopped}. Stop and ask the person what to do, saying what keeps failing. If they say to go on, allow more rounds with ticket_move (id: ${ticket.id}, moreFixRounds: 1 or more), then ${start.retry}. To change the limit for every ticket, ${howToChange(SETTING.fixRoundLimit)}.`
+    return `This would be ${roundOf(count, allowed)} on ${ticket.id}, past the fix-round limit, so ${start.stopped}. Stop and ask the person what to do, saying what keeps failing. If they say to go on, allow more rounds with ticket_move (id: ${ticket.id}, moreFixRounds: 1 or more), then ${start.retry}.`
   }
   if (fresh.length > 0) await writeFixRounds($, project, ticket.id, { ...entry, count, counted: [...entry.counted, ...fresh].slice(-COUNTED_KEPT) })
   return undefined
@@ -717,12 +736,12 @@ export function ticketMoveCheck($: EngineInterface, cache: LoopCache): MoveCheck
     const wanted = normaliseId(id) ?? id.trim().toUpperCase()
     const tickets = await openTicketsOf($, trackerOf(context.note.shared.answers), context.note.dir, { id: wanted, withFixes: change.status === 'done' })
     const ticket = tickets.find(header => header.id.toUpperCase() === wanted)
-    // A Jira ticket godmode did not file is moved only when the person created it, or asked for it (D74).
-    if (ticket === undefined && trackerOf(context.note.shared.answers) === 'jira') {
+    // Someone else's Jira ticket is a risky action under "careful" (D78): the person created it, godmode filed it, or they ask.
+    if (ticket === undefined && trackerOf(context.note.shared.answers) === 'jira' && context.settings.care === 'careful') {
       const owner = await jiraOwnership($, context.project, wanted)
       if (!owner.isOwn) {
-        const held = await withUnlocks($, [{ action: 'edit-ticket', target: wanted, reason: owner.why }])
-        if (held.length > 0) throw new TicketError(controlledRefusal(held))
+        const held = await withAsks($, [{ action: 'others-ticket', target: wanted, state: owner.why }])
+        if (held.length > 0) throw new TicketError(riskyRefusal(held))
       }
     }
     // No such ticket: the move itself says so.
@@ -826,97 +845,13 @@ async function botFirstRefusal(
   return `${botQaRefusal(ticket, record, read.head, what)} An override is for an app the QA agent cannot run, never for a failed test.`
 }
 
-const doingOf = (step: ShellStep) => (step.action === 'pr-ready' ? 'marked ready' : step.action === 'pr-approve' ? 'approved' : 'merged')
-
-/** Why a gated step that names no PR is refused: godmode cannot tell which PR's verdict and tickets to check. */
-const unnamedPrRefusal = (step: ShellStep) => {
-  const doing = doingOf(step)
-  if (step.isApi === true) {
-    const plain = step.action === 'pr-ready' ? 'gh pr ready 12' : 'gh pr merge 12'
-    return `godmode cannot tell which PR this \`gh api\` call would have ${doing}, so it cannot check its review and QA first. Use \`${plain}\` with the PR's number instead. Nothing ran.`
-  }
-  return `Name the PR by number (\`${step.verb} 12\`) so godmode can check its review verdict and its tickets before it is ${doing}. Nothing ran.`
-}
-
-/** Why auto-merge is refused in a human QA mode (D53, D69), whatever the auto-merge setting says. */
-const autoMergeInHumanQaRefusal = (qaMode: LoopSettings['qaMode'], step: ShellStep) => {
-  const pr = step.pr ?? '12'
-  const why =
-    qaMode === 'human-pr'
-      ? 'auto-merge would merge a later commit that people never tested'
-      : 'auto-merge would merge without godmode seeing it, so the ticket would never move to qa for people to test on staging'
-  return `In QA mode ${qaMode}, a PR is never armed for auto-merge: ${why}. Merge it directly (\`gh pr merge ${pr}\`) on the person's go. Nothing ran. To change how this project is tested, ${howToChange(SETTING.qaMode)}.`
-}
-
-/**
- * Why a PR may not be marked ready or merged yet, or undefined when nothing holds it: a
- * clean review verdict at its current commit (D53), then in `human-pr` a QA pass at that
- * commit (D69) for every ticket the PR carries.
- */
-async function readyRefusal($: EngineInterface, context: LoopContext, step: ShellStep, pr: string) {
-  const doing = doingOf(step)
-  const label = `PR #${pr}`
-  const choice = await hostOf($, context)
-  if ('error' in choice) return `godmode could not reach the git host to check ${label}'s review (${choice.error}). Nothing ran.`
-  let head: string
-  try {
-    head = await choice.host.headCommit(pr)
-  } catch (error) {
-    return `godmode could not read ${label}'s head commit (${messageOf(error)}), so it cannot check its review verdict. Nothing ran; try again once the host answers.`
-  }
-  if (context.settings.isMergeGateOn) {
-    const record = (await readVerdicts($, context.project))[pr]
-    const rule = `To change the rule, ${howToChange(SETTING.mergeGate)}.`
-    if (record === undefined) {
-      return `${label} has no review verdict, so it cannot be ${doing}. Dispatch a godmode:reviewer on it; the reviewer records its verdict with review_verdict. ${rule}`
-    }
-    if (record.headCommit !== head) {
-      return `${label}'s last verdict (${record.verdict}) was given at commit ${short(record.headCommit)}, and the PR is now at ${short(head)}. Every new commit is reviewed again: dispatch a godmode:reviewer on the new commit. ${rule}`
-    }
-    if (record.verdict !== 'clean') {
-      return `${label}'s verdict at its current commit is ${record.verdict}, not clean, so it cannot be ${doing}. Send the findings to the dev agent for a fix round, then review again. ${rule}`
-    }
-  }
-  if (context.settings.qaMode === 'bot') return botReadyRefusal($, context, pr, doing, head)
-  if (context.settings.qaMode !== 'human-pr') return undefined
-  const found = await ticketsOfPr($, context, pr)
-  if ('error' in found) return `godmode could not read the tickets to check whether ${label} waits on QA (${found.error}). Nothing ran; try again once the tickets can be read.`
-  if (found.tickets.length === 0) return qaGateRefusal(context.settings, pr, doing, undefined, head)
-  // A PR that carries several tickets waits on each one's own pass.
-  for (const ticket of found.tickets) {
-    const refusal = qaGateRefusal(context.settings, pr, doing, ticket, head)
-    if (refusal !== undefined) return refusal
-  }
-  return undefined
-}
-
-/**
- * In `bot`, why a PR may not be marked ready or merged yet: each visible change it carries
- * needs the QA agent's pass, or the person's skip, at its current commit (D35, D36).
- */
-async function botReadyRefusal($: EngineInterface, context: LoopContext, pr: string, doing: string, head: string) {
-  const label = `PR #${pr}`
-  const found = await ticketsOfPr($, context, pr)
-  if ('error' in found) return `godmode could not read the tickets to check whether ${label} waits on the QA agent (${found.error}). Nothing ran; try again once the tickets can be read.`
-  if (found.tickets.length === 0) {
-    return `In this project the QA agent tests a visible change before its PR is ${doing} (QA mode bot), and no ticket names ${label}, so godmode cannot tell whether it waits on QA. Set the PR on its ticket with ticket_move (pr: ${pr}), then try again. Nothing ran.`
-  }
-  const records = await readBotQa($, context.project)
-  for (const ticket of found.tickets) {
-    if (!ticket.visibleChange) continue
-    const refusal = botQaRefusal(ticket, records[ticket.id], head, `${label} cannot be ${doing}`)
-    if (refusal !== undefined) return refusal.replace(/Nothing changed\.$/, 'Nothing ran.')
-  }
-  return undefined
-}
-
 // ---------------------------------------------------------------------------
 // The tool-call gate
 
 /** What the gate decided: a refusal, or what `afterToolCall` needs once the call ran. */
 export type ToolDecision =
   | { deny: string }
-  | { deny?: undefined; isMain: boolean; agentId?: string; agent?: DispatchedAgent; opensPr: boolean; merges: string[] }
+  | { deny?: undefined; isMain: boolean; agentId?: string; agent?: DispatchedAgent; opensPr: boolean; merges: string[]; notes: string[] }
 
 /** The texts a commit or PR command carries: the command line and any file it reads its body from. */
 async function textsOf($: EngineInterface, command: string, step: ShellStep) {
@@ -929,35 +864,179 @@ async function textsOf($: EngineInterface, command: string, step: ShellStep) {
   return texts
 }
 
-/** The hard rules that refuse a shell step outright: drafts, attribution, auto-merge, the verdict and QA gate. */
-async function shellRefusal($: EngineInterface, context: LoopContext, step: ShellStep, command: string) {
+const doingOf = (step: ShellStep) => (step.action === 'pr-ready' ? 'marked ready' : step.action === 'pr-approve' ? 'approved' : 'merged')
+
+/** Why a merge or ready that names no PR is refused: godmode cannot tell which PR to read. */
+const unnamedPrRefusal = (step: ShellStep) => {
+  const doing = doingOf(step)
+  const plain = step.action === 'pr-ready' ? 'gh pr ready 12' : 'gh pr merge 12'
+  if (step.isApi === true) return `godmode cannot tell which PR this \`gh api\` call would have ${doing}, so it cannot read the PR's live state first. Run \`${plain}\` with the PR's number instead. Nothing ran.`
+  return `Name the PR by number (\`${step.verb} 12\`), so godmode can read its live state before it is ${doing}. Nothing ran.`
+}
+
+/**
+ * godmode's own work on a PR (D78): its review verdict, and its QA agent's pass where it tries
+ * godmode's visible changes, at the PR's current commit. They apply only to a PR godmode made
+ * (a ticket of its names the PR, or its reviewer gave a verdict on it): `isOwn` false for any other.
+ */
+async function ownLoopState($: EngineInterface, context: LoopContext, pr: string, head: string): Promise<{ isOwn: boolean; missing: string[] }> {
+  const record = (await readVerdicts($, context.project))[pr]
+  const found = await ticketsOfPr($, context, pr)
+  const tickets = 'error' in found ? [] : found.tickets
+  if (record === undefined && tickets.length === 0) return { isOwn: false, missing: [] }
+  const missing: string[] = []
+  const { settings } = context
+  if (settings.isMergeGateOn) {
+    if (record === undefined) missing.push(`godmode's review has no verdict on PR #${pr}: dispatch a godmode:reviewer on it`)
+    else if (record.headCommit !== head) missing.push(`godmode's last verdict (${record.verdict}) was at ${short(record.headCommit)} and PR #${pr} is now at ${short(head)}: dispatch a godmode:reviewer on the new commit`)
+    else if (record.verdict !== 'clean') missing.push(`godmode's review at ${short(head)} is ${record.verdict}: send the findings to the dev agent for a fix round, then review again`)
+  }
+  const isAgentFirst = settings.qaMode === 'bot' || (isHumanQaMode(settings.qaMode) && settings.isQaBotFirst)
+  if (isAgentFirst) {
+    const records = await readBotQa($, context.project)
+    for (const ticket of tickets.filter(header => header.visibleChange)) {
+      const refusal = botQaRefusal(ticket, records[ticket.id], head, `PR #${pr} is not ready`)
+      if (refusal !== undefined) missing.push(refusal.replace(/ Nothing changed\.$/, ''))
+    }
+  }
+  return { isOwn: true, missing }
+}
+
+/**
+ * Why godmode's own PR may not be marked ready yet (D53, D78): its review and its QA agent are
+ * not done at the current commit. A PR godmode did not make has no such step. The person's ask
+ * marks it ready as it is: it is their work too.
+ */
+async function readyRefusal($: EngineInterface, cache: LoopCache, context: LoopContext, pr: string) {
+  const choice = await hostOf($, context)
+  if ('error' in choice) return undefined
+  let head: string
+  try {
+    head = await choice.host.headCommit(pr)
+  } catch {
+    // The PR cannot be read: there is no loop state to hold it on.
+    return undefined
+  }
+  const own = await ownLoopState($, context, pr, head)
+  if (!own.isOwn || own.missing.length === 0) return undefined
+  if (await takeAsk($, 'ready-as-is', pr)) return undefined
+  return `PR #${pr} is godmode's own work, and godmode marks it ready once its own checks pass at the current commit ${short(head)}: ${own.missing.join('; ')}. If the person asks for it ready as it is, record their words with mcp__godmode__allow_once (action: ready-as-is, target: ${pr}), then run it again. Nothing ran.`
+}
+
+/** What a merge gate decided: a refusal, or a go with lines for the PM (what was missing, said after the merge). */
+type MergeDecision = { deny: string } | { deny?: undefined; notes: string[]; asks: Ask[] }
+
+/**
+ * The QA merge condition (D69, D78): people's pass at the PR's current commit. godmode's own
+ * tickets that name the PR are read first; a PR godmode did not make is looked up by the ticket
+ * key in its branch or title, read live, and never linked or recorded. The PR-approval and
+ * ticket-status signals count too, where the project uses them.
+ */
+async function qaCondition($: EngineInterface, context: LoopContext, view: PrView, me: string | undefined) {
+  const signals = qaSignalsOf(context.answers)
+  const approvers = approversOf(context.answers.qaApprovers)
+  if (signals.includes('pr-approval') && (approvers.logins.size > 0 || approvers.teams.length > 0)) {
+    const approved = await checkMergeConditions($, context.project.root, view, [{ kind: 'approvals', count: 1, reviewers: String(context.answers.qaApprovers) }], me, async () => ({ met: false, state: '' }))
+    if (approved[0]?.met === true) return { met: true, state: 'a QA approver approved the current commit' }
+  }
+  const found = await ticketsOfPr($, context, view.number)
+  if (!('error' in found) && found.tickets.length > 0) {
+    const states = found.tickets.map(ticket => qaPassState(ticket, view.head))
+    const unmet = states.find(state => !state.met)
+    return unmet ?? { met: true, state: states.map(state => state.state).join('; ') }
+  }
+  const tracker = trackerOf(context.note.shared.answers)
+  const key = ticketKeyIn(`${view.branch} ${view.title}`, tracker !== 'jira')
+  if (key === undefined) return { met: false, state: 'no ticket key in its branch or title, and no QA pass seen on the PR' }
+  if (tracker === 'jira') {
+    const status = await jiraStatusOf($, context, key)
+    const pass = typeof context.answers.qaPassStatus === 'string' ? context.answers.qaPassStatus : undefined
+    if (status === undefined) return { met: false, state: `godmode could not read ${key}'s status in Jira just now` }
+    if (pass !== undefined && status.toLowerCase() === pass.toLowerCase()) return { met: true, state: `${key} is in "${status}"` }
+    return { met: false, state: `${key} is in "${status}"${pass === undefined ? '' : `, not "${pass}"`}` }
+  }
+  const backend = backendOrNothing($, context)
+  const tickets = backend === undefined ? undefined : await backend.list({ statuses: TICKET_STATUSES }).catch(() => undefined)
+  const ticket = tickets?.find(header => header.id.toUpperCase() === key)
+  if (ticket === undefined) return { met: false, state: `godmode found no ticket ${key}` }
+  return qaPassState(ticket, view.head)
+}
+
+/**
+ * The merge gate (D78), on every PR whoever made it: the project's merge conditions, checked
+ * live, and on godmode's own PR its own review and QA agent. Under "careful" a merge is the
+ * person's to ask for: their "merge" goes through when the conditions hold, their "merge anyway"
+ * when they do not, and godmode merges on its own only when they set it to and everything
+ * holds. Under "not careful" godmode merges, and says what was missing.
+ */
+async function mergeDecision($: EngineInterface, cache: LoopCache, context: LoopContext, step: ShellStep, pr: string): Promise<MergeDecision> {
+  const { settings } = context
+  const isCareful = settings.care === 'careful'
+  const view = await readPrView($, context.project.root, pr)
+  if ('error' in view) {
+    if (!isCareful) return { notes: [`godmode merged PR #${pr} without checking its merge conditions: ${view.error}.`], asks: [] }
+    if (await takeAsk($, 'merge-anyway', pr, false)) return { notes: [`godmode could not read PR #${pr} (${view.error}); it merged on the person's "merge anyway".`], asks: [] }
+    return {
+      deny: `godmode could not read PR #${pr} to check its merge conditions (${view.error}). Try again once GitHub answers. If the person says to merge it anyway, record their words with mcp__godmode__allow_once (action: merge-anyway, target: ${pr}), then run it again. Nothing ran.`,
+    }
+  }
+  const me = await ownLogin($, cache, context)
+  const checks = await checkMergeConditions($, context.project.root, view, settings.mergeConditions, me, () => qaCondition($, context, view, me))
+  const own = await ownLoopState($, context, pr, view.head)
+  const projectMissing = checks.filter(check => !check.met)
+  const loopMissing = own.missing
+  const owner = await prOwnerOf($, cache, context, pr, view)
+  const missingText = [missingLine(checks), ...loopMissing].filter(part => part !== '').join('; ')
+  const isAuto = step.isAuto === true
+  // godmode moves its own tickets to qa when it sees the merge; armed for GitHub to merge later, it never would.
+  if (isAuto && settings.qaMode === 'human-staging' && own.isOwn) {
+    return { deny: `People test on staging after the merge, and godmode moves PR #${pr}'s tickets to qa when it merges it: armed for later, its tickets would never move to qa for people to test on staging. Merge it directly once the conditions hold (\`gh pr merge ${pr}\`). Nothing ran.` }
+  }
+  if (isAuto && settings.mergeConditions.some(condition => condition.kind === 'qa')) {
+    return { deny: `GitHub's auto-merge cannot wait for this project's QA pass, so PR #${pr} is not armed. Merge it directly once QA passes (\`gh pr merge ${pr}\`). Nothing ran.` }
+  }
+  if (!isCareful) {
+    return { notes: missingText === '' ? [] : [`godmode merged PR #${pr} with these not met: ${missingText}.`], asks: [] }
+  }
+  // Armed for later, GitHub merges once its own required checks pass: the person set godmode to merge on its own.
+  if (isAuto && settings.isAutoMergeOn && loopMissing.length === 0 && owner.kind === 'mine') return { notes: [], asks: [] }
+  const state = conditionsState(checks)
+  if (projectMissing.length > 0) {
+    if (await hasAsk($, 'merge-anyway', pr)) return { notes: [`PR #${pr} merged on the person's "merge anyway", with these not met: ${missingText}.`], asks: [{ action: 'merge-anyway', target: pr }] }
+    return {
+      deny: `PR #${pr} does not meet this project's merge conditions yet: ${missingLine(checks)}.${loopMissing.length === 0 ? '' : ` godmode's own checks: ${loopMissing.join('; ')}.`} Tell the person what is missing. If they say "merge anyway", record their words with mcp__godmode__allow_once (action: merge-anyway, target: ${pr}), then run it again. Nothing ran.`,
+    }
+  }
+  if (await hasAsk($, 'merge-anyway', pr)) return { notes: loopMissing.length === 0 ? [] : [`PR #${pr} merged on the person's word, before godmode's own checks: ${loopMissing.join('; ')}.`], asks: [{ action: 'merge-anyway', target: pr }] }
+  if (await hasAsk($, 'merge', pr)) return { notes: loopMissing.length === 0 ? [] : [`PR #${pr} merged on the person's word, before godmode's own checks: ${loopMissing.join('; ')}.`], asks: [{ action: 'merge', target: pr }] }
+  if (settings.isAutoMergeOn && loopMissing.length === 0 && owner.kind === 'mine') return { notes: [], asks: [] }
+  const whose = owner.kind === 'others' ? ` It is ${owner.author}'s PR.` : owner.kind === 'unknown' ? ` godmode could not tell whose PR it is (${owner.reason}).` : ''
+  const loop = loopMissing.length === 0 ? '' : ` godmode's own checks are not done: ${loopMissing.join('; ')}.`
+  return {
+    deny: `Merging is a risky action, and godmode asks the person first. ${state}${whose}${loop} When the person says "merge #${pr}", record their words with mcp__godmode__allow_once (action: merge, target: ${pr}), then run it again. Nothing ran.`,
+  }
+}
+
+/** Where the conditions stand, for a refusal that asks the person. */
+const conditionsState = (checks: readonly ConditionCheck[]) =>
+  checks.length === 0 ? 'This project sets no merge conditions.' : `Every merge condition holds: ${heldLine(checks)}.`
+
+/** The hard rules of a shell step that are the project's own (D78): drafts and attribution. */
+async function projectRuleRefusal($: EngineInterface, context: LoopContext, step: ShellStep, command: string) {
   const { settings } = context
   if (step.action === 'pr-open' && settings.isDraftsOnly && step.isDraft !== true) {
-    return `godmode opens every PR as a draft: add \`--draft\` to \`gh pr create\` and run it again. A PR leaves draft only once a clean review is recorded at its current commit. To change the rule, ${howToChange(SETTING.draftsOnly)}.`
+    return 'In this project godmode opens its PRs as drafts and marks each ready once its own review passes: add `--draft` to `gh pr create` and run it again. Nothing ran.'
   }
   if (!settings.isAttributionAllowed && carriesText(step)) {
     for (const text of await textsOf($, command, step)) {
       const line = attributionIn(text)
       if (line !== undefined) {
         const what = step.verb === 'git commit' ? 'commit message' : 'PR text'
-        return `This project's setup turns AI attribution off, and the ${what} carries \`${line}\`. Remove that line and run it again. To allow attribution, ${howToChange(SETTING.attribution)}.`
+        return `This project's commits and PRs carry no AI attribution, and the ${what} carries \`${line}\`. Remove that line and run it again. Nothing ran.`
       }
     }
   }
-  // Approving once review and QA passed (D74) waits on the same gate as ready and merge.
-  const isApprovalGated = step.action === 'pr-approve' && settings.prApproval === 'when-passed'
-  const isGated = (step.action === 'pr-ready' || step.action === 'pr-merge' || isApprovalGated) && step.isUndo !== true
-  if (!isGated) return undefined
-  const isAuto = step.action === 'pr-merge' && step.isAuto === true
-  if (isAuto && isHumanQaMode(settings.qaMode)) return autoMergeInHumanQaRefusal(settings.qaMode, step)
-  if (isAuto && !settings.isAutoMergeOn) {
-    return `Auto-merge is off: a PR is merged only once the person says so. Tell them the PR is ready for their go instead. To arm auto-merge on its own, ${howToChange(SETTING.autoMerge)}.`
-  }
-  const isChecked = settings.isMergeGateOn || settings.qaMode === 'human-pr' || settings.qaMode === 'bot'
-  // In human-staging a merge moves its tickets to qa, so its PR must be known even with the merge gate off.
-  const isStagingMerge = settings.qaMode === 'human-staging' && step.action === 'pr-merge'
-  if (step.pr === undefined) return isChecked || isStagingMerge ? unnamedPrRefusal(step) : undefined
-  return isChecked ? readyRefusal($, context, step, step.pr) : undefined
+  return undefined
 }
 
 /** Why a dev agent's edit is refused: outside its worktree (D38), or a file another open PR holds (D48). */
@@ -967,22 +1046,15 @@ async function devEditRefusal($: EngineInterface, cache: LoopCache, context: Loo
   const isScratch = SCRATCH_FOLDERS.some(folder => isInside(path, folder))
   if (settings.isWorktreeGuardOn && !isInside(path, agent.worktree) && !isScratch) {
     const copy = isInside(path, context.project.root) ? ` (here, ${normalisePath(`${agent.worktree}/${relativeTo(path, context.project.root)}`)})` : ''
-    return `You are a dev agent working in your worktree ${agent.worktree}, and ${path} is outside it. Edit the file inside your worktree${copy} instead. To change the rule, ${howToChange(SETTING.worktreeGuard)}.`
+    return `You are a dev agent working in your worktree ${agent.worktree}, and ${path} is outside it. Edit the file inside your worktree${copy} instead.`
   }
   if (!settings.isContentionOn || !isInside(path, agent.worktree)) return undefined
-  let prs: readonly PullRequest[]
-  try {
-    prs = await openPullRequests($, cache, context)
-  } catch (error) {
-    if (cache.sweep === undefined) {
-      return `godmode could not list the open PRs to check that no other PR holds ${path} (${messageOf(error)}). Nothing was edited; try again shortly. To change the rule, ${howToChange(SETTING.contention)}.`
-    }
-    prs = cache.sweep.prs
-  }
+  // A sweep that cannot be read leaves the edit free: godmode never refuses for what it cannot see.
+  const prs = await openPullRequests($, cache, context).catch(() => cache.sweep?.prs ?? [])
   const file = relativeTo(path, agent.worktree)
   const holder = prs.find(pr => pr.branch !== agent.branch && pr.files.includes(file))
   if (holder === undefined) return undefined
-  return `\`${file}\` is held by open PR #${holder.ref} (${holder.title}${holder.author === '' ? '' : `, by ${holder.author}`}), so editing it now could collide with that work. Stop and report this to the PM; do not work around it. The file frees up when that PR merges or closes. To change the rule, ${howToChange(SETTING.contention)}.`
+  return `\`${file}\` is held by open PR #${holder.ref} (${holder.title}${holder.author === '' ? '' : `, by ${holder.author}`}), so editing it now could collide with that work. Stop and report this to the PM, who asks the person how to go on. The file frees up when that PR merges or closes.`
 }
 
 /** The tools of the context7 server godmode's `plugin.json` declares (D41). */
@@ -1003,22 +1075,29 @@ export async function context7Refusal($: EngineInterface, cache: LoopCache, tool
   return why === undefined ? undefined : `godmode's context7 tools work only while godmode is on in a set-up project, and ${why}. Nothing ran.`
 }
 
+/** A Jira tool that deletes an issue: deleting a ticket is a risky action (D78). */
+const TICKET_DELETE = /^mcp__.+__(deleteJiraIssue|deleteIssue)$/
+
+/** A Jira tool that moves or edits an issue: on someone else's ticket, a risky action (D78). */
+const TICKET_EDIT = /^mcp__.+__(transitionJiraIssue|editJiraIssue)$/
+
 /**
- * The gate every tool call passes while godmode is on: the thin main thread (D63), the
- * dev agent's worktree and held files (D38, D48), drafts, attribution and the verdict
- * gate (D15, D53), then the few writes that wait for the person's yes (D74), asked directly (D66).
+ * The gate every tool call passes while godmode is on (D78): the thin main thread, a dev
+ * agent's worktree and held files, the project's own rules (drafts, attribution), the merge
+ * gate and the ready step on godmode's own PR, then the risky actions, which ask the person
+ * first under "careful".
  */
 export async function decideToolCall($: EngineInterface, cache: LoopCache, e: ToolCallInput): Promise<ToolDecision> {
   const isMain = e.agentId === undefined
-  if ((await read($, isOn)) !== true) return { isMain, opensPr: false, merges: [] }
+  if ((await read($, isOn)) !== true) return { isMain, opensPr: false, merges: [], notes: [] }
   const input = e as unknown as Record<string, unknown> & { tool: string }
   const context = await loopContextOf($, cache)
   const settings = context?.settings ?? settingsOf({})
   const agent = e.agentId === undefined ? undefined : (await read($, agents))[e.agentId]
-  const allowed = { isMain, agentId: e.agentId, agent, opensPr: false, merges: [] as string[] }
+  const allowed = { isMain, agentId: e.agentId, agent, opensPr: false, merges: [] as string[], notes: [] as string[] }
 
   if (isMain && settings.isThinMainThread && (await read($, mode)) === 'coding') {
-    const verdict = mainThreadVerdict(input, settings, await read($, mainThreadReads), $.plugin.root)
+    const verdict = mainThreadVerdict(input, settings, await read($, mainThreadReads), $.plugin.root, await mainThreadAsks($))
     if (!verdict.isAllowed) return { deny: verdict.reason }
     if (verdict.isRead === true) await update($, mainThreadReads, count => count + 1)
   }
@@ -1029,7 +1108,7 @@ export async function decideToolCall($: EngineInterface, cache: LoopCache, e: To
     if (refusal !== undefined) return { deny: refusal }
   }
 
-  const held: Controlled[] = []
+  const held: Risky[] = []
   if (EDIT_TOOLS.includes(input.tool)) {
     const path = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : undefined
     if (path !== undefined && agent?.role === 'dev') {
@@ -1037,37 +1116,80 @@ export async function decideToolCall($: EngineInterface, cache: LoopCache, e: To
       if (refusal !== undefined) return { deny: refusal }
     }
   }
-  const ticketEdit = /^mcp__.+__(transitionJiraIssue|editJiraIssue)$/.test(input.tool) ? String(input.issueIdOrKey ?? '').trim().toUpperCase() : ''
-  if (ticketEdit !== '') {
+  if (TICKET_DELETE.test(input.tool)) held.push({ action: 'delete-ticket', target: String(input.issueIdOrKey ?? 'the ticket').trim().toUpperCase() })
+  const ticketEdit = TICKET_EDIT.test(input.tool) ? String(input.issueIdOrKey ?? '').trim().toUpperCase() : ''
+  if (ticketEdit !== '' && settings.care === 'careful') {
     const owner = await jiraOwnership($, context.project, ticketEdit)
-    if (!owner.isOwn) held.push({ action: 'edit-ticket', target: ticketEdit, reason: owner.why })
+    if (!owner.isOwn) held.push({ action: 'others-ticket', target: ticketEdit, state: owner.why })
   }
+  const asks: Ask[] = []
   if (input.tool === 'Bash' && typeof input.command === 'string') {
     const command = input.command
     for (const step of classifyShell(command)) {
-      const refusal = await shellRefusal($, context, step, command)
+      const refusal = await projectRuleRefusal($, context, step, command)
       if (refusal !== undefined) return { deny: refusal }
-      held.push(...(await controlledIn($, cache, context, step, agent)))
+      const isMerge = step.action === 'pr-merge' && step.isUndo !== true
+      if ((isMerge || (step.action === 'pr-ready' && step.isUndo !== true)) && step.pr === undefined) return { deny: unnamedPrRefusal(step) }
+      if (isMerge && step.pr !== undefined) {
+        const decision = await mergeDecision($, cache, context, step, step.pr)
+        if (decision.deny !== undefined) return { deny: decision.deny }
+        allowed.notes.push(...decision.notes)
+        asks.push(...decision.asks)
+      }
+      if (step.action === 'pr-ready' && step.isUndo !== true && step.pr !== undefined) {
+        const refusal = await readyRefusal($, cache, context, step.pr)
+        if (refusal !== undefined) return { deny: refusal }
+      }
+      if (settings.care === 'careful') held.push(...(await riskyIn($, cache, context, step, agent)))
       if (step.action === 'pr-open') allowed.opensPr = true
       // A merge that runs now, not one armed for later: what happens after it depends on the QA mode (D69).
-      if (step.action === 'pr-merge' && step.isAuto !== true && step.isUndo !== true && step.pr !== undefined) allowed.merges.push(step.pr)
+      if (isMerge && step.isAuto !== true && step.pr !== undefined) allowed.merges.push(step.pr)
     }
   }
-  if (held.length === 0) return allowed
-  const missing = await withUnlocks($, held)
-  return missing.length === 0 ? allowed : { deny: controlledRefusal(missing) }
+  if (held.length > 0) {
+    const missing = await withAsks($, held)
+    if (missing.length > 0) return { deny: riskyRefusal(missing) }
+  }
+  for (const ask of asks) await takeAsk($, ask.action, ask.target)
+  return allowed
 }
 
 /** How long a recorded ask stays usable. */
 const UNLOCK_TTL_MS = 60 * 60_000
 
-/**
- * The controlled actions no recorded ask covers. When every one is covered, their unlocks are
- * used up: one ask, one action on one target (D74).
- */
-async function withUnlocks($: EngineInterface, held: readonly Controlled[]): Promise<Controlled[]> {
+/** One recorded ask, as a gate looks it up. */
+type Ask = { action: AskAction; target: string }
+
+async function liveUnlocks($: EngineInterface) {
   const now = await $.clock.now()
-  const live = (await read($, unlocks)).filter(unlock => now - unlock.at < UNLOCK_TTL_MS)
+  return (await read($, unlocks)).filter(unlock => now - unlock.at < UNLOCK_TTL_MS)
+}
+
+/** Whether the person's ask for this action on this target is recorded and still fresh. */
+async function hasAsk($: EngineInterface, action: AskAction, target: string) {
+  return (await liveUnlocks($)).some(unlock => unlock.action === action && targetKey(unlock.target) === targetKey(target))
+}
+
+/** Uses up the person's ask for this action on this target: one ask, one action. Resolves whether there was one. */
+async function takeAsk($: EngineInterface, action: AskAction, target: string, isUsed = true) {
+  const live = await liveUnlocks($)
+  const found = live.find(unlock => unlock.action === action && targetKey(unlock.target) === targetKey(target))
+  if (found === undefined) return false
+  if (isUsed) await update($, unlocks, () => live.filter(unlock => unlock !== found))
+  return true
+}
+
+/** The tools the person asked the PM to use itself, for their current message (D78). */
+async function mainThreadAsks($: EngineInterface) {
+  return (await liveUnlocks($)).filter(unlock => unlock.action === 'main-thread').map(unlock => unlock.target)
+}
+
+/**
+ * The risky actions no recorded ask covers. When every one is covered, their asks are used
+ * up: one ask, one action on one target (D78).
+ */
+async function withAsks($: EngineInterface, held: readonly Risky[]): Promise<Risky[]> {
+  const live = await liveUnlocks($)
   const used = new Set<Unlock>()
   const missing = held.filter(entry => {
     const found = live.find(unlock => !used.has(unlock) && unlock.action === entry.action && targetKey(unlock.target) === targetKey(entry.target))
@@ -1079,47 +1201,72 @@ async function withUnlocks($: EngineInterface, held: readonly Controlled[]): Pro
 }
 
 /**
- * Whether a force-push could overwrite a reviewed commit: the pushed branch has an open PR
- * with a review verdict recorded. Where the PRs cannot be read, it counts as reviewed.
+ * Whether a branch holds pushed work, read live (D78): `origin` has it. A read that fails is
+ * tried again once; when it still fails, the push counts as over pushed work, with why.
  */
-async function isReviewedBranch($: EngineInterface, cache: LoopCache, context: LoopContext, branch: string) {
-  const prs = await openPullRequests($, cache, context).catch(() => undefined)
-  if (prs === undefined) return true
-  const pr = prs.find(candidate => targetKey(candidate.branch) === targetKey(branch))
-  return pr !== undefined && (await readVerdicts($, context.project))[pr.ref] !== undefined
+async function pushedState($: EngineInterface, context: LoopContext, branch: string): Promise<string | undefined> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await $.process.run(['git', 'ls-remote', '--exit-code', '--heads', 'origin', branch], { cwd: context.project.root }).catch(() => undefined)
+    if (result?.exitCode === 0) return `${branch} is on origin`
+    if (result?.exitCode === 2) return undefined
+  }
+  return `godmode could not read whether ${branch} is on origin`
 }
 
+/** A branch godmode made: its ticket branch prefix, and no open PR on it from someone else. */
+async function isOwnBranch($: EngineInterface, cache: LoopCache, context: LoopContext, branch: string) {
+  if (!targetKey(branch).startsWith(context.settings.branchPrefix.toLowerCase())) return false
+  const pr = (await openPullRequests($, cache, context).catch(() => [])).find(candidate => targetKey(candidate.branch) === targetKey(branch))
+  if (pr === undefined) return true
+  return (await prOwnerOf($, cache, context, pr.ref)).kind === 'mine'
+}
+
+/** The PR actions that act on a PR: on someone else's, a risky action (D78). Comments and reviews that do not approve stay free. */
+const ACTS_ON_PR: readonly string[] = ['pr-ready', 'pr-edit']
+
 /**
- * The controlled actions in one shell step (D74): approving a PR (unless the setting lets
- * godmode approve once review and QA passed), closing a PR, deleting a branch whose name does
- * not start with godmode's branch prefix, force-pushing a branch whose PR has a review
- * verdict, and a raw host API write. Every other write is free.
+ * The risky actions in one shell step under "careful" (D78): approving or closing a PR,
+ * deleting a branch godmode did not make, force-pushing over pushed work, and acting on someone
+ * else's PR. Merging is the merge gate's. Each is read live, and a read that fails asks the
+ * person, saying so. Every other write is free.
  */
-async function controlledIn($: EngineInterface, cache: LoopCache, context: LoopContext, step: ShellStep, agent: DispatchedAgent | undefined): Promise<Controlled[]> {
-  const { settings } = context
-  const pr = step.pr ?? 'unnamed PR'
-  const found: Controlled[] = []
-  if (step.action === 'pr-approve' && settings.prApproval === 'ask') found.push({ action: 'approve-pr', target: pr })
+async function riskyIn($: EngineInterface, cache: LoopCache, context: LoopContext, step: ShellStep, agent: DispatchedAgent | undefined): Promise<Risky[]> {
+  const pr = step.pr ?? 'the current branch\'s PR'
+  const found: Risky[] = []
+  if (step.action === 'pr-approve') found.push({ action: 'approve-pr', target: pr })
   if (step.verb === 'gh pr close') found.push({ action: 'close-pr', target: pr })
-  for (const branch of step.deletes ?? []) if (!targetKey(branch).startsWith(settings.branchPrefix.toLowerCase())) found.push({ action: 'delete-branch', target: branch })
+  if (step.isApi === true && step.action === 'host-write' && step.endpoint !== undefined && /\/pulls\/\d+\/reviews/.test(step.endpoint)) found.push({ action: 'approve-pr', target: step.endpoint })
+  for (const branch of step.deletes ?? []) if (!(await isOwnBranch($, cache, context, branch))) found.push({ action: 'delete-branch', target: branch })
   if (step.action === 'force-push') {
     const branch = step.branch ?? agent?.branch
-    if (branch === undefined || (await isReviewedBranch($, cache, context, branch))) found.push({ action: 'force-push', target: branch ?? 'the current branch' })
+    const state = branch === undefined ? 'the current branch, which godmode cannot name' : await pushedState($, context, branch)
+    if (state !== undefined) found.push({ action: 'force-push', target: branch ?? 'the current branch', state })
   }
-  if (step.action === 'host-write' || step.isApi === true) found.push({ action: 'host-write', target: step.endpoint ?? (step.pr === undefined ? 'gh api' : `PR ${step.pr}`) })
+  // Merging, approving and closing are risky on any PR already; the rest acts on someone else's work.
+  const isOthersStep = ACTS_ON_PR.includes(step.action) && step.pr !== undefined && step.verb !== 'gh pr close'
+  if (isOthersStep && step.pr !== undefined) {
+    const owner = await prOwnerOf($, cache, context, step.pr)
+    if (owner.kind === 'others') found.push({ action: 'others-pr', target: step.pr, state: `opened by ${owner.author}` })
+    if (owner.kind === 'unknown') found.push({ action: 'others-pr', target: step.pr, state: owner.reason })
+  }
+  if ((step.action === 'push' || step.action === 'force-push') && step.branch !== undefined) {
+    const open = (await openPullRequests($, cache, context).catch(() => [])).find(candidate => targetKey(candidate.branch) === targetKey(step.branch ?? ''))
+    const owner = open === undefined ? undefined : await prOwnerOf($, cache, context, open.ref)
+    if (open !== undefined && owner?.kind === 'others') found.push({ action: 'others-pr', target: open.ref, state: `its branch ${step.branch} is ${owner.author}'s PR` })
+  }
   return found
 }
 
-/** The `allow_once` tool: the PM records the person's explicit ask for one controlled action (D74). */
+/** The `allow_once` tool: the PM records the person's explicit ask (D78). */
 export const ALLOW_ONCE_TOOL: ToolSpec & { name: 'allow_once' } = {
   name: 'allow_once',
   description:
-    'Record that the person explicitly asked, in their current message, for one controlled action on one target: approving or closing a PR, deleting a branch godmode did not create, force-pushing over a reviewed commit, editing a ticket godmode did not file, or a raw host API write. It lets that one action run once, by you or the agent you dispatch for it. Only the main thread may call it, and only on the person\'s own words, never on your initiative.',
+    'Record that the person explicitly asked, in their current message, for one action that godmode asks about first: merging a PR (merge), merging one whose conditions are not met (merge-anyway), approving or closing a PR, deleting a branch or a ticket, force-pushing over pushed work, acting on someone else\'s PR or ticket; or doing work on this thread yourself (main-thread, target: the tool), or one more agent past the cap (extra-agent). It lets that one action run once, by you or the agent you dispatch for it; main-thread holds until the person\'s next message. Only the main thread may call it, and only on the person\'s own words, never on your initiative.',
   inputSchema: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: [...CONTROLLED] },
-      target: { type: 'string', description: 'The PR number, the branch, the ticket key or the API endpoint, as the refusal named it.' },
+      action: { type: 'string', enum: [...ASKS] },
+      target: { type: 'string', description: 'The PR number, the branch, the ticket key or the tool, as the refusal named it.' },
       ask: { type: 'string', description: 'The person\'s words that ask for it, quoted.' },
     },
     required: ['action', 'target', 'ask'],
@@ -1129,17 +1276,24 @@ export const ALLOW_ONCE_TOOL: ToolSpec & { name: 'allow_once' } = {
 
 /** Serves `allow_once`: the main thread alone records an ask; an agent never unlocks anything. */
 export async function serveAllowOnce($: EngineInterface, e: { agentId?: string } & Record<string, unknown>) {
-  if ((await read($, isOn)) !== true) return { deny: 'godmode is off, so nothing is controlled.' }
+  if ((await read($, isOn)) !== true) return { deny: 'godmode is off, so it asks nothing first.' }
   if (e.agentId !== undefined) return { deny: 'Only the PM records the person\'s ask, on the main thread. Report to the PM what you need the person to ask for. Nothing was recorded.' }
-  const action = CONTROLLED.find(name => name === e.action)
+  const action = ASKS.find(name => name === e.action)
   const target = typeof e.target === 'string' ? e.target.trim() : ''
   const ask = typeof e.ask === 'string' ? e.ask.trim() : ''
   if (action === undefined || target === '' || ask === '') {
-    return { deny: `allow_once needs \`action\` (${CONTROLLED.join(', ')}), \`target\` and \`ask\`, the person's own words. Nothing was recorded.` }
+    return { deny: `allow_once needs \`action\` (${ASKS.join(', ')}), \`target\` and \`ask\`, the person's own words. Nothing was recorded.` }
   }
   const at = await $.clock.now()
-  await update($, unlocks, current => [...current.filter(unlock => at - unlock.at < UNLOCK_TTL_MS), { action: action satisfies ControlledAction, target, ask, at }])
-  return { result: `Recorded: the person asked for ${action} on ${target}. It runs once, within the hour.` }
+  await update($, unlocks, current => [...current.filter(unlock => at - unlock.at < UNLOCK_TTL_MS), { action, target, ask, at }])
+  const lasts = action === 'main-thread' ? 'It holds until their next message.' : 'It runs once, within the hour.'
+  return { result: `Recorded: the person asked for ${action} on ${target}. ${lasts}` }
+}
+
+/** The person's next message ends the asks to work on this thread: each holds for one message (D78). */
+export async function endMainThreadAsks($: EngineInterface) {
+  const current = await read($, unlocks)
+  if (current.some(unlock => unlock.action === 'main-thread')) await update($, unlocks, () => current.filter(unlock => unlock.action !== 'main-thread'))
 }
 
 /** A tool result's text as the model would read it. */
@@ -1235,6 +1389,7 @@ export async function afterToolCall(
   if (context !== undefined) {
     for (const pr of decision.merges) await clearFixRoundsOfPr($, context, pr)
   }
+  extra.push(...decision.notes)
   if (context?.settings.qaMode === 'human-staging') {
     for (const pr of decision.merges) extra.push(...(await afterStagingMerge($, context, pr)))
   }
@@ -1294,13 +1449,14 @@ export const conventionsBrief = (context: Pick<LoopContext, 'project' | 'note'>)
 }
 
 /** What godmode adds to a dev agent's brief: its ticket, worktree, and the files other PRs hold (D38, D47). */
-export const devBrief = (ticket: { id: string; title: string }, worktree: string, branch: string, held: readonly PullRequest[] | undefined) => {
+export const devBrief = (ticket: { id: string; title: string }, worktree: string, branch: string, held: readonly PullRequest[] | undefined, unlisted?: string) => {
   const lines = [
     '---',
     'From godmode (added to this brief by the mod):',
     `- Ticket: ${ticket.id}, "${ticket.title}".`,
     `- Your worktree: ${worktree}, on branch ${branch}. Work, run commands and commit only there: an edit outside it is refused.`,
   ]
+  if (unlisted !== undefined) lines.push(`- godmode could not list the open PRs' files just now (${unlisted}). Before editing a file others may be changing, check \`gh pr list\`, and stop and report a clash.`)
   if (held !== undefined) {
     const files = held.flatMap(pr => pr.files.map(file => `  - ${file} (PR #${pr.ref}${pr.author === '' ? '' : `, ${pr.author}`})`))
     if (files.length === 0) {
@@ -1331,12 +1487,18 @@ async function planDevSpawn($: EngineInterface, cache: LoopCache, context: LoopC
   if (id === undefined) {
     return { deny: 'A dev agent builds one ticket, and this brief names none. Name the ticket (e.g. T-3) in the brief, then dispatch again.' }
   }
-  const ticket = (await backend.list({ statuses: TICKET_STATUSES })).find(header => header.id.toUpperCase() === id)
+  let tickets: TicketHeader[]
+  try {
+    tickets = await backend.list({ statuses: TICKET_STATUSES })
+  } catch (error) {
+    return { deny: `godmode could not read the tickets just now (${messageOf(error)}), so it cannot make ${id}'s worktree and brief. Try again once they can be read.` }
+  }
+  const ticket = tickets.find(header => header.id.toUpperCase() === id)
   if (ticket === undefined) return { deny: `The brief names ${id}, and there is no such ticket. File it first, or fix the id.` }
   if (ticket.status === 'done') return { deny: `${ticket.id} is done; a dev agent does not start on a done ticket.` }
   if (settings.requiresReadyTicket && !ticket.ready) {
     return {
-      deny: `${ticket.id} is not marked ready: a dev agent starts only on a ticket the person said go for. Once they have, mark it with ticket_move (ready: true) and dispatch again. To change the rule, ${howToChange(SETTING.requireReadyTicket)}.`,
+      deny: `${ticket.id} is not marked ready: a dev agent starts only on a ticket the person said go for. When the person says go, mark it with ticket_move (ready: true) and dispatch again.`,
     }
   }
   const pastLimit = await fixRoundRefusal($, context, ticket)
@@ -1348,18 +1510,24 @@ async function planDevSpawn($: EngineInterface, cache: LoopCache, context: LoopC
   if (ticket.branch === undefined) await backend.move(ticket.id, { branch }).catch(() => undefined)
 
   let held: PullRequest[] | undefined
+  let unlisted: string | undefined
   if (settings.isContentionOn) {
-    try {
-      held = (await openPullRequests($, cache, context, true)).filter(pr => pr.branch !== branch && pr.files.length > 0)
-    } catch (error) {
-      return {
-        deny: `godmode could not list the open PRs and their files (${messageOf(error)}), so the dev agent did not start: without that list it could edit a file another PR holds. Try again once the host answers. To change the rule, ${howToChange(SETTING.contention)}.`,
-      }
-    }
+    // A list that cannot be read never stops the dispatch (D78): the brief says so instead.
+    held = await openPullRequests($, cache, context, true).then(
+      prs => prs.filter(pr => pr.branch !== branch && pr.files.length > 0),
+      (error: unknown) => {
+        unlisted = messageOf(error)
+        return undefined
+      },
+    )
   }
   const conventions = conventionsBrief(context)
   return {
-    input: { ...e, prompt: [e.prompt, devBrief(ticket, worktree, branch, held), conventions].filter(part => part !== undefined).join('\n\n'), cwd: worktree },
+    input: {
+      ...e,
+      prompt: [e.prompt, devBrief(ticket, worktree, branch, held, unlisted), conventions].filter(part => part !== undefined).join('\n\n'),
+      cwd: worktree,
+    },
     record: { role: 'dev', ticket: ticket.id, worktree, branch, name: e.name },
   }
 }
@@ -1373,10 +1541,10 @@ export async function planSpawn($: EngineInterface, cache: LoopCache, e: AgentSp
   const context = await loopContextOf($, cache)
   const settings = context?.settings ?? settingsOf({})
   const running = (await $.agent.list()).filter(agent => RUNNING_STATUSES.includes(agent.status))
-  if (running.length >= settings.agentCap) {
+  if (running.length >= settings.agentCap && !(await takeAsk($, 'extra-agent', 'agent'))) {
     const names = running.map(agent => agent.description || agent.type).slice(0, 8).join('; ')
     return {
-      deny: `godmode runs at most ${settings.agentCap} agents at once, and ${running.length} are running (${names}). Wait for one to finish or stop one, then dispatch again. To change the cap, ${howToChange(SETTING.agentCap)}.`,
+      deny: `godmode runs at most ${settings.agentCap} agents at once, and ${running.length} are running (${names}). Wait for one to finish, or stop one, then dispatch again. If the person asks for this one to start now, record their words with mcp__godmode__allow_once (action: extra-agent, target: agent), then dispatch again.`,
     }
   }
   const role = roleOf(e.subagentType)

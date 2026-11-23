@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { answerIssueLines, checkAnswer, cleanAnswers, jiraProjectKeyOf, jiraSiteOf } from '../hooks/answers'
 import { sitesIn, unknownJqlValues } from '../hooks/jira'
-import { questionsFor, resolveAnswer } from '../hooks/questionnaire'
+import { peopleQaQuestion, resolveAnswer } from '../hooks/questionnaire'
 import type { Question } from '../hooks/questionnaire'
 import { pnpmWorkspacesIn, scriptUseOf } from '../hooks/verify'
 import type { ScanFacts } from '../types'
@@ -79,9 +79,7 @@ test('a saved note is repaired where safe and flagged where not, each with the t
 
 /** The QA signals question as setup asks it with Jira and people testing the PR on GitHub. */
 const signalsQuestion = (): Question => {
-  const qa = questionsFor(facts(), 'full').find(question => question.key === 'qaHuman')
-  const where = qa?.followUps?.({ qaHuman: true })[0]
-  const signals = where?.followUps?.({ qaHuman: true, tracker: 'jira', qaMode: 'human-pr' }).find(question => question.key === 'qaSignals')
+  const signals = peopleQaQuestion(facts()).followUps?.({ tracker: 'jira', qaMode: 'human-pr' }).find(question => question.key === 'qaSignals')
   if (signals === undefined) throw new Error('no signals question')
   return signals
 }

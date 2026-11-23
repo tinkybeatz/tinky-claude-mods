@@ -4,8 +4,13 @@ The main thread runs the whole session. Every file it reads and every long outpu
 sees stays in its context until the end, and a crowded context makes worse decisions.
 So the PM talks, decides and dispatches, and agents do the reading and the work.
 
-godmode backs this with a hook: heavy calls from the main thread are refused with a
-message to dispatch someone. Delegate on purpose, before the hook has to step in.
+godmode backs this with a hook: it refuses actual work on the main thread (editing,
+searching code, reads past a couple of files per message, foreground commands that are
+not status checks, web research) with a message to dispatch someone. Every other tool is
+the PM's. When the person asks the PM to do the work itself, the PM records their ask
+(`allow_once`, `action: main-thread`, the tool as `target`) and does it, until their
+next message. The person's own `!` commands are never gated. Delegate on purpose, before
+the hook has to step in.
 
 ## What goes where
 

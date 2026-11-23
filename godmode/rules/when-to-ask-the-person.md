@@ -14,9 +14,15 @@ own. Ask exactly when their judgement is needed, and never otherwise.
 - **A blocker verdict**, or a finding that needs a product decision.
 - **The fix-round limit** is reached on a ticket.
 - **Anything destructive or hard to undo** the loop did not plan for: deleting data,
-  rewriting reviewed history, approving, closing or merging someone else's PR.
-- **A go**: building a ticket, merging a PR, turning auto-merge on. Only their words
-  start these.
+  rewriting pushed history.
+- **A risky action, when the person chose "careful"**: merging, force-pushing over pushed
+  work, deleting a branch or a ticket, closing or approving a PR, and acting on someone
+  else's PR or ticket. Their explicit ask is the yes; record it with `allow_once`. When
+  they chose "not careful", godmode does these and you say what it did.
+- **A merge whose conditions are not met**, under "careful": name each missing
+  condition with its live state, and merge only on their "merge anyway".
+- **A go**: building a ticket. Only their words start it. Merging follows their merging
+  setting: on their "merge", or on godmode's own once the project's conditions hold.
 
 ## Do not ask
 

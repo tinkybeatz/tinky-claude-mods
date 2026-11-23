@@ -6,6 +6,7 @@ import { pendingUpdates } from './change-setup'
 import { COMMAND_KEYS, commandKey, scanProject } from './scan'
 import { fingerprintOf, godmodeVersionOf, notePath } from './storage'
 import type { Answer, NoteLookup, Project } from './storage'
+import { PROJECT_RULES_FILE } from './project-rules'
 import { TICKET_RULES_FILE, TICKET_RULES_KEY } from './ticket-rules'
 import { verifyAnswers } from './verify'
 
@@ -64,7 +65,12 @@ async function conventionsIssues($: EngineInterface, project: Project, found: Fo
   for (const file of found.shared.conventions) {
     const print = await fingerprintOf($, project, file.path)
     if (print === undefined) issues.push({ what: `the conventions file ${file.path} is gone`, fix: 'restore it, or drop it from the conventions (`/godmode setup`, then setup_finish)' })
-    else if (print !== file.fingerprint) issues.push({ what: `${file.path} was edited by hand since setup`, fix: `read it, then save it as checked: setup_finish with \`conventions: ["${file.path}"]\`` })
+    else if (print !== file.fingerprint && file.path.endsWith(PROJECT_RULES_FILE)) {
+      issues.push({
+        what: `${file.path} was edited by hand since it was saved, and godmode still follows the saved setup`,
+        fix: `read it; for each rule that now differs from the setup, ask its topic again with setup_questionnaire (\`change\`), offering the file's value; then setup_finish with \`conventions: ["${file.path}"]\``,
+      })
+    } else if (print !== file.fingerprint) issues.push({ what: `${file.path} was edited by hand since setup`, fix: `read it, then save it as checked: setup_finish with \`conventions: ["${file.path}"]\`` })
   }
   return { issues, held: found.shared.conventions.length - issues.length }
 }

@@ -6,7 +6,7 @@ function hooks. This repository holds several mods, one folder each.
 | Mod | What it does |
 | --- | --- |
 | [`dispatch-panel`](dispatch-panel/) | A side panel listing dispatched agents and background shells, with their purpose, input and output tokens and duration, in Active and Finished tabs, coloured by what each agent is doing. |
-| [`godmode`](godmode/) | An agentic development loop for any project: a PM main thread files tickets and dispatches dev, review, QA and research agents, with hard rules in code. Being tested; expect changes. |
+| [`godmode`](godmode/) | An agentic development loop for any project, solo or with others: a PM main thread files tickets and dispatches dev, review, QA and research agents. It follows the project's own rules (merge conditions, QA, tickets, conventions), set up from two questions and a short summary and kept in a plain-language rules file, and asks before risky actions only if you want it to. Its own side pane, one of four ways to show it is on, lists what waits on you, its tickets and its agents. Being tested; expect changes. |
 
 ## Installing on a new machine
 
@@ -55,7 +55,16 @@ claude plugin update dispatch-panel@tinky-claude-mods
 ```
 
 Then restart Claude Code (or run `/reload-plugins` in an open session). `/plugin` →
-**Installed** also has **Update now**. After a godmode update, `/godmode audit` checks
+**Installed** also has **Update now**. Since 0.8.0, godmode's setup starts with two questions,
+alone or with others, and careful or not, then shows one summary of what it found and
+pre-filled, with where each value came from, and asks only what is left. A PR merges on the
+conditions the project sets (approvals, green CI, QA, or none), checked live on every PR,
+and the rules are kept in plain language in `project-rules.md`, which you can edit. Older
+setups keep working; `/godmode setup` offers the two questions and maps the old answers
+for your yes. godmode can show that it is on with a mode label, a hint tag, a band, or its
+own side pane (what waits on you, its tickets, a running try, its agents and shells),
+which sits beside the dispatch panel without clashing; pick one with `/godmode setup`.
+After a godmode update, `/godmode audit` checks
 each project's saved setup against the new version and the project as it is now, in the
 open session; it changes nothing until you pick the fixes.
 

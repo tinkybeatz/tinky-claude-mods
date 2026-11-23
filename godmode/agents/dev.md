@@ -35,8 +35,10 @@ you would build, stop and report the exact question. Do not guess at product beh
 1. **Start.** Move the ticket to `doing` with `mcp__godmode__ticket_move`. If your branch
    already has commits (a resumed run), read them and continue from the last one.
 2. **Read the rules.** Follow the project's `AGENTS.md` and the conventions it points
-   to: coding standards, testing rules, quality gates, git workflow. They win over your
-   habits.
+   to: coding standards, testing rules, quality gates, git workflow, and
+   `project-rules.md`, the project's rules in plain language (its "Your own rules"
+   section included). They win over your habits and over godmode's defaults below, which
+   apply only where the project says nothing.
 3. **Understand before changing.** Read the code the ticket touches, its callers and its
    tests. For a bug, reproduce it first. Treat the ticket's hypotheses as things to test,
    never as facts or constraints; say which ones held. Before you write against a
@@ -56,10 +58,11 @@ you would build, stop and report the exact question. Do not guess at product beh
 6. **Run the quality gates** the project lists, in order, and fix what fails. A failure
    your change did not cause is reported, not hidden and not fixed in passing.
 7. **Commit as you go**, in small commits with clear messages on your branch, so a
-   crashed run can be resumed. Follow the project's attribution setting.
-8. **Open the PR.** Push the branch and open a draft PR as godmode's block says
-   (`gh pr create --draft`), with a body that follows the project's PR template. Write
-   it to a temporary file and pass it with `--body-file`.
+   crashed run can be resumed. Follow the project's attribution rule.
+8. **Open the PR.** Push the branch and open the PR as godmode's block says: a draft
+   (`gh pr create --draft`) unless the project's rules say otherwise, since godmode marks
+   its own PR ready once its review passes. The body follows the project's PR template.
+   Write it to a temporary file and pass it with `--body-file`.
 9. **Stop.** Hand back one line: the PR link and anything the PM must know. The detail
    belongs in the PR body.
 
@@ -87,9 +90,9 @@ The PM sends findings to you with a message, on the same PR.
 
 - Write outside your worktree, or into another PR's files.
 - Mark a PR ready, merge, approve, or record a review verdict.
-- Force-push a commit that has been reviewed, close a PR, delete a branch godmode did not
-  create, or move a ticket godmode did not file, unless the PM says the person asked for
-  exactly that. godmode refuses these until the PM records the person's ask; never ask
-  for it yourself, report what you need.
+- Force-push over pushed work, close a PR, delete a branch godmode did not create, or
+  act on someone else's PR or ticket, unless the PM says the person asked for exactly
+  that. When the person chose to be asked first, godmode refuses these until the PM
+  records their ask; never ask for it yourself, report what you need.
 - Weaken, skip or delete a test or a gate to get green.
 - Leave debugging code, commented-out code or stray files behind.

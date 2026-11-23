@@ -5,9 +5,9 @@ import type { AgentInfo, AgentSpawnInput, On } from 'claude-code'
 import { fableOutcome } from '../hooks/role'
 import type { Answer, ModelTier, AgentRole } from '../hooks/storage'
 import { markdownBackend, otherBackend } from '../hooks/tickets'
-import { makeJira, mountJira, SERVER, sidePath } from './jira-world'
+import { makeJira, mountJira, RUNNER_SERVER, SERVER, sidePath } from './jira-world'
 import { FIRST_COMMIT, makeWorld, mountWorld, REPO, setUpProject, worldEngine } from './world'
-import type { Gh, World } from './world'
+import type { Gh, GhCheck, World } from './world'
 
 // Spelled in pieces: a shell guard outside this repo blocks any command line that holds it.
 const PR_CREATE = ['gh', 'pr', 'create'].join(' ')
@@ -150,61 +150,82 @@ test('agents write freely: edits, commits, pushes, a draft PR and comments, a te
   expect(loop.ran).toHaveLength(7)
 })
 
-test('a controlled action is refused until the person\'s ask is recorded, then runs once on that target only', async ($, on) => {
+test('careful: a risky action is refused until the person\'s ask is recorded, then runs once on that target only', async ($, on) => {
   const loop = await startLoop($, on)
 
   const refused = await bash($, 'gh pr close 9', 'agent-x')
-  expect(refused.deny).toContain('controlled action: closing a PR (9)')
-  expect(refused.deny).toContain('ask for it explicitly and it goes through')
+  expect(refused.deny).toContain('risky action, and godmode asks the person first: closing a PR (#9)')
+  expect(refused.deny).toContain('such as "close #9"')
   expect(refused.deny).toContain('allow_once (action: close-pr, target: 9)')
 
   expect((await allowOnce($, 'close-pr', '#9')).deny).toBeUndefined()
-  expect((await bash($, 'gh pr close 12', 'agent-x')).deny).toContain('closing a PR (12)')
+  expect((await bash($, 'gh pr close 12', 'agent-x')).deny).toContain('closing a PR (#12)')
   expect((await bash($, 'gh pr close 9', 'agent-x')).deny).toBeUndefined()
   // One ask, one use.
-  expect((await bash($, 'gh pr close 9', 'agent-x')).deny).toContain('closing a PR (9)')
+  expect((await bash($, 'gh pr close 9', 'agent-x')).deny).toContain('closing a PR (#9)')
   expect(loop.ran).toEqual(['Bash gh pr close 9'])
   expect(loop.asked).toEqual([])
 })
 
-test('an agent cannot record an ask: only the main thread unlocks a controlled action', async ($, on) => {
+test('not careful: the same risky actions just run, others\' PRs included', async ($, on) => {
+  const loop = await startLoop($, on, { personal: { care: 'not-careful' } })
+
+  for (const command of ['gh pr close 9', 'gh pr review 9 --approve', 'git push origin --delete deps', 'git push --force-with-lease origin deps', 'gh pr ready 9']) {
+    expect([command, (await bash($, command, 'agent-x')).deny]).toEqual([command, undefined])
+  }
+  expect(loop.ran).toHaveLength(5)
+  expect(loop.asked).toEqual([])
+})
+
+test('an agent cannot record an ask: only the main thread unlocks a risky action', async ($, on) => {
   const loop = await startLoop($, on)
 
   const byAgent = await allowOnce($, 'approve-pr', '9', 'agent-x')
   expect(byAgent.deny).toContain('Only the PM records the person\'s ask')
 
-  expect((await bash($, 'gh pr review 9 --approve', 'agent-x')).deny).toContain('approving a PR (9)')
+  expect((await bash($, 'gh pr review 9 --approve', 'agent-x')).deny).toContain('approving a PR (#9)')
   expect(loop.ran).toEqual([])
 })
 
-test('deleting a branch godmode did not create, and force-pushing over a reviewed PR, are controlled; godmode\'s own unreviewed branch is free', async ($, on) => {
+test('careful: deleting a branch godmode did not make and force-pushing over pushed work ask first; godmode\'s own unpushed branch is free', async ($, on) => {
+  const loop = await startLoop($, on)
+  loop.world.pushed = ['deps', 'godmode/t-1-export-button']
+
+  expect((await bash($, 'git push origin --delete deps', 'agent-x')).deny).toContain('deleting a branch (deps)')
+  expect((await bash($, 'git branch -D godmode/t-3-scratch', 'agent-x')).deny).toBeUndefined()
+  expect((await bash($, 'git push --force-with-lease origin godmode/t-3-scratch', 'agent-x')).deny).toBeUndefined()
+  const forced = await bash($, 'git push --force-with-lease origin godmode/t-1-export-button', 'agent-x')
+  expect(forced.deny).toContain('force-pushing over pushed work (godmode/t-1-export-button: godmode/t-1-export-button is on origin)')
+  // Pushing to a teammate's PR branch is acting on their work.
+  expect((await bash($, 'git push origin deps', 'agent-x')).deny).toContain('acting on someone else\'s PR (#9: its branch deps is teammate\'s PR)')
+  expect(loop.ran).toEqual(['Bash git branch -D godmode/t-3-scratch', 'Bash git push --force-with-lease origin godmode/t-3-scratch'])
+})
+
+test('careful: approving a PR, marking someone else\'s ready or editing it ask first; the person\'s own PR is theirs to act on', async ($, on) => {
   const loop = await startLoop($, on)
 
-  expect((await bash($, 'git push origin --delete deps', 'agent-x')).deny).toContain('deleting a branch godmode did not create (deps)')
-  expect((await bash($, 'git push --force-with-lease origin godmode/t-1-export-button', 'agent-x')).deny).toBeUndefined()
-
-  await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'change-request', agentId: await reviewer($) })
-  const forced = await bash($, 'git push --force-with-lease origin godmode/t-1-export-button', 'agent-x')
-  expect(forced.deny).toContain('force-pushing over a reviewed commit (godmode/t-1-export-button)')
-  expect(loop.ran).toEqual(['Bash git push --force-with-lease origin godmode/t-1-export-button'])
+  expect((await bash($, 'gh pr review 12 --approve', 'agent-x')).deny).toContain('approving a PR (#12)')
+  expect((await bash($, 'gh pr ready 9', 'agent-x')).deny).toContain('acting on someone else\'s PR (#9: opened by teammate)')
+  expect((await bash($, 'gh pr edit 9 --add-label bug', 'agent-x')).deny).toContain('acting on someone else\'s PR (#9: opened by teammate)')
+  expect((await bash($, 'gh pr edit 12 --add-label bug', 'agent-x')).deny).toBeUndefined()
+  expect(loop.ran).toEqual(['Bash gh pr edit 12 --add-label bug'])
 })
 
-test('approving a PR is controlled by default; with approvals on once passed, the verdict gate holds it instead', async ($, on) => {
-  const loop = await startLoop($, on, { personal: { prApproval: 'when-passed' } })
+test('a PR\'s owner is read live: a failed read of the person\'s login is tried again, and never kept', async ($, on) => {
+  let failures = 2
+  const loop = await startLoop($, on)
+  loop.world.reject = run => (run.argv.join(' ') === 'gh api user --jq .login' && failures-- > 0 ? 'gh timed out' : undefined)
 
-  const early = await bash($, 'gh pr review 12 --approve', 'agent-x')
-  expect(early.deny).toContain('approved')
-  expect(early.deny).not.toContain('controlled action')
-
-  await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'clean', agentId: await reviewer($) })
-  expect((await bash($, 'gh pr review 12 --approve', 'agent-x')).deny).toBeUndefined()
-  expect(loop.ran).toEqual(['Bash gh pr review 12 --approve'])
+  // Both reads fail: godmode cannot tell, so it asks the person, saying why.
+  expect((await bash($, 'gh pr edit 9 --add-label bug', 'agent-x')).deny).toContain('gh could not read your own login')
+  // The next call reads again, and now it answers.
+  expect((await bash($, 'gh pr edit 12 --add-label bug', 'agent-x')).deny).toBeUndefined()
 })
 
-/** A Jira project PROD where the person (`acc-me`) created PROD-5748 by hand and a colleague created PROD-12. */
+/** A Jira project PROD where the person (`acc-me`) created PROD-48 by hand and a colleague created PROD-12. */
 const prodBoard = (overrides: Parameters<typeof makeJira>[0] = {}) => {
   const jira = makeJira({ projects: [{ key: 'PROD', name: 'Product' }], account: 'acc-me', ...overrides })
-  jira.issues.set('PROD-5748', { key: 'PROD-5748', summary: 'Mine', status: 'To Do', creator: 'acc-me' })
+  jira.issues.set('PROD-48', { key: 'PROD-48', summary: 'Mine', status: 'To Do', creator: 'acc-me' })
   jira.issues.set('PROD-12', { key: 'PROD-12', summary: 'Sam\'s', status: 'To Do', creator: 'acc-sam' })
   return jira
 }
@@ -214,31 +235,51 @@ const ON_PROD = { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1
 const transition = ($: Engine, key: string) =>
   call($, { tool: 'mcp__claude_ai_Atlassian__transitionJiraIssue', cloudId: 'acme.atlassian.net', issueIdOrKey: key, agentId: 'agent-x' })
 
-test('a Jira ticket the person created by hand moves freely; a colleague\'s is controlled until the person asks for it', async ($, on) => {
+test('careful: a Jira ticket the person created by hand moves freely; a colleague\'s asks first until the person asks for it', async ($, on) => {
   const jira = prodBoard()
   const loop = await startLoop($, on, { shared: ON_PROD, personal: { jiraServer: SERVER }, beneath: below => mountJira(below, jira) })
 
-  expect((await transition($, 'prod-5748')).deny).toBeUndefined()
+  expect((await transition($, 'prod-48')).deny).toBeUndefined()
   const refused = await transition($, 'PROD-12')
-  expect(refused.deny).toContain('moving or editing a ticket that is neither godmode\'s nor created by you (PROD-12: someone else created PROD-12)')
+  expect(refused.deny).toContain('acting on someone else\'s ticket (PROD-12: someone else created PROD-12)')
   expect((await call($, { tool: 'mcp__godmode__ticket_move', id: 'PROD-12', status: 'doing' })).deny).toContain('(PROD-12: someone else created PROD-12)')
 
-  await allowOnce($, 'edit-ticket', 'PROD-12')
+  await allowOnce($, 'others-ticket', 'PROD-12')
   expect((await transition($, 'PROD-12')).deny).toBeUndefined()
   expect(loop.ran).toEqual(['mcp__claude_ai_Atlassian__transitionJiraIssue', 'mcp__claude_ai_Atlassian__transitionJiraIssue'])
-  // The account and each creator are read once.
-  await transition($, 'PROD-5748')
-  expect(jira.calls.filter(found => found.tool === 'atlassianUserInfo')).toHaveLength(1)
-  expect(jira.calls.filter(found => found.tool === 'getJiraIssue' && found.args.issueIdOrKey === 'PROD-5748')).toHaveLength(1)
+  // The account is read live on each check; each issue's creator, which never changes, once.
+  await transition($, 'PROD-48')
+  expect(jira.calls.filter(found => found.tool === 'atlassianUserInfo')).toHaveLength(5)
+  expect(jira.calls.filter(found => found.tool === 'getJiraIssue' && found.args.issueIdOrKey === 'PROD-48')).toHaveLength(1)
+})
+
+test('not careful: a colleague\'s Jira ticket just moves, with no ownership read', async ($, on) => {
+  const jira = prodBoard()
+  const loop = await startLoop($, on, { shared: ON_PROD, personal: { jiraServer: SERVER, care: 'not-careful' }, beneath: below => mountJira(below, jira) })
+
+  expect((await transition($, 'PROD-12')).deny).toBeUndefined()
+  expect(loop.ran).toEqual(['mcp__claude_ai_Atlassian__transitionJiraIssue'])
+  expect(jira.calls.filter(found => found.tool === 'atlassianUserInfo')).toHaveLength(0)
+})
+
+test('the Atlassian account is read in the shape the server answers (`{ data: { accountId } }`), and deleting a ticket asks first', async ($, on) => {
+  const jira = prodBoard({ flavour: 'runner' })
+  await startLoop($, on, { shared: ON_PROD, personal: { jiraServer: RUNNER_SERVER }, beneath: below => mountJira(below, jira) })
+
+  expect((await transition($, 'PROD-48')).deny).toBeUndefined()
+  const removed = await call($, { tool: 'mcp__claude_ai_Atlassian__deleteJiraIssue', issueIdOrKey: 'PROD-48', agentId: 'agent-x' })
+  expect(removed.deny).toContain('deleting a ticket (PROD-48)')
 })
 
 test('when the person\'s Atlassian account cannot be read, a ticket godmode did not file stays controlled, saying why', async ($, on) => {
   const jira = prodBoard({ account: undefined })
   const loop = await startLoop($, on, { shared: ON_PROD, personal: { jiraServer: SERVER }, beneath: below => mountJira(below, jira) })
 
-  const refused = await transition($, 'PROD-5748')
+  const refused = await transition($, 'PROD-48')
 
   expect(refused.deny).toContain('godmode could not read your Atlassian account, so it cannot tell whether you created it')
+  // The read was tried again before asking, and the failure is not kept.
+  expect(jira.calls.filter(found => found.tool === 'atlassianUserInfo')).toHaveLength(2)
   expect(loop.ran).toEqual([])
 })
 
@@ -272,7 +313,7 @@ test('with attribution off, a commit or PR carrying an AI attribution line is re
   const pr = await bash($, `${PR_CREATE} --draft --title "T-1" --body-file /tmp/body.md`, 'agent-x')
   const clean = await bash($, 'git commit -m "Add filters"', 'agent-x')
 
-  expect(commit.deny).toContain('attribution off')
+  expect(commit.deny).toContain('carry no AI attribution')
   expect(commit.deny).toContain('Co-Authored-By: Claude')
   expect(pr.deny).toContain('Generated with [Claude Code]')
   expect(clean.deny).toBeUndefined()
@@ -318,11 +359,28 @@ test('the main thread\'s heavier work is refused, saying to dispatch a researche
     { tool: 'WebSearch', query: 'csv export' },
   ]) {
     const answer = await call($, input)
-    expect(answer.deny).toContain('Dispatch a researcher, a dev agent or a background shell')
-    expect(answer.deny).toContain('If the person asked for it, do it that way now')
-    expect(answer.deny).toContain('/godmode setup')
+    expect(answer.deny).toContain('dispatch a dev agent, a researcher or a background shell')
+    expect(answer.deny).toContain(`allow_once (action: main-thread, target: ${input.tool})`)
   }
   expect(loop.ran).toEqual([])
+})
+
+test('the person\'s explicit ask lets the PM do the work itself, for that message only', async ($, on) => {
+  const loop = await startLoop($, on)
+
+  await allowOnce($, 'main-thread', 'Edit')
+  expect((await edit($, `${REPO}/src/a.ts`)).deny).toBeUndefined()
+  expect((await edit($, `${REPO}/src/b.ts`)).deny).toBeUndefined()
+  await $.prompt.submit({ text: 'thanks, next' } as Parameters<typeof $.prompt.submit>[0])
+  expect((await edit($, `${REPO}/src/c.ts`)).deny).toContain('editing files')
+  expect(loop.ran).toEqual([`Edit ${REPO}/src/a.ts`, `Edit ${REPO}/src/b.ts`])
+})
+
+test('an unknown tool, one added after this build, is the PM\'s on the main thread', async ($, on) => {
+  const loop = await startLoop($, on)
+
+  for (const tool of ['SomeToolAddedLater', 'mcp__other_server__do_thing', 'Artifact']) expect((await call($, { tool })).deny).toBeUndefined()
+  expect(loop.ran).toEqual(['SomeToolAddedLater', 'mcp__other_server__do_thing', 'Artifact'])
 })
 
 test('the main thread reads up to its limit per prompt; the person\'s next prompt starts the count over', async ($, on) => {
@@ -333,7 +391,6 @@ test('the main thread reads up to its limit per prompt; the person\'s next promp
   expect((await read('b.ts')).deny).toBeUndefined()
   const third = await read('c.ts')
   expect(third.deny).toContain('reading more than 2 files')
-  expect(third.deny).toContain('mainThreadReadLimit')
 
   await $.prompt.submit({ text: 'and the docs?' } as Parameters<typeof $.prompt.submit>[0])
   expect((await read('c.ts')).deny).toBeUndefined()
@@ -378,8 +435,13 @@ test('a sixth agent is refused while five run, saying why; a finished one frees 
 
   const refused = await spawn($, 'Explore', 'Find the export code')
   expect(refused.deny).toContain('at most 5 agents at once')
-  expect(refused.deny).toContain('agentCap')
+  expect(refused.deny).toContain('allow_once (action: extra-agent, target: agent)')
   expect(loop.spawned).toEqual([])
+  // The person asked for this one now: it starts, once.
+  await allowOnce($, 'extra-agent', 'agent')
+  expect((await spawn($, 'Explore', 'Find the export code')).deny).toBeUndefined()
+  expect((await spawn($, 'Explore', 'Find the export code')).deny).toContain('at most 5 agents')
+  loop.spawned.length = 0
 
   loop.running = running(4)
   expect((await spawn($, 'Explore', 'Find the export code')).deny).toBeUndefined()
@@ -413,7 +475,7 @@ test('a dev agent starts only on a ticket the person said go for', async ($, on)
   const unknown = await spawn($, 'godmode:dev', 'Build T-99.')
 
   expect(notReady.deny).toContain('not marked ready')
-  expect(notReady.deny).toContain('requireReadyTicket')
+  expect(notReady.deny).toContain('When the person says go')
   expect(noTicket.deny).toContain('names none')
   expect(unknown.deny).toContain('no such ticket')
   expect(loop.spawned).toEqual([])
@@ -503,7 +565,6 @@ test('a dev agent cannot edit outside its worktree; scratch files are fine', asy
 
   expect(main.deny).toContain('outside it')
   expect(main.deny).toContain(`${dev.worktree}/src/filters.ts`)
-  expect(main.deny).toContain('worktreeGuard')
   expect(scratch.deny).toBeUndefined()
 })
 
@@ -516,16 +577,16 @@ test('contention and the worktree guard are settings', async ($, on) => {
   expect((await edit($, `${REPO}/src/a.ts`, dev.agentId)).deny).toBeUndefined()
 })
 
-test('a dev agent does not start when the open PRs cannot be listed', async ($, on) => {
+test('a dev agent still starts when the open PRs cannot be listed, its brief saying so', async ($, on) => {
   const loop = await startLoop($, on)
   loop.world.answer = run => (run.argv[0] === 'gh' && run.argv[2] === 'list' ? { exitCode: 1, stdout: '', stderr: 'HTTP 502' } : undefined)
   const id = await fileTicket(loop, 'Export button')
 
   const answer = await spawn($, 'godmode:dev', `Build ${id}.`)
 
-  expect(answer.deny).toContain('could not list the open PRs')
-  expect(answer.deny).toContain('HTTP 502')
-  expect(loop.spawned).toEqual([])
+  expect(answer.deny).toBeUndefined()
+  expect(loop.spawned[0]?.prompt).toContain('godmode could not list the open PRs\' files just now')
+  expect(loop.spawned[0]?.prompt).toContain('HTTP 502')
 })
 
 // ---------------------------------------------------------------------------
@@ -538,24 +599,54 @@ test('a PR is opened only as a draft', async ($, on) => {
   const draft = await bash($, `${PR_CREATE} --draft --title "T-1" --body "x"`, 'agent-x')
 
   expect(ready.deny).toContain('add `--draft`')
-  expect(ready.deny).toContain('draftsOnly')
   expect(draft.deny).toBeUndefined()
   expect(loop.ran).toHaveLength(1)
 })
 
-test('no ready or merge without a verdict; a reviewer\'s clean verdict at the current commit clears it', async ($, on) => {
+/** godmode's own ticket on PR #12, in review: the PR is godmode's work. */
+const ownTicketOn12 = async (loop: Loop, visibleChange = false) => {
+  const header = await loop.tickets.create({ title: 'Export button', ask: 'Add an export button', visibleChange })
+  await loop.tickets.move(header.id, { status: 'review', ready: true, pr: 'https://github.com/acme/app/pull/12' })
+  return header.id
+}
+
+/** The person said "merge #<pr>": the PM records it, then merges. */
+const mergeOnAsk = async ($: Engine, pr = '12', command = `gh pr merge ${pr} --squash`) => {
+  await allowOnce($, 'merge', pr)
+  return bash($, command)
+}
+
+test('godmode\'s own PR: ready waits for its own review at the current commit; then the person\'s "merge" goes through', async ($, on) => {
   const loop = await startLoop($, on)
+  await ownTicketOn12(loop)
 
   const before = await bash($, 'gh pr ready 12')
-  expect(before.deny).toContain('PR #12 has no review verdict')
+  expect(before.deny).toContain('PR #12 is godmode\'s own work')
+  expect(before.deny).toContain('godmode\'s review has no verdict on PR #12')
+  expect(before.deny).toContain('allow_once (action: ready-as-is, target: 12)')
 
   const agentId = await reviewer($)
   const recorded = await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'clean', summary: 'Good.', agentId })
   expect(recorded.result).toContain('Recorded clean for PR #12 at a1b2c3d')
+  expect(recorded.result).toContain('Mark PR #12 ready now')
+  expect(recorded.result).toContain('The project sets no merge conditions; the person says "merge"')
 
   expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
-  expect((await bash($, 'gh pr merge 12 --squash')).deny).toBeUndefined()
+  // Careful: merging asks first, even with nothing missing.
+  const unasked = await bash($, 'gh pr merge 12 --squash')
+  expect(unasked.deny).toContain('Merging is a risky action, and godmode asks the person first. This project sets no merge conditions.')
+  expect(unasked.deny).toContain('When the person says "merge #12"')
+  expect((await mergeOnAsk($)).deny).toBeUndefined()
   expect(loop.ran).toEqual(['Bash gh pr ready 12', 'Bash gh pr merge 12 --squash'])
+})
+
+test('the person\'s ask marks godmode\'s own PR ready as it is', async ($, on) => {
+  const loop = await startLoop($, on)
+  await ownTicketOn12(loop)
+
+  await allowOnce($, 'ready-as-is', '12')
+  expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
+  expect((await bash($, 'gh pr ready 12')).deny).toContain('godmode\'s own work')
 })
 
 test('a verdict counts only at the commit it was given at', async ($, on) => {
@@ -567,18 +658,18 @@ test('a verdict counts only at the commit it was given at', async ($, on) => {
 
   const answer = await bash($, 'gh pr ready 12')
 
-  expect(answer.deny).toContain('given at commit a1b2c3d, and the PR is now at ffff000')
+  expect(answer.deny).toContain('godmode\'s last verdict (clean) was at a1b2c3d and PR #12 is now at ffff000')
   expect(loop.ran).toEqual([])
 })
 
-test('a change-request verdict keeps the PR a draft', async ($, on) => {
+test('a change-request verdict keeps godmode\'s PR a draft', async ($, on) => {
   const loop = await startLoop($, on)
   const agentId = await reviewer($)
   await call($, { tool: 'mcp__godmode__review_verdict', pr: '#12', verdict: 'change-request', agentId })
 
-  const answer = await bash($, 'gh pr merge 12', 'agent-x')
+  const answer = await bash($, 'gh pr ready 12', 'agent-x')
 
-  expect(answer.deny).toContain('change-request, not clean')
+  expect(answer.deny).toContain('godmode\'s review at a1b2c3d is change-request')
   expect(loop.ran).toEqual([])
 })
 
@@ -591,7 +682,7 @@ test('only a reviewer records a verdict', async ($, on) => {
 
   expect(byDev.deny).toContain('Only a reviewer agent records a verdict')
   expect(byPm.deny).toContain('Only a reviewer agent records a verdict')
-  expect((await bash($, 'gh pr ready 12')).deny).toContain('no review verdict')
+  expect(loop.store.get(`verdicts:${FIRST_COMMIT}`)).toBeUndefined()
 })
 
 test('a verdict is kept across sessions, per project', async ($, on) => {
@@ -604,25 +695,27 @@ test('a verdict is kept across sessions, per project', async ($, on) => {
   expect(stored['12']).toMatchObject({ verdict: 'clean', headCommit: 'a1b2c3d4e5', agentId })
 })
 
-test('auto-merge is off unless the person turns it on', async ($, on) => {
+test('careful, merging on its own is off: arming auto-merge asks the person first', async ($, on) => {
   const off = await startLoop($, on)
   const agentId = await reviewer($)
   await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'clean', agentId })
 
   const armed = await bash($, 'gh pr merge 12 --auto --squash')
 
-  expect(armed.deny).toContain('Auto-merge is off')
-  expect(armed.deny).toContain('autoMerge')
+  expect(armed.deny).toContain('Merging is a risky action, and godmode asks the person first')
   expect(off.ran).toEqual([])
 })
 
-test('with auto-merge on, a clean PR can be armed', async ($, on) => {
+test('merging on its own, once the conditions hold: godmode\'s clean PR merges or is armed with no ask', async ($, on) => {
   const loop = await startLoop($, on, { personal: { autoMerge: true } })
   const agentId = await reviewer($)
   await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'clean', agentId })
 
   expect((await bash($, 'gh pr merge 12 --auto --squash')).deny).toBeUndefined()
-  expect(loop.ran).toEqual(['Bash gh pr merge 12 --auto --squash'])
+  expect((await bash($, 'gh pr merge 12 --squash')).deny).toBeUndefined()
+  // Someone else's PR is theirs to merge: godmode merges it on its own only when the person asks.
+  expect((await bash($, 'gh pr merge 9 --squash')).deny).toContain('It is teammate\'s PR.')
+  expect(loop.ran).toEqual(['Bash gh pr merge 12 --auto --squash', 'Bash gh pr merge 12 --squash'])
 })
 
 test('the merge gate asks for the PR by number', async ($, on) => {
@@ -659,18 +752,19 @@ test('human-pr: a clean review moves the ticket to qa, and ready and merge wait 
 
   expect(answer).toContain(`godmode moved ${id} to qa`)
   expect((await ticketOf(loop, id))?.status).toBe('qa')
-  const ready = await bash($, 'gh pr ready 12')
-  const merge = await bash($, 'gh pr merge 12 --squash')
-  expect(ready.deny).toContain('PR #12 is waiting on people\'s QA (QA mode human-pr)')
-  expect(ready.deny).toContain('record that with ticket_move (qaResult: passed)')
-  expect(merge.deny).toContain('so it cannot be merged')
-  expect(loop.ran).toEqual([])
+  // godmode's own loop is done, so the PR is marked ready; people's QA is the project's merge condition.
+  expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
+  const merge = await mergeOnAsk($)
+  expect(merge.deny).toContain('PR #12 does not meet this project\'s merge conditions yet: a QA pass from the people who test (no QA pass recorded for T-1 at a1b2c3d)')
+  expect(merge.deny).toContain('If they say "merge anyway"')
+  expect(loop.ran).toEqual(['Bash gh pr ready 12'])
 
   const passed = await moveTicket($, { id, qaResult: 'passed' })
   expect(String(passed.result)).toContain(`Recorded QA passed for ${id} at a1b2c3d`)
   expect((await ticketOf(loop, id))?.qaResult).toEqual({ result: 'passed', commit: 'a1b2c3d4e5' })
-  expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
-  expect(loop.ran).toEqual(['Bash gh pr ready 12'])
+  // The earlier "merge" was not used up by the refusal.
+  expect((await bash($, 'gh pr merge 12 --squash')).deny).toBeUndefined()
+  expect(loop.ran).toEqual(['Bash gh pr ready 12', 'Bash gh pr merge 12 --squash'])
 })
 
 test('Other: godmode\'s own move to qa tells the PM to mirror it in the tracker (D25)', async ($, on) => {
@@ -691,10 +785,9 @@ test('human-pr: a QA pass holds only at the commit it was given at', async ($, o
   const agentId = await reviewer($)
   await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'clean', agentId })
 
-  const ready = await bash($, 'gh pr ready 12')
+  const merge = await mergeOnAsk($)
 
-  expect(ready.deny).toContain('QA passed was recorded at commit a1b2c3d, and PR #12 is now at ffff000')
-  expect(ready.deny).toContain('a new commit needs a new QA pass')
+  expect(merge.deny).toContain('last QA passed was at a1b2c3d, and the PR is now at ffff000')
   expect(loop.ran).toEqual([])
 })
 
@@ -710,7 +803,7 @@ test('human-pr: only the main thread records a QA result, and a fail sends the t
   expect(await ticketOf(loop, id)).toMatchObject({ status: 'doing', qaResult: { result: 'failed', commit: 'a1b2c3d4e5' } })
   const rounds = () => (loop.store.get(`fixRounds:${FIRST_COMMIT}`) as Record<string, { count: number }>)[id]?.count
   expect(rounds()).toBe(1)
-  expect((await bash($, 'gh pr ready 12')).deny).toContain(`QA failed for ${id} at PR #12's current commit a1b2c3d`)
+  expect((await mergeOnAsk($)).deny).toContain(`${id} failed QA at a1b2c3d`)
 
   // The same fail recorded again at the same commit is the same round.
   const again = await moveTicket($, { id, qaResult: 'failed' })
@@ -735,27 +828,32 @@ test('human-pr with the QA agent first: the ticket stays in review until it pass
   const loop = await startLoop($, on, { shared: { qaMode: 'human-pr', qaBotFirst: true } })
   const { id, answer } = await reviewedClean($, loop)
 
-  expect(answer).toContain(`Next the QA agent tests ${id}`)
+  expect(answer).toContain(`Next godmode's QA agent tests ${id}`)
   expect((await ticketOf(loop, id))?.status).toBe('review')
-  expect((await bash($, 'gh pr ready 12')).deny).toContain(`${id} is not waiting in qa yet (it is in review). Move it to qa, once the QA agent passed it,`)
+  expect((await bash($, 'gh pr ready 12')).deny).toContain(`${id} is a visible change, and the QA agent has not passed it`)
 })
 
 test('human-pr: a ticket with no visible change skips human QA', async ($, on) => {
   const loop = await startLoop($, on, { shared: { qaMode: 'human-pr' } })
   const { id, answer } = await reviewedClean($, loop, false)
 
-  expect(answer).toContain('It may now be marked ready')
+  expect(answer).toContain('Mark PR #12 ready now')
   expect((await ticketOf(loop, id))?.status).toBe('review')
   expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
+  expect((await mergeOnAsk($)).deny).toBeUndefined()
 })
 
-test('human-pr: a PR no ticket names is held, saying how to link it', async ($, on) => {
+test('human-pr: a PR no ticket of godmode\'s names is looked up by the key in its title, read live, and never linked', async ($, on) => {
   const loop = await startLoop($, on, { shared: { qaMode: 'human-pr' } })
   const agentId = await reviewer($)
   await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'clean', agentId })
 
-  expect((await bash($, 'gh pr ready 12')).deny).toContain('no ticket names PR #12')
-  expect(loop.ran).toEqual([])
+  expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
+  const merge = await mergeOnAsk($)
+  // PR #12's title names T-1, which godmode does not have: said as it is, with no ask to link it.
+  expect(merge.deny).toContain('a QA pass from the people who test (godmode found no ticket T-1)')
+  expect(merge.deny).not.toMatch(/ticket_move \(pr|link|adopt/)
+  expect(await loop.tickets.list({ statuses: ['todo', 'doing', 'review', 'qa', 'done'] })).toEqual([])
 })
 
 test('human-staging: the merge runs on the person\'s go, and the ticket goes to qa, not done', async ($, on) => {
@@ -764,7 +862,7 @@ test('human-staging: the merge runs on the person\'s go, and the ticket goes to 
   expect((await ticketOf(loop, id))?.status).toBe('review')
 
   const ready = await bash($, 'gh pr ready 12')
-  const merged = await bash($, 'gh pr merge 12 --squash')
+  const merged = await mergeOnAsk($)
 
   expect(ready.deny).toBeUndefined()
   expect(merged.deny).toBeUndefined()
@@ -780,7 +878,7 @@ test('human-staging: a visible change is not closed straight from review, and a 
   const { id } = await reviewedClean($, loop)
 
   expect((await moveTicket($, { id, status: 'done' })).deny).toContain(`${id} is a visible change in QA mode human-staging, so it is done only once people passed it`)
-  await bash($, 'gh pr merge 12 --squash')
+  await mergeOnAsk($)
   const failed = await moveTicket($, { id, qaResult: 'failed' })
 
   expect(String(failed.result)).toContain('its fix is a new ticket')
@@ -792,7 +890,7 @@ test('none: a clean review goes straight to ready', async ($, on) => {
   const loop = await startLoop($, on, { shared: { qaMode: 'none' } })
   const { id, answer } = await reviewedClean($, loop)
 
-  expect(answer).toContain('It may now be marked ready')
+  expect(answer).toContain('Mark PR #12 ready now')
   expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
   expect((await ticketOf(loop, id))?.status).toBe('review')
   expect(loop.ran).toEqual(['Bash gh pr ready 12'])
@@ -802,20 +900,20 @@ test('a note from before the QA modes with qa: true gates as bot: the QA agent\'
   const loop = await startLoop($, on, { shared: { qa: true } })
   const { id, answer } = await reviewedClean($, loop)
 
-  expect(answer).toContain(`Next the QA agent tests ${id}`)
+  expect(answer).toContain(`Next godmode's QA agent tests ${id}`)
   expect((await bash($, 'gh pr ready 12')).deny).toContain('the QA agent has not passed it')
   await qaVerdict($, loop, id, 'pass')
   expect((await ticketOf(loop, id))?.status).toBe('review')
   expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
-  expect((await bash($, 'gh pr merge 12 --squash')).context).toBeUndefined()
+  expect((await mergeOnAsk($)).context).toBeUndefined()
   expect((await ticketOf(loop, id))?.status).toBe('review')
 })
 
-test('a merge behind gh\'s -R flag, a path, bash -c or the raw API meets the verdict gate, though writes are free', async ($, on) => {
+test('a merge behind gh\'s -R flag, a path, bash -c or the raw API meets the merge gate, though writes are free', async ($, on) => {
   const loop = await startLoop($, on)
 
   for (const command of ['gh pr -R acme/app merge 12', 'gh --repo acme/app pr merge 12', '/usr/bin/gh pr merge 12', 'bash -c "gh pr merge 12"', 'gh api -X PUT repos/acme/app/pulls/12/merge']) {
-    expect([command, (await bash($, command, 'agent-x')).deny]).toEqual([command, expect.stringContaining('PR #12 has no review verdict')])
+    expect([command, (await bash($, command, 'agent-x')).deny]).toEqual([command, expect.stringContaining('Merging is a risky action')])
   }
   const graphql = await bash($, 'gh api graphql -f query=\'mutation { markPullRequestReadyForReview(input: {pullRequestId: "PR_1"}) { clientMutationId } }\'', 'agent-x')
 
@@ -832,7 +930,7 @@ test('human-pr: an agent cannot turn a ticket\'s visible change off to skip peop
 
   expect(flipped.deny).toContain('Only the main thread changes whether a ticket is a visible change')
   expect((await ticketOf(loop, id))?.visibleChange).toBe(true)
-  expect((await bash($, 'gh pr ready 12')).deny).toContain('PR #12 is waiting on people\'s QA')
+  expect((await mergeOnAsk($)).deny).toContain('a QA pass from the people who test')
 })
 
 test('human-pr: auto-merge is refused even when switched on, by gh pr merge and by the API, saying to merge directly', async ($, on) => {
@@ -843,9 +941,8 @@ test('human-pr: auto-merge is refused even when switched on, by gh pr merge and 
   const armed = await bash($, 'gh pr merge 12 --auto --squash')
   const viaApi = await bash($, 'gh api graphql -f query=\'mutation { enablePullRequestAutoMerge(input: {pullRequestId: "PR_1"}) { clientMutationId } }\'', 'agent-x')
 
-  expect(armed.deny).toContain('In QA mode human-pr, a PR is never armed for auto-merge: auto-merge would merge a later commit that people never tested')
-  expect(armed.deny).toContain('Merge it directly (`gh pr merge 12`) on the person\'s go')
-  expect(viaApi.deny).toContain('never armed for auto-merge')
+  expect(armed.deny).toContain('GitHub\'s auto-merge cannot wait for this project\'s QA pass, so PR #12 is not armed. Merge it directly once QA passes (`gh pr merge 12`)')
+  expect(viaApi.deny).toContain('godmode cannot tell which PR this `gh api` call would have merged')
   expect(loop.ran).toEqual([])
   expect((await bash($, 'gh pr merge 12 --squash')).deny).toBeUndefined()
 })
@@ -858,7 +955,7 @@ test('human-staging with the merge gate off: auto-merge is refused, and a merge 
   const unnamed = await bash($, 'gh pr merge --squash')
   const merged = await bash($, 'gh pr merge 12 --squash')
 
-  expect(armed.deny).toContain('the ticket would never move to qa for people to test on staging')
+  expect(armed.deny).toContain('its tickets would never move to qa for people to test on staging')
   expect(unnamed.deny).toContain('Name the PR by number')
   expect(merged.deny).toBeUndefined()
   expect(merged.context?.join('\n')).toContain(`godmode moved ${id} to qa, not done`)
@@ -880,14 +977,14 @@ test('human-pr: a PR that carries two tickets moves both to qa, and is marked re
   const agentId = await reviewer($)
 
   const verdict = await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'clean', agentId })
-  expect(String(verdict.result)).toContain(`godmode moved ${header.id} to qa; godmode moved ${second} to qa`)
+  expect(String(verdict.result)).toContain(`godmode moved ${header.id} to qa: people test the PR now. godmode moved ${second} to qa`)
   expect((await ticketOf(loop, second))?.status).toBe('qa')
 
   await moveTicket($, { id: header.id, qaResult: 'passed' })
-  expect((await bash($, 'gh pr ready 12')).deny).toContain(`${second} has no pass recorded`)
+  expect((await mergeOnAsk($)).deny).toContain(`no QA pass recorded for ${second} at a1b2c3d`)
 
   await moveTicket($, { id: second, qaResult: 'passed' })
-  expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
+  expect((await bash($, 'gh pr merge 12 --squash')).deny).toBeUndefined()
 })
 
 test('human-staging: a merged PR that carries two tickets moves each to qa', async ($, on) => {
@@ -895,7 +992,7 @@ test('human-staging: a merged PR that carries two tickets moves each to qa', asy
   const { id } = await reviewedClean($, loop)
   const second = await secondTicketOn12(loop)
 
-  const merged = await bash($, 'gh pr merge 12 --squash')
+  const merged = await mergeOnAsk($)
 
   expect(merged.context?.join('\n')).toContain(`godmode moved ${second} to qa, not done`)
   expect((await ticketOf(loop, id))?.status).toBe('qa')
@@ -921,7 +1018,7 @@ test('the main thread moves a ticket out of qa with an override reason, written 
 test('human-staging: the original leaves qa for done once its fix ticket records a pass', async ($, on) => {
   const loop = await startLoop($, on, { shared: { qaMode: 'human-staging' } })
   const { id } = await reviewedClean($, loop)
-  await bash($, 'gh pr merge 12 --squash')
+  await mergeOnAsk($)
   const failed = await moveTicket($, { id, qaResult: 'failed' })
   expect(String(failed.result)).toContain(`file it with ticket_create (fixFor: ${id})`)
 
@@ -1105,7 +1202,7 @@ test('the count ends when the main thread closes the ticket, or when its PR merg
   const pr = loop.world.gh?.prs.find(candidate => candidate.number === 12)
   if (pr !== undefined) pr.head = 'abcdef0123'
   await verdictOn12($, 'clean')
-  expect((await bash($, 'gh pr merge 12 --squash')).deny).toBeUndefined()
+  expect((await mergeOnAsk($)).deny).toBeUndefined()
   expect(roundsOf(loop, id)).toBeUndefined()
 })
 
@@ -1113,7 +1210,7 @@ test('human-staging: a fail after the merge counts no fix round, and a dispatch 
   const loop = await startLoop($, on, { shared: { qaMode: 'human-staging' }, personal: { fixRoundLimit: 1 } })
   const id = await ticketOn12(loop)
   await verdictOn12($, 'clean')
-  await bash($, 'gh pr merge 12 --squash')
+  await mergeOnAsk($)
 
   const failed = await moveTicket($, { id, qaResult: 'failed' })
   const again = await spawn($, 'godmode:dev', `Look at ${id}.`)
@@ -1321,7 +1418,7 @@ test('a QA agent pass starts no fix round', async ($, on) => {
 
   const passed = await qaVerdict($, loop, dev.id, 'pass')
 
-  expect(String(passed.result)).toContain('its PR may now be marked ready')
+  expect(String(passed.result)).toContain('mark PR #12 ready now')
   expect(String(passed.result)).not.toContain('fix round')
   expect((await sendTo($, 'builder')).deny).toBeUndefined()
   expect(roundsOf(loop, dev.id)).toBeUndefined()
@@ -1336,9 +1433,9 @@ test('human-pr with the QA agent first: its pass moves the ticket to qa for the 
   expect((await ticketOf(loop, id))?.status).toBe('review')
 
   const passed = await qaVerdict($, loop, id, 'pass')
-  expect(String(passed.result)).toContain(`godmode moved ${id} to qa: people test it now (QA mode human-pr)`)
+  expect(String(passed.result)).toContain(`godmode moved ${id} to qa: people test the PR now.`)
   expect((await ticketOf(loop, id))?.status).toBe('qa')
-  expect((await bash($, ['gh', 'pr', 'ready', '12'].join(' '))).deny).toContain('waiting on people\'s QA')
+  expect((await bash($, ['gh', 'pr', 'ready', '12'].join(' '))).deny).toBeUndefined()
 })
 
 test('qa_verdict needs the commit the QA agent tested, and refuses it once the PR has moved past it', async ($, on) => {
@@ -1360,10 +1457,10 @@ test('qa_verdict needs the commit the QA agent tested, and refuses it once the P
 test('bot: a visible change\'s PR is marked ready or merged only with the QA agent\'s pass at its current commit', async ($, on) => {
   const loop = await startLoop($, on, { shared: { qaMode: 'bot' } })
   const { id, answer } = await reviewedClean($, loop)
-  expect(answer).toContain(`Next the QA agent tests ${id} at this commit`)
+  expect(answer).toContain(`Next godmode's QA agent tests ${id} at this commit`)
 
-  expect((await bash($, 'gh pr ready 12')).deny).toContain(`${id} is a visible change, and the QA agent has not passed it at the current commit a1b2c3d, so PR #12 cannot be marked ready`)
-  expect((await bash($, 'gh pr merge 12')).deny).toContain('cannot be merged')
+  expect((await bash($, 'gh pr ready 12')).deny).toContain(`${id} is a visible change, and the QA agent has not passed it at the current commit a1b2c3d, so PR #12 is not ready`)
+  expect((await bash($, 'gh pr merge 12')).deny).toContain('godmode\'s own checks are not done')
 
   await qaVerdict($, loop, id, 'fail')
   expect((await bash($, 'gh pr ready 12')).deny).toContain(`The QA agent failed ${id} at the current commit a1b2c3d`)
@@ -1377,10 +1474,10 @@ test('bot: a visible change\'s PR is marked ready or merged only with the QA age
   expect(loop.ran).toEqual(['Bash gh pr ready 12'])
 })
 
-test('bot: a PR no ticket names is held; one whose tickets change nothing visible is not', async ($, on) => {
+test('bot: a PR no ticket of godmode\'s names has no QA agent step; one whose tickets change nothing visible is not held either', async ($, on) => {
   const loop = await startLoop($, on, { shared: { qaMode: 'bot' } })
   await verdictOn12($, 'clean')
-  expect((await bash($, 'gh pr ready 12')).deny).toContain('no ticket names PR #12')
+  expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
 
   await reviewedClean($, loop, false)
   expect((await bash($, 'gh pr ready 12')).deny).toBeUndefined()
@@ -1405,7 +1502,7 @@ test('bot: when the app cannot run, only the main thread records the person\'s s
 
   await qaVerdict($, loop, id, 'fail')
   expect((await skip()).deny).toContain(`The QA agent failed ${id} at this commit a1b2c3d`)
-  expect((await bash($, 'gh pr merge 12')).deny).toContain(`The QA agent failed ${id}`)
+  expect((await bash($, 'gh pr ready 12')).deny).toContain(`The QA agent failed ${id}`)
 })
 
 test('human-pr with the QA agent first: a ticket moves to qa only after its pass at the current commit, or by override', async ($, on) => {
@@ -1584,4 +1681,139 @@ test('which Fable outcomes mean the model is unavailable: a thrown or returned m
   expect(fableOutcome({ error: 'rate_limit: too many requests' })).toBe('unknown')
   expect(fableOutcome({ stopReason: 'end_turn', answer: 'ok' })).toBe('works')
   expect(fableOutcome({ stopReason: null, answer: 'API Error: 500 server_error' })).toBe('unknown')
+})
+
+// ---------------------------------------------------------------------------
+// The project's merge conditions, checked live on every PR (D77, D78)
+
+/** Sets what GitHub says of a PR: its reviews at its head, its checks, its merge state. */
+const prState = (loop: Loop, number: number, state: { approvedBy?: string[]; changesBy?: string[]; checks?: GhCheck['conclusion'] | 'running'; mergeState?: string }) => {
+  const pr = loop.world.gh?.prs.find(candidate => candidate.number === number)
+  if (pr === undefined) throw new Error(`no PR #${number}`)
+  pr.reviews = [
+    ...(state.approvedBy ?? []).map(login => ({ login, state: 'APPROVED' as const, commit: pr.head })),
+    ...(state.changesBy ?? []).map(login => ({ login, state: 'CHANGES_REQUESTED' as const, commit: pr.head })),
+  ]
+  if (state.checks !== undefined) pr.checks = [state.checks === 'running' ? { name: 'build', status: 'IN_PROGRESS' } : { name: 'build', status: 'COMPLETED', conclusion: state.checks }]
+  if (state.mergeState !== undefined) pr.mergeState = state.mergeState
+}
+
+const TWO_CONDITIONS = { mergeConditions: 'approvals,ci', humanReviewCount: 1 }
+
+test('an outside PR merges on the person\'s "merge" once its conditions hold, checked live, with nothing linked or recorded', async ($, on) => {
+  const loop = await startLoop($, on, { shared: TWO_CONDITIONS })
+  prState(loop, 9, { approvedBy: ['carol'], checks: 'SUCCESS' })
+
+  expect((await bash($, 'gh pr merge 9 --squash')).deny).toContain('Every merge condition holds: 1 approval from someone other than its author (1/1 at the current commit); green CI (1 green). It is teammate\'s PR.')
+  const merged = await mergeOnAsk($, '9')
+
+  expect(merged.deny).toBeUndefined()
+  // godmode's own review and QA agent are never conditions on work it did not do.
+  expect(loop.store.get(`verdicts:${FIRST_COMMIT}`)).toBeUndefined()
+  expect(await loop.tickets.list({ statuses: ['todo', 'doing', 'review', 'qa', 'done'] })).toEqual([])
+  expect(loop.ran).toEqual(['Bash gh pr merge 9 --squash'])
+})
+
+test('careful: an outside PR missing a condition is named with its live state, and "merge anyway" goes through', async ($, on) => {
+  const loop = await startLoop($, on, { shared: TWO_CONDITIONS })
+  prState(loop, 9, { approvedBy: ['carol'], checks: 'FAILURE' })
+
+  const refused = await mergeOnAsk($, '9')
+  expect(refused.deny).toContain('PR #9 does not meet this project\'s merge conditions yet: green CI (failing: build).')
+  expect(refused.deny).toContain('allow_once (action: merge-anyway, target: 9)')
+  expect(refused.deny).not.toMatch(/\/godmode (setup|off)|setting|switch|turn .* off|loosen/i)
+
+  await allowOnce($, 'merge-anyway', '9')
+  const merged = await bash($, 'gh pr merge 9 --squash')
+  expect(merged.deny).toBeUndefined()
+  expect(merged.context?.join('\n')).toContain('PR #9 merged on the person\'s "merge anyway", with these not met: green CI (failing: build).')
+  expect(loop.ran).toEqual(['Bash gh pr merge 9 --squash'])
+})
+
+test('not careful: an outside PR missing a condition merges, and godmode says what was missing', async ($, on) => {
+  const loop = await startLoop($, on, { shared: TWO_CONDITIONS, personal: { care: 'not-careful' } })
+  prState(loop, 9, { changesBy: ['carol'], checks: 'running' })
+
+  const merged = await bash($, 'gh pr merge 9 --squash')
+
+  expect(merged.deny).toBeUndefined()
+  expect(merged.context?.join('\n')).toContain('godmode merged PR #9 with these not met: 1 approval from someone other than its author (carol requested changes); green CI (1 of 1 still running).')
+  expect(loop.ran).toEqual(['Bash gh pr merge 9 --squash'])
+})
+
+test('an empty conditions list checks nothing: a PR merges on the person\'s "merge" whatever its CI says', async ($, on) => {
+  const loop = await startLoop($, on, { shared: { mergeConditions: 'none' } })
+  prState(loop, 9, { checks: 'FAILURE' })
+
+  expect((await bash($, 'gh pr merge 9')).deny).toContain('This project sets no merge conditions.')
+  expect((await mergeOnAsk($, '9', 'gh pr merge 9')).deny).toBeUndefined()
+  expect(loop.ran).toEqual(['Bash gh pr merge 9'])
+})
+
+test('godmode\'s own PR goes through its own loop first, then the project\'s conditions; merging on its own waits for both', async ($, on) => {
+  const loop = await startLoop($, on, { shared: { mergeConditions: 'ci' }, personal: { autoMerge: true } })
+  await ownTicketOn12(loop)
+  prState(loop, 12, { checks: 'SUCCESS' })
+
+  const early = await bash($, 'gh pr merge 12 --squash')
+  expect(early.deny).toContain('godmode\'s own checks are not done: godmode\'s review has no verdict on PR #12')
+
+  await verdictOn12($, 'clean')
+  prState(loop, 12, { checks: 'running' })
+  expect((await bash($, 'gh pr merge 12 --squash')).deny).toContain('green CI (1 of 1 still running)')
+
+  prState(loop, 12, { checks: 'SUCCESS' })
+  expect((await bash($, 'gh pr merge 12 --squash')).deny).toBeUndefined()
+  expect(loop.ran).toEqual(['Bash gh pr merge 12 --squash'])
+})
+
+test('approvals count live: never the author nor the person, only named reviewers when there are some', async ($, on) => {
+  const loop = await startLoop($, on, { shared: { mergeConditions: 'approvals', humanReviewCount: 1, humanReviewers: 'bob' } })
+  const { answer } = await reviewedClean($, loop)
+  expect(answer).toContain('Request bob as reviewers')
+
+  prState(loop, 12, { approvedBy: ['me', 'carol'] })
+  expect((await mergeOnAsk($)).deny).toContain('1 approval from bob (0/1 at the current commit)')
+  prState(loop, 12, { changesBy: ['bob'] })
+  expect((await bash($, 'gh pr merge 12 --squash')).deny).toContain('bob requested changes')
+  prState(loop, 12, { approvedBy: ['bob'] })
+  expect((await bash($, 'gh pr merge 12 --squash')).deny).toBeUndefined()
+})
+
+test('a PR that cannot be read is tried again, then the person is asked, saying why; not careful merges and says it did not check', async ($, on) => {
+  const loop = await startLoop($, on, { shared: TWO_CONDITIONS })
+  loop.world.answer = run => (run.argv.join(' ').startsWith('gh pr view 9') ? { exitCode: 1, stdout: '', stderr: 'HTTP 502' } : undefined)
+
+  const refused = await mergeOnAsk($, '9')
+  expect(refused.deny).toContain('godmode could not read PR #9 to check its merge conditions (gh could not read PR #9: HTTP 502)')
+  expect(refused.deny).toContain('allow_once (action: merge-anyway, target: 9)')
+  expect(loop.world.runs.filter(run => run.argv.join(' ').startsWith('gh pr view 9')).length).toBeGreaterThanOrEqual(2)
+})
+
+test('no refusal anywhere suggests switching a rule off: each names the ask that lets it run, or the live state that is missing', async ($, on) => {
+  const loop = await startLoop($, on, { shared: { ...TWO_CONDITIONS, qaMode: 'bot' }, personal: { attribution: false, agentCap: 1 } })
+  await ownTicketOn12(loop, true)
+  prState(loop, 9, { checks: 'FAILURE' })
+  const dev = await devAgent($, loop)
+  loop.running = running(1)
+  const refusals = [
+    await edit($, `${REPO}/src/a.ts`),
+    await call($, { tool: 'Grep', pattern: 'x' }),
+    await call($, { tool: 'WebFetch', url: 'https://example.com' }),
+    await bash($, 'npm test'),
+    await bash($, `${PR_CREATE} --title "x"`, 'agent-x'),
+    await bash($, 'git commit -m "x\n\nCo-Authored-By: Claude <noreply@anthropic.com>"', 'agent-x'),
+    await bash($, 'gh pr ready 12', 'agent-x'),
+    await bash($, 'gh pr merge 12', 'agent-x'),
+    await mergeOnAsk($, '9'),
+    await bash($, 'gh pr close 9', 'agent-x'),
+    await bash($, 'git push origin --delete deps', 'agent-x'),
+    await spawn($, 'Explore', 'Look around.'),
+    await spawn($, 'godmode:dev', 'Build T-99.'),
+  ]
+  expect(dev.agentId).not.toBe('')
+  for (const refusal of refusals) {
+    expect(refusal.deny).toBeDefined()
+    expect([refusal.deny, /\/godmode (setup|off)|\(setting|To change the rule|loosen the rule|switch (it|this|the rule) off|turn (it|this|the rule) off/i.test(refusal.deny ?? '')]).toEqual([refusal.deny, false])
+  }
 })

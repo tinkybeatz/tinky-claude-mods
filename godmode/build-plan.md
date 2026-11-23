@@ -25,6 +25,52 @@ proven first on a repo set up by hand.
 
 ## Status (2026-11-16)
 
+- 0.8.0 (2026-11-23), godmode follows the project's rules (D78): setup asks two questions
+  first, Who (alone or with others) and Care (careful asks before risky actions, not
+  careful just acts), after a silent scan that also reads branch protection, CI files,
+  how PRs land and the history's attribution habit. They pre-fill every other answer; one
+  summary shows each value with its source (scan, a pre-fill, or "?"), only the "?" items
+  are asked, each with an answer that leaves no rule, and the person saves or changes
+  something. Setup writes `project-rules.md` into the conventions folder from the note,
+  again on each save; a hand edit is carried back through change-setup with a yes, and
+  its "Your own rules" section is kept. Merge conditions are the project's list
+  (approvals from others, green CI, up to date, people's QA; possibly empty), checked live
+  on every PR whoever made it; godmode's review, QA agent and fix rounds apply only to its
+  own PRs before it marks them ready. A PR godmode did not make has its ticket read live
+  from the key in its branch or title, never linked or recorded. Risky actions (merge,
+  force-push over pushed work, deleting branches or tickets, closing or approving PRs,
+  others' PRs or tickets) ask first under "careful", the person's ask recorded with
+  `allow_once` as the yes, and run under "not careful"; ownership is read live with a
+  retry, never from a cached failure. The thin main thread refuses only actual work, and
+  the person's ask unlocks it for one message. No refusal suggests switching a rule off.
+  `update` and `/godmode audit` offer Who and Care to older notes and map their code
+  review, QA and CI answers onto the merge conditions, shown on the summary for a yes.
+  A fourth on-indicator, the side pane (`pane`), is godmode's own pane (id `godmode`, its
+  own state keys), independent of the dispatch panel: the dispatch panel's look (Active
+  and Finished tabs, agent and shell cards, usage bars) under a red GODMODE header, with
+  godmode's sections when they have content (what waits on the person, the tickets with
+  their status, a running try with its link), each agent card naming its role and ticket.
+  It opens at every switch-on in any mode, closes on `/godmode off`, falls back to the
+  band when it cannot be placed, and stays closed when the person closes it until the next
+  switch-on. Tickets come from godmode's own records on each prompt and after each ticket
+  change, with no network polling.
+
+- 0.7.2, required human code review (D77): a team question (`humanReview`, with the
+  approval count and named reviewers, defaulted from GitHub branch protection when it can
+  be read). After godmode's clean review the PR is marked ready and named reviewers are
+  requested; the merge waits for the approvals at the PR's current commit (never the
+  author's or the person's own, GitHub's `reviewDecision` followed where it exists) and for
+  QA. The per-prompt check reports code review. A code-review approval is never a QA pass.
+- 0.7.2 (2026-11-23): the ticket-rules scan is a fixed checklist (D76): issue type per kind
+  of work, placement and sprint naming, parent, assignee, fields per type (Jira-required,
+  habit, template text), title, description template, labels and components when used;
+  answered from the person's own tickets first, the team's where theirs say nothing, "?"
+  asked, never guessed. The sprint is read from `customFields` by label too. Every
+  multi-line text goes out one `$.ui.log` line at a time, and every question on one line.
+  Dry-run against the real board before release: on the "Atlassian MCP" server the scan
+  reads slim fields first, learns the custom field ids from one ticket per type, then
+  reads those fields by key; placement names each type's sprint pattern, and the parent is
+  read per type.
 - 0.7.1 (2026-11-23): `/godmode audit` (D75) checks the saved setup in place, mid-session
   and after `/reload-plugins`: the answers through the answer rules and live checks (the
   `check` topic's code), drift (stale commands, a missing base branch, conventions files

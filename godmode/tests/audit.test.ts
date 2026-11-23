@@ -86,7 +86,7 @@ test('after an update and a reload mid-session, the next prompt suggests the aud
 })
 
 test('drift is listed with its fix: a stale command, a renamed base branch, an edited conventions file, an older note; the picked fixes save on a yes', async ($, on) => {
-  const world = makeWorld({ pluginVersion: '0.7.1' })
+  const world = makeWorld({ pluginVersion: '0.8.0' })
   world.files.set(`${REPO}/package.json`, JSON.stringify({ name: 'app', scripts: { test: 'vitest run', lint: 'eslint .' } }))
   world.answer = run => (run.argv.join(' ') === 'git show-ref --verify --quiet refs/heads/trunk' ? { exitCode: 0, stdout: '' } : undefined)
   await setUpProject(world, { sharedAnswers: { tracker: 'none', qaMode: 'bot', baseBranch: 'main', testCommand: 'npm run e2e' }, personalAnswers: { autoMerge: false } }, '0.6.0')
@@ -101,7 +101,7 @@ test('drift is listed with its fix: a stale command, a renamed base branch, an e
   expect(text).toContain('1. testCommand "npm run e2e" does not hold: `npm run e2e` runs `e2e`, which is not a script in package.json: name a script that exists. Fix: ask the person for the right value')
   expect(text).toContain('the base branch main no longer exists')
   expect(text).toContain('AGENTS.md was edited by hand since setup. Fix: read it, then save it as checked: setup_finish with `conventions: ["AGENTS.md"]`')
-  expect(text).toContain('new since godmode 0.6.0: whether godmode may approve a PR')
+  expect(text).toContain('new since godmode 0.6.0: two questions, who works on the project and how careful godmode is')
   expect(text).toContain('- Consider: the project now has a lint command, `npm run lint`')
   expect(text).toContain('Nothing has changed.')
   expect(audit.context?.join('\n')).toContain('Apply only the fixes the person picks')

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'claude-code'
 
-import type { GodmodeMode, SetupScope } from '../types'
+import type { GodmodeMode, IndicatorStyle, SetupScope } from '../types'
 import { NO_GIT_LINE } from './host'
 import { indicatorOf, registerIndicator } from './indicator'
 import { answerIssueLines } from './answers'
@@ -10,6 +10,7 @@ import {
   ALLOW_ONCE_TOOL,
   context7Refusal,
   decideToolCall,
+  endMainThreadAsks,
   noteDevEnds,
   planSpawn,
   QA_VERDICT_TOOL,
@@ -25,16 +26,18 @@ import {
 import type { LoopCache } from './loop'
 import { changedConventions, godmodeVersionOf, projectOf, readNote } from './storage'
 import type { NoteLookup, Project } from './storage'
-import { qaCheckBlock } from './qa-check'
+import { codeReviewBlock, qaCheckBlock } from './qa-check'
 import { fableOutcome, isPmModel, PM_FALLBACK_MODEL, PM_MODEL, pmReminder, pmRoleOf, qaModeLine } from './role'
 import { godmodeReport, resumeOf, updateLineOf } from './report'
 import { auditNotice } from './audit'
+import { PROJECT_RULES_FILE } from './project-rules'
 import { beginChangeSetup, beginSetup, leaveChangeSetup, offerGitInit, runAudit, serveSetupTool, SETUP_TOOLS, setupEditRefusal, takeSetupReport } from './setup'
 import type { SetupToolName } from './setup'
 import { serveTicketRules, TICKET_RULES_TOOL } from './ticket-rules'
 import { runTicketTool, TICKET_TOOLS, TicketError, ticketBackendOf } from './tickets'
 import type { TicketToolName } from './tickets'
 import { forgetStaleTry, startTry, stopTry, stopTryCommand } from './try'
+import { closeGodmodePane, openGodmodePane, paneAction, paneReceived, paneSpawned, paneStep, refreshPaneTickets, registerPane, startPaneClock } from './pane'
 import type { TryHandles } from './try'
 
 const USAGE = 'Use `/godmode`, `/godmode setup`, `/godmode audit`, `/godmode off`, `/godmode report` or `/godmode try <ticket>`.'
@@ -48,7 +51,7 @@ const mode = atom({ plugin: 'godmode', key: 'mode' } as const, 'coding' as Godmo
 const setupScope = atom({ plugin: 'godmode', key: 'setupScope' } as const, 'full' as SetupScope)
 const recheck = atom({ plugin: 'godmode', key: 'recheck' } as const, [] as string[])
 const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
-const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as 'mode' | 'hint' | 'band')
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as IndicatorStyle)
 const pmModel = atom({ plugin: 'godmode', key: 'pmModel' } as const, 'untried' as 'untried' | 'fable' | 'opus')
 
 /** How `/godmode` switches on: the mode, and what the setup or the PM picks up first. */
@@ -87,7 +90,9 @@ const switchOnPlan = async ($: EngineInterface, project: Project): Promise<Switc
   const current = await godmodeVersionOf($).catch(() => shared.godmodeVersion)
   // A saved answer the rules repaired or cannot use is told at each switch-on, with what fixes it.
   const flagged = answerIssueLines(found.repairs ?? [], found.issues ?? [])
-  const line = [updateLineOf(shared.godmodeVersion, current), ...flagged].filter(part => part !== undefined).join('\n') || undefined
+  const rulesEdited = recheck.some(path => path.endsWith(`/${PROJECT_RULES_FILE}`) || path === PROJECT_RULES_FILE)
+  const rulesLine = rulesEdited ? `${PROJECT_RULES_FILE} was edited by hand since it was saved: godmode follows the saved setup until the PM carries the edit into it with your yes.` : undefined
+  const line = [updateLineOf(shared.godmodeVersion, current), ...flagged, rulesLine].filter(part => part !== undefined).join('\n') || undefined
   if (found.personal === undefined) return { mode: 'setup', setupScope: 'personal', recheck, line }
   return { mode: 'coding', setupScope: 'full', recheck, line, indicatorStyle: found.personal.answers.indicator, qaLine: qaModeLine(shared.answers) }
 }
@@ -110,6 +115,8 @@ const switchOn = async ($: EngineInterface, to: GodmodeMode) => {
   await update($, mainThreadReads, () => 0)
   await update($, mode, () => to)
   await update($, isOn, () => true)
+  // The side pane, when it is the person's indicator, opens with godmode in every mode.
+  await openGodmodePane($).catch(() => undefined)
   return registerTicketTools($)
 }
 
@@ -128,7 +135,10 @@ const serveTicketTool = async ($: EngineInterface, cache: LoopCache, e: { tool: 
   const { tool, tool_use_id: _id, agentId, consent: _consent, ...input } = e
   try {
     const backend = await ticketBackendOf($)
-    return { result: await runTicketTool(backend, tool.replace(/^mcp__godmode__/, '') as TicketToolName, input, { agentId, checkMove: ticketMoveCheck($, cache) }) }
+    const result = await runTicketTool(backend, tool.replace(/^mcp__godmode__/, '') as TicketToolName, input, { agentId, checkMove: ticketMoveCheck($, cache) })
+    // A ticket changed: the side pane lists it as it is now.
+    await refreshPaneTickets($, cache).catch(() => undefined)
+    return { result }
   } catch (error) {
     if (error instanceof TicketError) return { deny: error.message }
     return { deny: `godmode's ticket tool failed: ${error instanceof Error ? error.message : String(error)}` }
@@ -166,8 +176,9 @@ export const register: Register = on => {
   // The app `/godmode try` started; a reload of the module ends it.
   const tries: TryHandles = {}
 
-  // The "godmode is on" indicator (D68), drawn by `indicator.tsx`.
+  // The "godmode is on" indicator (D68), drawn by `indicator.tsx`, and the side pane, by `pane.tsx`.
   registerIndicator(on)
+  registerPane(on)
 
   // The PM is the main thread, never a dispatched agent: its type stays off the model's list.
   on('agent.offer', { agent: 'godmode:pm' }, () => ({ isOffered: false }))
@@ -183,6 +194,7 @@ export const register: Register = on => {
     if ((await read($, isOn)) === true) await registerTicketTools($)
     // A try the old copy of the module started died with it; free its port.
     await forgetStaleTry($, tries).catch(() => undefined)
+    startPaneClock($)
     return next(e)
   })
 
@@ -198,7 +210,12 @@ export const register: Register = on => {
   on('turn.step', async function* ($, e, next) {
     const current = (await read($, isOn)) === true ? await read($, mode) : undefined
     const isPm = e.agentId === undefined && (current === 'coding' || current === 'change-setup') && !isPmModel(e.model)
-    if (!isPm) return yield* next(e)
+    if (!isPm) {
+      const step = yield* next(e)
+      // An agent's request adds to its tokens on the side pane.
+      await paneStep($, e.agentId, step.usage).catch(() => undefined)
+      return step
+    }
     const known = await read($, pmModel)
     if (known !== 'untried') return yield* next({ ...e, model: known === 'opus' ? PM_FALLBACK_MODEL : PM_MODEL })
     const held: TurnStepChunk[] = []
@@ -270,11 +287,16 @@ export const register: Register = on => {
     if (setupRefusal !== undefined) return { deny: setupRefusal }
     const decision = await decideToolCall($, cache, e)
     if (decision.deny !== undefined) return { deny: decision.deny }
-    return afterToolCall($, cache, decision, await next(e))
+    // An agent's tool call is its current action on the side pane, until it ends.
+    const input = e as unknown as Record<string, unknown>
+    await paneAction($, e.agentId, String(e.tool), input, false).catch(() => undefined)
+    const ran = await next(e)
+    await paneAction($, e.agentId, String(e.tool), input, true).catch(() => undefined)
+    return afterToolCall($, cache, decision, ran)
   }).catch(($, e, next) => {
     if (next.called) return next(e)
     return {
-      deny: `godmode's tool-call check failed (${next.error.message ?? next.error.kind}), so it refused this call to be safe. Nothing ran. The person can go on without godmode with \`/godmode off\`.`,
+      deny: `godmode's check of this call failed (${next.error.message ?? next.error.kind}), so nothing ran. Run it again; if the check fails again, tell the person what failed.`,
     }
   })
 
@@ -282,7 +304,9 @@ export const register: Register = on => {
   on('agent.spawn', async ($, e, next) => {
     const plan = await planSpawn($, cache, e)
     if (plan.deny !== undefined) return { deny: plan.deny }
+    const startedAt = await $.clock.now()
     const started = await next(plan.input)
+    if (started.agentId !== undefined) await paneSpawned($, plan.input, started.agentId, startedAt).catch(() => undefined)
     if (started.agentId !== undefined && plan.record !== undefined) {
       await recordAgent($, started.agentId, plan.record)
       await recordDevDispatch($, cache, started.agentId, plan.record).catch(() => undefined)
@@ -291,20 +315,26 @@ export const register: Register = on => {
   }).catch(($, e, next) => {
     if (next.called) return next(e)
     return {
-      deny: `godmode's dispatch check failed (${next.error.message ?? next.error.kind}), so the agent did not start. The person can go on without godmode with \`/godmode off\`.`,
+      deny: `godmode's check of this dispatch failed (${next.error.message ?? next.error.kind}), so the agent did not start. Dispatch it again; if the check fails again, tell the person what failed.`,
     }
   })
 
   // A dev agent's end reaches the main thread as a task notification; its last report says whether it stopped to ask the person (D57).
   on('session.receive', async ($, e, next) => {
     if (e.agentId === undefined && (await read($, isOn)) === true) await noteDevEnds($, cache, e.text).catch(() => undefined)
+    // A finished agent or shell's notice ends its row on the side pane, a subagent's included.
+    await paneReceived($, e.text).catch(() => undefined)
     return next(e)
   }).catch(($, e, next) => next(e))
 
   // The PM hears about each new draft PR, and each ticket waiting on QA, on its next prompt, a person's or a task notification (D35, D64, D73).
   on('prompt.submit', async ($, e, next) => {
     if ((await read($, isOn)) !== true) return next(e)
-    if (PERSON_ORIGINS.includes((e.origin as typeof e.origin | undefined)?.kind)) await update($, mainThreadReads, () => 0)
+    if (PERSON_ORIGINS.includes((e.origin as typeof e.origin | undefined)?.kind)) {
+      await update($, mainThreadReads, () => 0)
+      // An ask to work on this thread holds for one message of the person's (D78).
+      await endMainThreadAsks($)
+    }
     const report = await takeSetupReport($)
     // After an update and a reload, which may start no session, one line suggests the audit (D75).
     if (PERSON_ORIGINS.includes((e.origin as typeof e.origin | undefined)?.kind)) await noticeAudit($)
@@ -314,7 +344,9 @@ export const register: Register = on => {
     const reminder = isCoding && role === undefined ? pmReminder($.plugin.root) : undefined
     // The tickets waiting on QA, read from the ticket store on each prompt, never from memory (D73).
     const qa = isCoding ? await qaCheckBlock($, cache) : undefined
-    const told = [report, role, reminder, qa, await takePendingReviews($)].filter(text => text !== undefined)
+    const review = isCoding ? await codeReviewBlock($, cache) : undefined
+    if (isCoding) await refreshPaneTickets($, cache).catch(() => undefined)
+    const told = [report, role, reminder, qa, review, await takePendingReviews($)].filter(text => text !== undefined)
     return next(told.length === 0 ? e : { ...e, context: [...(e.context ?? []), ...told] })
   }).catch(($, e, next) => next(e))
 
@@ -379,6 +411,7 @@ export const register: Register = on => {
     if (action === 'off') {
       if ((await read($, isOn)) !== true) return { text: 'godmode is already off.' }
       await update($, isOn, () => false)
+      await closeGodmodePane($).catch(() => undefined)
       return { text: 'godmode is off: plain Claude Code for the rest of the session.' }
     }
     // Read-only, on or off (D44, D70).

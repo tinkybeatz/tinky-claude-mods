@@ -7,13 +7,15 @@ import type { BoardData, FieldMeta } from './jira'
 import { trackerKindOf } from './tickets'
 import { claudeDirOf, conventionsDirOf, fingerprintOf, notePath, projectOf, readNote, STORAGE_MODES, writeSharedNote } from './storage'
 import type { Answer, Project, StorageMode } from './storage'
+import { logLines, questionText } from './ui-text'
 
 /*
- * The ticket-filing rules (D74): how this team files Jira tickets, learned from a read-only
- * scan of the board that the person confirms, or from the person's own words, and kept as a
- * plain conventions file, `ticket-filing.md`, the PM follows when it files. The scan's
- * reading is plain functions; the `ticket_rules` tool asks the person, and saves the rules
- * only on their yes. Every helper that takes `$` is a function declaration.
+ * The ticket-filing rules (D74, D76): the decisions godmode makes every time it files a Jira
+ * ticket, as a fixed checklist, answered from the person's own latest tickets first and the
+ * team's only where theirs do not settle an item, and kept as a plain conventions file,
+ * `ticket-filing.md`, under the same headings. An item no ticket settles is "?" and asked,
+ * never guessed. The `ticket_rules` tool asks the person and saves only on their yes. Every
+ * helper that takes `$` is a function declaration.
  */
 
 // The same state as `register.tsx`'s atoms: `validate` reads a state source only from this file.
@@ -27,47 +29,21 @@ export const TICKET_RULES_FILE = 'ticket-filing.md'
 /** The setup answer that records where the rules file is, so `update` knows a note without one. */
 export const TICKET_RULES_KEY = 'ticketRules'
 
-/** How many of the latest issues a scan reads. */
-export const SCAN_SIZE = 30
-
-type Count = { value: string; count: number }
-
-type Placement = 'active sprint' | 'next sprint' | 'backlog' | 'a sprint now closed'
-
-/** How one issue type is used on the board. */
-export type TypeUse = { name: string; count: number; placement: Partial<Record<Placement, number>>; withParent: number; parentTypes: string[]; priority?: Count }
-
-/** A field the team usually sets, and the values it usually takes. */
-export type FieldUse = { id: string; name: string; setIn: number; values: Count[] }
-
-/** Text a field holds unchanged across issues, as a template left in place does. */
-export type TemplateText = { field: string; excerpt: string; count: number }
-
-/** What a board scan found. */
-export type BoardScan = {
-  project: string
-  total: number
-  /** How many of them the person created; absent when their account could not be read. */
-  mine?: number
-  types: TypeUse[]
-  sprintField?: string
-  labels: Count[]
-  components: Count[]
-  fields: FieldUse[]
-  /** Each issue type's required fields beyond the ones godmode sets, as "Name (id)". */
-  required: Record<string, string[]>
-  templates: TemplateText[]
-}
-
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 
 const flat = (text: string) => text.replace(/\s+/g, ' ').trim()
 
+// ---------------------------------------------------------------------------
+// Reading a ticket
+
+type Sprint = { name: string; state?: string }
+
+/** One ticket as the checklist reads it: its type, title, parent, fields by name, and sprints. */
+export type TicketRow = { type: string; isSubtask: boolean; title: string; parentType?: string; hasParent: boolean; fields: Record<string, unknown>; sprints: Sprint[] }
+
 /** The text of an Atlassian document (`{ type: 'doc', content }`), its text nodes joined. */
 const documentText = (value: unknown): string =>
-  isRecord(value)
-    ? `${typeof value.text === 'string' ? value.text : ''}${Array.isArray(value.content) ? value.content.map(documentText).join(' ') : ''}`
-    : ''
+  isRecord(value) ? `${typeof value.text === 'string' ? value.text : ''}${Array.isArray(value.content) ? value.content.map(documentText).join(' ') : ''}` : ''
 
 /** A field's value as text people read: an option's value, a name, a list of them; undefined when empty. */
 export const valueText = (value: unknown): string | undefined => {
@@ -84,162 +60,346 @@ export const valueText = (value: unknown): string | undefined => {
   return undefined
 }
 
-/** Counts, most common first. */
+/** Sprints in a field's value: `{ name, state }` objects, or bare names; none for anything else. */
+const sprintsIn = (value: unknown): Sprint[] => {
+  const items = Array.isArray(value) ? value : value === undefined || value === null ? [] : [value]
+  return items.flatMap(item => {
+    if (typeof item === 'string' && item.trim() !== '') return [{ name: item.trim() }]
+    if (!isRecord(item) || typeof item.name !== 'string') return []
+    return [{ name: item.name, ...(typeof item.state === 'string' ? { state: item.state.toLowerCase() } : {}) }]
+  })
+}
+
+/** Whether a value holds sprints with states, as Jira's sprint field does. */
+const isSprintValue = (value: unknown) => Array.isArray(value) && value.length > 0 && value.every(item => isRecord(item) && typeof item.name === 'string' && typeof item.state === 'string')
+
+/**
+ * Custom fields a server maps under `customFields`: by label, each `{ id, value }` (the
+ * "Atlassian MCP" server: `"Sprint": { "id": "customfield_10001", "value": [...] }`), by label
+ * with the bare value, or as `{ name, value }` rows.
+ */
+const customFieldsIn = (value: unknown): Record<string, unknown> => {
+  const unwrapped = (entry: unknown) => (isRecord(entry) && typeof entry.id === 'string' && entry.id.startsWith('customfield_') && 'value' in entry ? entry.value : entry)
+  if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([label, entry]) => [label, unwrapped(entry)]))
+  if (!Array.isArray(value)) return {}
+  return Object.fromEntries(
+    value.flatMap(row => {
+      if (!isRecord(row)) return []
+      const name = [row.name, row.label, row.key, row.id].find(part => typeof part === 'string')
+      return typeof name === 'string' ? [[name, 'value' in row ? row.value : row]] : []
+    }),
+  )
+}
+
+/**
+ * A ticket from a search row, in either server's shape: `fields` with `customfield_*` keys
+ * (named from the field metadata), or with custom fields under `customFields` by label. The
+ * sprint is the field named Sprint, or any field holding sprints with states.
+ */
+export const ticketRowOf = (issue: unknown, names: ReadonlyMap<string, string>): TicketRow | undefined => {
+  if (!isRecord(issue)) return undefined
+  const raw = isRecord(issue.fields) ? issue.fields : issue
+  const fields: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries({ ...raw, ...customFieldsIn(raw.customFields) })) {
+    if (key !== 'customFields') fields[names.get(key) ?? key] = value
+  }
+  const type = isRecord(fields.issuetype) && typeof fields.issuetype.name === 'string' ? fields.issuetype.name : typeof fields.issuetype === 'string' ? fields.issuetype : undefined
+  if (type === undefined) return undefined
+  const sprintKey = Object.keys(fields).find(key => /^sprints?$/i.test(key)) ?? Object.keys(fields).find(key => isSprintValue(fields[key]))
+  const sprints = sprintKey === undefined ? [] : sprintsIn(fields[sprintKey])
+  if (sprintKey !== undefined) delete fields[sprintKey]
+  const parent = isRecord(fields.parent) ? fields.parent : undefined
+  const parentFields = parent !== undefined && isRecord(parent.fields) ? parent.fields : parent
+  const parentType = parentFields !== undefined && isRecord(parentFields.issuetype) && typeof parentFields.issuetype.name === 'string' ? parentFields.issuetype.name : undefined
+  return {
+    type,
+    isSubtask: isRecord(fields.issuetype) && fields.issuetype.subtask === true,
+    title: typeof fields.summary === 'string' ? fields.summary : '',
+    ...(parentType === undefined ? {} : { parentType }),
+    hasParent: parent !== undefined,
+    fields,
+    sprints,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The checklist
+
+/** The kinds of work godmode files, and the issue type names that usually mean each. */
+const KINDS = [
+  { key: 'bug', label: 'Bug', pattern: /bug|defect|incident/i },
+  { key: 'feature', label: 'Feature or change', pattern: /story|feature|improvement|enhancement|change/i },
+  { key: 'chore', label: 'Chore or maintenance', pattern: /task|chore|maintenance|tech.?debt/i },
+  { key: 'piece', label: 'Piece of a bigger item', pattern: /sub-?task/i },
+] as const
+
+type Kind = (typeof KINDS)[number]['key']
+
+/** The kind of work an issue type is; undefined for a type of none, which the checklist leaves out. */
+const kindOf = (row: Pick<TicketRow, 'type' | 'isSubtask'>): Kind | undefined => {
+  if (row.isSubtask || /sub-?task/i.test(row.type)) return 'piece'
+  return KINDS.find(kind => kind.key !== 'piece' && kind.pattern.test(row.type))?.key
+}
+
+/** One checklist line: its heading, the item, the answer ("?" when nothing settles it), its source, and the question that asks it. */
+export type ChecklistItem = { heading: string; item: string; answer: string; source?: string; question?: string }
+
+/** Where an answer came from: the person's own tickets, or the team's when theirs do not settle it. */
+type Evidence = { rows: TicketRow[]; source: 'yours' | 'team' }
+
+const sourceOf = (evidence: Evidence, count: number) =>
+  evidence.source === 'yours' ? `from ${count} of your tickets` : `from ${count} of the team's tickets; none of yours settle it`
+
+/** The rows that settle an item: the person's own when any match, else the team's. */
+const evidenceFor = (own: readonly TicketRow[], team: readonly TicketRow[], match: (row: TicketRow) => boolean): Evidence | undefined => {
+  const mine = own.filter(match)
+  if (mine.length > 0) return { rows: mine, source: 'yours' }
+  const theirs = team.filter(match)
+  return theirs.length > 0 ? { rows: theirs, source: 'team' } : undefined
+}
+
+type Count = { value: string; count: number }
+
 const countsOf = (values: readonly string[]): Count[] => {
   const counts = new Map<string, number>()
   for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1)
   return [...counts].map(([value, count]) => ({ value, count })).sort((a, b) => b.count - a.count || a.value.localeCompare(b.value))
 }
 
-/** Whether a field holds sprints: a list of `{ name, state }`. */
-const isSprintValue = (value: unknown) => Array.isArray(value) && value.length > 0 && value.every(item => isRecord(item) && typeof item.state === 'string' && typeof item.name === 'string')
+/** The most common value when it holds for at least `share` of `total`; undefined otherwise. */
+const settled = (values: readonly string[], total: number, share = 0.6) => {
+  const [top] = countsOf(values)
+  return top !== undefined && top.count >= Math.max(1, Math.ceil(total * share)) ? top : undefined
+}
 
-const placementOf = (sprints: unknown): Placement => {
-  const states = Array.isArray(sprints) ? sprints.flatMap(item => (isRecord(item) && typeof item.state === 'string' ? [item.state.toLowerCase()] : [])) : []
-  if (states.includes('active')) return 'active sprint'
-  if (states.includes('future')) return 'next sprint'
-  return states.length > 0 ? 'a sprint now closed' : 'backlog'
+const placementOf = (sprints: readonly Sprint[]) => {
+  const states = sprints.flatMap(sprint => sprint.state ?? [])
+  if (states.includes('active')) return 'the active sprint'
+  if (states.includes('future')) return 'the next sprint'
+  if (sprints.length > 0 && states.length === 0) return 'a sprint'
+  return sprints.length > 0 ? 'a sprint now closed' : 'the backlog'
+}
+
+/** A sprint name's pattern, its numbers as `<n>`: "Web - Cooldown 12.2" is "Web - Cooldown <n>.<n>". */
+const sprintPattern = (name: string) => name.replace(/\d+/g, '<n>')
+
+/** A title's prefix, its numbers as `<n>`: "P3 - Export fails" is "P<n> - ", "[Editor] x" is "[Editor] ". */
+const titlePrefix = (title: string) => {
+  const found = /^(\[[^\]]{1,24}\]\s*|[A-Za-z0-9]{1,10}\s*[-–:|]\s+)/.exec(title)?.[1]
+  return found === undefined ? undefined : found.replace(/\d+/g, '<n>')
+}
+
+/** Headings in a description: markdown headings, bold lines, and short lines ending in a colon. */
+const headingsOf = (value: unknown): string[] => {
+  if (isRecord(value) && value.type === 'doc') {
+    const found: string[] = []
+    const walk = (node: unknown) => {
+      if (!isRecord(node)) return
+      if (node.type === 'heading') found.push(flat(documentText(node)))
+      if (Array.isArray(node.content)) node.content.forEach(walk)
+    }
+    walk(value)
+    return found.filter(text => text !== '')
+  }
+  if (typeof value !== 'string') return []
+  return value
+    .split('\n')
+    .map(line => line.trim())
+    .flatMap(line => {
+      const heading = /^#{1,6}\s+(.+)$/.exec(line)?.[1] ?? /^\*\*(.{2,40})\*\*:?$/.exec(line)?.[1] ?? /^([A-Z][^.:]{1,38}):$/.exec(line)?.[1]
+      return heading === undefined ? [] : [flat(heading.replace(/:$/, ''))]
+    })
 }
 
 /** Text that reads as a template's placeholder. */
 const PLACEHOLDER = /\{\{[^}]*\}\}|<[A-Za-z][A-Za-z ]{2,30}>|\[(?:describe|add|insert|enter|fill|your)[^\]]*\]|\bTODO\b|\bfill (?:this|in)\b|\bdelete this\b/i
 
-/** The fields godmode never reads as "usually set": the ones every issue has. */
-const SYSTEM_FIELDS = new Set(['customFields', 'key', 'id', 'self', 'webUrl', 'summary', 'status', 'issuetype', 'project', 'created', 'updated', 'reporter', 'creator', 'assignee', 'priority', 'labels', 'components', 'parent', 'description', 'statuscategorychangedate', 'lastViewed', 'watches', 'votes', 'workratio', 'resolution', 'resolutiondate', 'issuelinks', 'subtasks', 'attachment', 'comment', 'worklog', 'timetracking', 'progress', 'aggregateprogress', 'fixVersions', 'versions', 'environment', 'duedate', 'security', 'timespent', 'timeestimate', 'timeoriginalestimate', 'aggregatetimespent', 'aggregatetimeestimate', 'aggregatetimeoriginalestimate', 'statusCategory'])
+/** The fields every ticket has, which say nothing about how a team files; the priority is read on purpose. */
+const SYSTEM_FIELDS = new Set([
+  'summary', 'status', 'issuetype', 'project', 'created', 'updated', 'reporter', 'creator', 'assignee', 'parent', 'labels', 'components', 'description',
+  'key', 'id', 'self', 'webUrl', 'statuscategorychangedate', 'lastViewed', 'watches', 'votes', 'workratio', 'resolution', 'resolutiondate', 'issuelinks',
+  'subtasks', 'attachment', 'comment', 'worklog', 'timetracking', 'progress', 'aggregateprogress', 'fixVersions', 'versions', 'environment', 'duedate',
+  'security', 'timespent', 'timeestimate', 'timeoriginalestimate', 'aggregatetimespent', 'aggregatetimeestimate', 'aggregatetimeoriginalestimate', 'statusCategory', 'Rank',
+  // The parent under its older names: the Parent line already says it, and its value is one ticket's own.
+  'Epic Link', 'Parent Link',
+])
+
+/** The fields godmode always sets itself, which no rule needs to name. */
+const GODMODE_SET: readonly string[] = ['summary', 'description', 'issuetype', 'project', 'reporter']
+
+/** A type's fields: required by Jira (with the usual value where tickets show one), set by habit, or left holding template text. */
+const fieldsAnswer = (rows: readonly TicketRow[], meta: readonly FieldMeta[]) => {
+  const named = rows.map(row => row.fields)
+  const required = meta.filter(field => field.isRequired && !field.hasDefault && !GODMODE_SET.includes(field.id)).map(field => field.name)
+  const usual = (name: string) => settled(named.flatMap(fields => valueText(fields[name]) ?? []), rows.length)?.value
+  const parts = required.map(name => `${name} (required by Jira${usual(name) === undefined ? '' : `, usually ${usual(name)}`})`)
+  const templates: string[] = []
+  const candidates = [...new Set(named.flatMap(fields => Object.keys(fields)))].filter(name => !SYSTEM_FIELDS.has(name) && !required.includes(name))
+  for (const name of candidates) {
+    const texts = named.flatMap(fields => valueText(fields[name]) ?? [])
+    const repeated = settled(texts, rows.length, 0.4)
+    if (texts.some(text => PLACEHOLDER.test(text)) || (repeated !== undefined && repeated.value.length >= 40 && repeated.count >= 2)) {
+      templates.push(name)
+      continue
+    }
+    const habit = settled(texts, rows.length)
+    if (habit !== undefined && habit.value.length <= 40) parts.push(`${name === 'priority' ? 'Priority' : name} = ${habit.value} (habit, ${habit.count} of ${rows.length})`)
+  }
+  if (templates.length > 0) parts.push(`fill or leave: ${templates.join(', ')} (template text)`)
+  return parts.length === 0 ? 'none' : parts.join('; ')
+}
+
+/** The kinds of work with the issue type the evidence settles for each, and that type's own tickets. */
+type Chosen = { type: string; evidence: Evidence }
 
 /**
- * What the board's latest issues say about how the team files tickets (D74): the issue types
- * in use and where each goes (active sprint, next sprint, backlog), parents, labels and
- * components, the custom fields usually set with their usual values, each type's required
- * fields, and text left unchanged from a template.
+ * Where a type's new tickets go, with the naming pattern of the sprints they go in when one
+ * shows ("Web - Cooldown <n>.<n>"): a team's active and next sprints are often named
+ * apart, so the pattern is read per type and placement, never across the board.
  */
-export const scanBoard = (data: BoardData): BoardScan => {
-  // A row's fields, or the row itself when a server answers them flat; custom fields a server
-  // maps to labels under `customFields` are read beside the rest.
-  const rows = data.issues.flatMap(issue => {
-    if (!isRecord(issue)) return []
-    const fields = isRecord(issue.fields) ? issue.fields : issue
-    return [{ ...fields, ...(isRecord(fields.customFields) ? fields.customFields : {}) }]
-  })
-  const names = new Map<string, string>()
-  for (const meta of Object.values(data.typeFields)) for (const field of meta) names.set(field.id, field.name)
-  const sprintField = [...new Set(rows.flatMap(fields => Object.keys(fields).filter(key => isSprintValue(fields[key]))))][0]
-  const typeOf = (fields: Record<string, unknown>) => (isRecord(fields.issuetype) && typeof fields.issuetype.name === 'string' ? fields.issuetype.name : 'unknown')
-  const types: TypeUse[] = countsOf(rows.map(typeOf)).map(({ value: name, count }) => {
-    const own = rows.filter(fields => typeOf(fields) === name)
-    const placement: TypeUse['placement'] = {}
-    for (const fields of own) {
-      const where = placementOf(sprintField === undefined ? undefined : fields[sprintField])
-      placement[where] = (placement[where] ?? 0) + 1
+const placementItems = (chosen: readonly Chosen[]): ChecklistItem[] =>
+  chosen.map(({ type, evidence }) => {
+    const where = evidence.rows.map(row => placementOf(row.sprints))
+    const top = settled(where, where.length)
+    if (top === undefined) {
+      return { heading: 'Placement', item: type, answer: `? (${countsOf(where).map(entry => `${entry.value} ${entry.count}`).join(', ')})`, question: `Where does a new ${type} go: the active sprint, the next sprint, or the backlog? Name the sprint if it follows a pattern.` }
     }
-    const parents = own.flatMap(fields => (isRecord(fields.parent) ? [fields.parent] : []))
-    const parentTypes = countsOf(parents.flatMap(parent => (isRecord(parent.fields) && isRecord(parent.fields.issuetype) && typeof parent.fields.issuetype.name === 'string' ? [parent.fields.issuetype.name] : []))).map(entry => entry.value)
-    const [priority] = countsOf(own.flatMap(fields => valueText(fields.priority) ?? []))
-    return { name, count, placement, withParent: parents.length, parentTypes, ...(priority === undefined || priority.count * 10 < own.length * 6 ? {} : { priority }) }
+    const open = evidence.rows.filter(row => placementOf(row.sprints) === top.value).flatMap(row => row.sprints.filter(sprint => sprint.state !== 'closed'))
+    const pattern = settled(open.map(sprint => sprintPattern(sprint.name)), open.length)
+    const example = open.find(sprint => pattern !== undefined && sprintPattern(sprint.name) === pattern.value)?.name
+    const named = pattern === undefined || example === undefined ? '' : `, named like "${pattern.value}" (e.g. "${example}")`
+    return { heading: 'Placement', item: type, answer: `${top.value}${named}`, source: sourceOf(evidence, top.count) }
   })
-  const custom = [...new Set(rows.flatMap(fields => Object.keys(fields)))].filter(key => !SYSTEM_FIELDS.has(key) && key !== sprintField)
-  const fields: FieldUse[] = custom
-    .map(id => {
-      const values = rows.flatMap(fields => valueText(fields[id]) ?? [])
-      return { id, name: names.get(id) ?? id, setIn: values.length, values: countsOf(values).filter(entry => entry.value.length <= 60).slice(0, 3) }
-    })
-    .filter(field => field.setIn >= Math.max(2, Math.ceil(rows.length * 0.4)) && field.values.length > 0)
-    .sort((a, b) => b.setIn - a.setIn)
-    .slice(0, 8)
-  const texts = new Map<string, { field: string; text: string; count: number }>()
-  for (const fields of rows) {
-    for (const [id, value] of Object.entries(fields)) {
-      const text = typeof value === 'string' || (isRecord(value) && value.type === 'doc') ? valueText(value) : undefined
-      if (text === undefined || text.length < 20) continue
-      const key = `${id}\n${text}`
-      texts.set(key, { field: names.get(id) ?? id, text, count: (texts.get(key)?.count ?? 0) + 1 })
-    }
-  }
-  const templates = [...texts.values()]
-    .filter(entry => (entry.count >= 2 && entry.text.length >= 40) || PLACEHOLDER.test(entry.text))
-    .map(entry => ({ field: entry.field, excerpt: entry.text.length > 70 ? `${entry.text.slice(0, 67)}...` : entry.text, count: entry.count }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 5)
-  const isGodmodeSet = (field: FieldMeta) => ['summary', 'description', 'issuetype', 'project', 'reporter'].includes(field.id)
-  const required = Object.fromEntries(
-    Object.entries(data.typeFields).map(([type, meta]) => [type, meta.filter(field => field.isRequired && !field.hasDefault && !isGodmodeSet(field)).map(field => `${field.name} (${field.id})`)]),
-  )
-  const creators = data.account === undefined ? undefined : rows.filter(fields => isRecord(fields.creator) && fields.creator.accountId === data.account).length
-  return {
-    project: data.project,
-    total: rows.length,
-    ...(creators === undefined ? {} : { mine: creators }),
-    types,
-    ...(sprintField === undefined ? {} : { sprintField }),
-    labels: countsOf(rows.flatMap(fields => (Array.isArray(fields.labels) ? fields.labels.filter((label): label is string => typeof label === 'string') : []))).slice(0, 6),
-    components: countsOf(rows.flatMap(fields => (Array.isArray(fields.components) ? fields.components.flatMap(item => valueText(item) ?? []) : []))).slice(0, 6),
-    fields,
-    required,
-    templates,
-  }
-}
 
-/** Why a scan says nothing clear enough to propose rules; undefined when it does. */
-export const unclearScan = (scan: BoardScan) => {
-  if (scan.total === 0) return `${scan.project} has no issues yet`
-  if (scan.total < 3) return `${scan.project} has only ${scan.total} issue${scan.total === 1 ? '' : 's'}, too few to see a pattern`
-  return undefined
-}
+/**
+ * Whether a type's tickets have a parent, and of which type, read per type: a team's tasks may
+ * always sit under an epic while its bugs never do. Which parent is the person's call each
+ * time, unless the answer is none.
+ */
+const parentItems = (chosen: readonly Chosen[]): ChecklistItem[] =>
+  chosen.map(({ type, evidence }): ChecklistItem => {
+    const rows = evidence.rows
+    const withParent = rows.filter(row => row.hasParent)
+    const parentType = countsOf(withParent.flatMap(row => row.parentType ?? []))[0]?.value ?? 'parent'
+    const article = /^[aeiou]/i.test(parentType) ? 'an' : 'a'
+    const answer =
+      withParent.length >= Math.ceil(rows.length * 0.9)
+        ? `${article} ${parentType}; ask the person which one each time`
+        : withParent.length === 0
+          ? 'none'
+          : `sometimes ${article} ${parentType} (${withParent.length} of ${rows.length}); ask the person each time`
+    return { heading: 'Parent', item: type, answer, source: sourceOf(evidence, rows.length) }
+  })
 
-const counted = (entries: readonly Count[]) => entries.map(entry => `${entry.value} (${entry.count})`).join(', ')
-
-const placementLine = (type: TypeUse) =>
-  Object.entries(type.placement)
-    .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
-    .map(([where, count]) => `${where} ${count}`)
-    .join(', ')
-
-/** The scan as rules, one plain line each, for the person to read and the PM to follow. */
-export const scanLines = (scan: BoardScan) => [
-  `Read from the latest ${scan.total} issues in ${scan.project}${scan.mine === undefined ? '' : `, ${scan.mine} of them yours`}.`,
-  ...scan.types.map(type => {
-    const parent = type.withParent === 0 ? 'no parent' : `a parent on ${type.withParent} of ${type.count}${type.parentTypes.length === 0 ? '' : ` (${type.parentTypes.join(', ')})`}`
-    const priority = type.priority === undefined ? '' : `, usually priority ${type.priority.value}`
-    return `- ${type.name}: ${type.count} of ${scan.total}. Goes to: ${placementLine(type)}. ${parent[0]?.toUpperCase()}${parent.slice(1)}${priority}.`
+/** A type's title prefix and description template, when its tickets show one. */
+const writingItems = (chosen: readonly Chosen[]): ChecklistItem[] => [
+  ...chosen.map(({ type, evidence }): ChecklistItem => {
+    const prefix = settled(evidence.rows.flatMap(row => titlePrefix(row.title) ?? []), evidence.rows.length)
+    if (prefix !== undefined) return { heading: 'Title', item: type, answer: `starts "${prefix.value}"`, source: sourceOf(evidence, prefix.count) }
+    return evidence.rows.length >= 3
+      ? { heading: 'Title', item: type, answer: 'no fixed prefix', source: sourceOf(evidence, evidence.rows.length) }
+      : { heading: 'Title', item: type, answer: '?', question: `Does a ${type} title follow a pattern, like a "P3 - " prefix?` }
   }),
-  scan.sprintField === undefined ? '- No sprint field found: tickets go to the backlog.' : `- The sprint field is ${scan.sprintField}.`,
-  ...(scan.labels.length === 0 ? [] : [`- Labels used: ${counted(scan.labels)}.`]),
-  ...(scan.components.length === 0 ? [] : [`- Components used: ${counted(scan.components)}.`]),
-  ...scan.fields.map(field => `- ${field.name}${field.name === field.id ? '' : ` (${field.id})`} is set on ${field.setIn} of ${scan.total}, usually ${counted(field.values)}.`),
-  ...Object.entries(scan.required).flatMap(([type, fields]) => (fields.length === 0 ? [] : [`- A ${type} requires ${fields.join(', ')}.`])),
-  ...scan.templates.map(entry => `- ${entry.field} still holds template text on ${entry.count} issue${entry.count === 1 ? '' : 's'} ("${entry.excerpt}"): write the real content instead.`),
+  ...chosen.map(({ type, evidence }): ChecklistItem => {
+    const fields = [...new Set(evidence.rows.flatMap(row => Object.keys(row.fields)))].filter(name => /description/i.test(name))
+    const found = fields.flatMap(name => {
+      const headings = evidence.rows.map(row => new Set(headingsOf(row.fields[name])))
+      const common = [...new Set(headings.flatMap(set => [...set]))].filter(heading => headings.filter(set => set.has(heading)).length >= Math.ceil(evidence.rows.length * 0.6))
+      return common.length === 0 ? [] : [`${name === 'description' ? 'Description' : name}: ${common.join(', ')}`]
+    })
+    if (found.length > 0) return { heading: 'Description', item: type, answer: found.join('; '), source: sourceOf(evidence, evidence.rows.length) }
+    return evidence.rows.length >= 3
+      ? { heading: 'Description', item: type, answer: 'free text', source: sourceOf(evidence, evidence.rows.length) }
+      : { heading: 'Description', item: type, answer: '?', question: `Does a ${type} description follow a template, and which headings?` }
+  }),
 ]
 
-/** The rules file as written from a confirmed scan. */
-export const rulesFromScan = (scan: BoardScan, date: string) =>
-  [
+/** Labels and components, only when the tickets actually use them. */
+const tagItems = (own: readonly TicketRow[], team: readonly TicketRow[]): ChecklistItem[] => {
+  const all: Evidence = own.length > 0 ? { rows: [...own], source: 'yours' } : { rows: [...team], source: 'team' }
+  return (['labels', 'components'] as const).flatMap(key => {
+    const used = all.rows.filter(row => valueText(row.fields[key]) !== undefined)
+    if (used.length === 0 || used.length < Math.ceil(all.rows.length * 0.3)) return []
+    const values = countsOf(used.flatMap(row => (valueText(row.fields[key]) ?? '').split(', '))).slice(0, 4).map(entry => entry.value)
+    return [{ heading: 'Labels and components', item: key === 'labels' ? 'Labels' : 'Components', answer: values.join(', '), source: sourceOf(all, used.length) }]
+  })
+}
+
+/**
+ * The checklist (D76): the decisions godmode makes each time it files a Jira ticket, each
+ * answered from the person's own tickets first and the team's only where theirs say nothing,
+ * each with its source; an item nothing settles is "?". Counts of issue types across the
+ * board are never part of it.
+ */
+export const checklistOf = (data: Pick<BoardData, 'own' | 'team' | 'typeFields'>): ChecklistItem[] => {
+  const names = new Map<string, string>()
+  for (const meta of Object.values(data.typeFields)) for (const field of meta) names.set(field.id, field.name)
+  const own = data.own.flatMap(issue => ticketRowOf(issue, names) ?? [])
+  const team = data.team.flatMap(issue => ticketRowOf(issue, names) ?? [])
+  const chosen: Chosen[] = []
+  const types = KINDS.map((kind): ChecklistItem => {
+    const evidence = evidenceFor(own, team, row => kindOf(row) === kind.key)
+    const top = evidence === undefined ? undefined : countsOf(evidence.rows.map(row => row.type))[0]
+    if (evidence === undefined || top === undefined) return { heading: 'Issue type', item: kind.label, answer: '?', question: `Which issue type does a ${kind.label.toLowerCase()} get?` }
+    chosen.push({ type: top.value, evidence: { ...evidence, rows: evidence.rows.filter(row => row.type === top.value) } })
+    return { heading: 'Issue type', item: kind.label, answer: top.value, source: sourceOf(evidence, top.count) }
+  })
+  return [
+    ...types,
+    ...placementItems(chosen),
+    ...parentItems(chosen),
+    { heading: 'Assignee', item: 'Assignee', answer: 'you, unless you say otherwise', source: 'godmode\'s default' },
+    ...chosen.map(({ type, evidence }): ChecklistItem => ({ heading: 'Fields', item: type, answer: fieldsAnswer(evidence.rows, data.typeFields[type] ?? []), source: sourceOf(evidence, evidence.rows.length) })),
+    ...writingItems(chosen),
+    ...tagItems(own, team),
+  ]
+}
+
+/** One checklist line, as shown and as saved: "item: answer (source)". */
+export const checklistLine = (item: ChecklistItem) => `- ${item.item}: ${item.answer}${item.source === undefined ? '' : ` (${item.source})`}`
+
+/** The checklist as the person reads it: each heading on a line of its own, then its items, one line each. */
+export const checklistLines = (items: readonly ChecklistItem[]) =>
+  [...new Set(items.map(item => item.heading))].flatMap(heading => [`${heading}:`, ...items.filter(item => item.heading === heading).map(checklistLine)])
+
+/** The rules file, under the checklist's headings, so a hand edit is easy and the PM reads it the same way. */
+export const checklistFile = (items: readonly ChecklistItem[], project: string, how: string) => {
+  const headings = [...new Set(items.map(item => item.heading))]
+  return [
     '# Ticket filing',
     '',
-    `How tickets are filed in Jira project ${scan.project}. godmode wrote this from a scan of the board on ${date}, and the person confirmed it. Edit it freely: godmode reads it as it stands.`,
+    `How godmode files a ticket in Jira project ${project}: ${how}. Edit any line. "?" means ask the person.`,
     '',
-    '## What the board shows',
+    ...headings.flatMap(heading => [`## ${heading}`, '', ...items.filter(item => item.heading === heading).map(checklistLine), '']),
+    '## When nothing fits',
     '',
-    ...scanLines(scan),
-    '',
-    '## Filing a ticket',
-    '',
-    '- Pick the issue type, the sprint, the parent, the labels, the components and the fields above, and pass them to `ticket_create` in `jira`.',
-    '- A field the issue type requires that these rules do not cover: ask the person, never guess.',
-    '- A ticket that fits no rule here: ask the person how to file it, then add the rule (`ticket_rules`).',
+    '- Ask the person how to file the ticket, then add the rule (`ticket_rules`).',
     '',
   ].join('\n')
+}
+
+/** The checklist when the person answers it themselves, under the same headings. */
+const EXPLAINED: readonly ChecklistItem[] = [
+  ...KINDS.map(kind => ({ heading: 'Issue type', item: kind.label, answer: '?', question: `Which issue type does a ${kind.label.toLowerCase()} get?` })),
+  { heading: 'Placement', item: 'Placement', answer: '?', question: 'Where does each new ticket go: the active sprint, the next sprint, or the backlog? Name the sprint if it follows a pattern.' },
+  { heading: 'Parent', item: 'Parent', answer: '?', question: 'Does a new ticket need a parent (an epic or a story), and how is it chosen?' },
+  { heading: 'Fields', item: 'Fields', answer: '?', question: 'Which fields does each type need, with which usual values (a team, a priority, a flag)?' },
+  { heading: 'Title', item: 'Title', answer: '?', question: 'Does a title follow a pattern, like a "P3 - " prefix on bugs?' },
+  { heading: 'Description', item: 'Description', answer: '?', question: 'Does a description follow a template, and which headings?' },
+  { heading: 'Labels and components', item: 'Labels and components', answer: '?', question: 'Which labels or components does a ticket get, if any?' },
+]
 
 // ---------------------------------------------------------------------------
 // The tool
 
-/** The `ticket_rules` tool: read, learn or change how the team files Jira tickets. */
+/** The `ticket_rules` tool: read, learn or change how the person files Jira tickets. */
 export const TICKET_RULES_TOOL: ToolSpec & { name: 'ticket_rules' } = {
   name: 'ticket_rules',
   description:
-    'The project\'s Jira ticket-filing rules (ticket-filing.md). With no arguments while coding: answers the rules as they stand; read them before every ticket_create on Jira. With no arguments in setup or in /godmode setup: asks the person whether to scan the board (read-only) and confirm, or explain the flow in their words; saves only on their yes. With `rules` (the whole file, in plain lines): shows the rules to the person and saves them on their yes. Use it when the person gives a new filing rule ("from now on bugs go in the next sprint"): read the rules, add theirs, call it with the whole file.',
+    'The project\'s Jira ticket-filing rules (ticket-filing.md), a checklist: issue type per kind of work, placement, parent, assignee, fields, title, description, labels and components. With no arguments while coding: answers the rules as they stand; read them before every ticket_create on Jira, and ask the person for any "?" item. With no arguments in setup or in /godmode setup: asks the person whether to scan their tickets (read-only) and confirm, or answer the checklist themselves; saves only on their yes. With `rules` (the whole file, same headings): shows the rules to the person and saves them on their yes. Use it when the person gives a new filing rule ("from now on bugs go in the next sprint"): read the rules, change that line, call it with the whole file.',
   inputSchema: {
     type: 'object',
-    properties: { rules: { type: 'string', description: 'The whole rules file, as plain markdown lines.' } },
+    properties: { rules: { type: 'string', description: 'The whole rules file, under the checklist headings.' } },
   },
   isDeferred: false,
 }
@@ -264,27 +424,19 @@ async function placeOf($: EngineInterface, current: GodmodeMode): Promise<Place 
   return { project, dir, answers: { ...found.shared.answers, ...(found.personal?.answers ?? {}) }, isSetup: false }
 }
 
-/** Asks one question; undefined when nobody could answer. */
+/** Asks one question, on one line; undefined when nobody could answer. */
 async function ask($: EngineInterface, question: string, options: string[], header: string): Promise<string | undefined> {
   try {
-    return await $.ui.ask(question, { options, header })
+    return await $.ui.ask(questionText(question), { options, header })
   } catch {
     return undefined
   }
 }
 
-const NOBODY = 'godmode could not ask the person (a headless run, or the question was dismissed). Nothing was saved. Ask them in plain words how their team files tickets, then call ticket_rules with `rules`.'
+const NOBODY = 'godmode could not ask the person (a headless run, or the question was dismissed). Nothing was saved. Ask them the ticket-filing checklist in plain words, then call ticket_rules with `rules`.'
 
-/**
- * Saves the rules file on the person's yes: in setup mode for `setup_finish` to fingerprint
- * with the other conventions, otherwise straight into the note's conventions with a new
- * fingerprint, so a hand edit later is seen like any conventions edit.
- */
-async function saveRules($: EngineInterface, place: Place, rules: string): Promise<string> {
-  $.ui.log(`The ticket-filing rules godmode would save:\n${rules.trim()}`)
-  const answer = await ask($, 'Save the ticket-filing rules shown above?', ['Save', 'Not yet'], 'Ticket rules')
-  if (answer === undefined) return NOBODY
-  if (answer !== 'Save') return 'The person did not save these rules. Ask what to change, then call ticket_rules with the new `rules`.'
+/** Writes the rules file and records it: in the setup run, or straight into the note's conventions with a new fingerprint. */
+async function writeRules($: EngineInterface, place: Place, rules: string): Promise<string> {
   const path = `${place.dir}/${TICKET_RULES_FILE}`
   const relative = notePath(place.project, path)
   await $.fs.write(path, `${rules.trim()}\n`)
@@ -297,34 +449,57 @@ async function saveRules($: EngineInterface, place: Place, rules: string): Promi
     return `Saved ${relative}. setup_finish adds it to the conventions the loop follows.`
   }
   const found = await readNote($, place.project)
-  if (found.status !== 'found') return `Saved ${relative}, but the setup note could not be read, so its fingerprint was not taken. Run \`/godmode setup\` with topic \`check\`.`
+  if (found.status !== 'found') return `Saved ${relative}, but the setup note could not be read, so its fingerprint was not taken. Run \`/godmode audit\`.`
   const print = await fingerprintOf($, place.project, relative)
   const conventions = [...found.shared.conventions.filter(file => file.path !== relative), ...(print === undefined ? [] : [{ path: relative, fingerprint: print }])]
   await writeSharedNote($, found.dir, { ...found.shared, answers: { ...found.shared.answers, [TICKET_RULES_KEY]: relative }, conventions })
   return `Saved ${relative}, and it is among the conventions the loop follows. Follow it from the next ticket on.`
 }
 
-const toModel = (what: string, said: string, draft?: string) =>
+/** Shows rules one line per log line and saves them on the person's yes. */
+async function saveRules($: EngineInterface, place: Place, rules: string): Promise<string> {
+  logLines($, rules)
+  const answer = await ask($, 'Save the ticket-filing rules shown above?', ['Save', 'Not yet'], 'Ticket rules')
+  if (answer === undefined) return NOBODY
+  if (answer !== 'Save') return 'The person did not save these rules. Ask what to change, then call ticket_rules with the new `rules`.'
+  return writeRules($, place, rules)
+}
+
+const toModel = (said: string, draft: string) =>
   [
-    `The person ${what}, in their words:`,
+    'The person corrected the checklist, in their words:',
     `"${said.trim()}"`,
-    draft === undefined
-      ? 'Turn it into plain filing rules: issue types and when each is used, where new tickets go (active sprint, next sprint, backlog), parents, labels, components, fields to set with their values, and what to do when no rule fits (ask the person). Then call ticket_rules with `rules` holding the whole file; godmode shows it to them and saves it on their yes.'
-      : 'Rewrite the rules below with their corrections (theirs win; keep what they did not correct), then call ticket_rules with `rules` holding the whole file; godmode shows it to them and saves it on their yes.',
-    ...(draft === undefined ? [] : ['', draft]),
+    'Rewrite the rules below with their corrections (theirs win; keep what they did not correct; an item still unknown stays "?"), then call ticket_rules with `rules` holding the whole file; godmode shows it to them and saves it on their yes.',
+    '',
+    draft,
   ].join('\n')
 
-/** The person explains the flow in their words; resolves the tool's answer. */
-async function explain($: EngineInterface, project: string): Promise<string> {
-  const answer = await ask(
-    $,
-    `How does your team file tickets in ${project}? Type it under Other: types, sprint or backlog, parents, labels, fields.`,
-    ['Skip for now', 'Decide later'],
-    'Ticket rules',
-  )
-  if (answer === undefined) return NOBODY
-  if (answer === 'Skip for now' || answer === 'Decide later') return 'The person skipped the ticket rules: nothing was saved. `/godmode setup` with topic `tickets` adds them later.'
-  return toModel('explained how their team files tickets', answer)
+const ASK_EACH_TIME = 'Ask me each time'
+const LEAVE_OUT = 'Leave it out'
+
+/** Asks each item with a question in turn: the person types the answer, or picks "ask me each time" or "leave it out". Undefined when nobody could answer. */
+async function askItems($: EngineInterface, items: readonly ChecklistItem[]): Promise<ChecklistItem[] | undefined> {
+  const answered: ChecklistItem[] = []
+  for (const item of items) {
+    const { question, ...rest } = item
+    if (question === undefined) {
+      answered.push(rest)
+      continue
+    }
+    const said = await ask($, `${question} Type it under Other.`, [ASK_EACH_TIME, LEAVE_OUT], 'Ticket rules')
+    if (said === undefined) return undefined
+    if (said === LEAVE_OUT) continue
+    answered.push({ ...rest, answer: said === ASK_EACH_TIME ? 'ask the person each time' : flat(said), source: 'your answer' })
+  }
+  return answered
+}
+
+/** The person answers the checklist themselves, item by item; resolves the tool's answer. */
+async function explain($: EngineInterface, place: Place, project: string): Promise<string> {
+  const items = await askItems($, EXPLAINED)
+  if (items === undefined) return NOBODY
+  if (items.length === 0) return 'The person left every item out: nothing was saved. `/godmode setup` with topic `tickets` asks again.'
+  return saveRules($, place, checklistFile(items, project, 'the person answered the checklist'))
 }
 
 const EXPLAIN = 'I\'ll explain it myself'
@@ -339,31 +514,37 @@ async function scanFailed($: EngineInterface, place: Place, project: string, why
   if (answer === undefined) return NOBODY
   if (answer === TRY_AGAIN) return scanAndConfirm($, place, tries + 1)
   if (answer === 'Skip for now') return 'The person skipped the ticket rules: nothing was saved. `/godmode setup` with topic `tickets` adds them later.'
-  return answer === EXPLAIN ? explain($, project) : toModel('explained how their team files tickets', answer)
+  return explain($, place, project)
 }
 
-/** Scans the board, shows what it found, and saves it on "Looks right"; corrections go back to the model. */
+/**
+ * Scans the person's tickets (the team's where theirs say nothing), shows the checklist one
+ * line each, and on "Looks right" asks each "?" item, then saves. A correction typed instead
+ * goes back to the model with the checklist, to rewrite.
+ */
 async function scanAndConfirm($: EngineInterface, place: Place, tries = 1): Promise<string> {
-  const data = await jiraBoardData($, place.answers, SCAN_SIZE)
+  const data = await jiraBoardData($, place.answers)
   const project = typeof place.answers.jiraProject === 'string' ? place.answers.jiraProject : 'the project'
   if (typeof data === 'string') return scanFailed($, place, project, plainError(data), tries)
-  const scan = scanBoard(data)
-  const unclear = unclearScan(scan)
-  if (unclear !== undefined) return scanFailed($, place, data.project, `The scan found nothing clear: ${unclear}`, tries)
-  const draft = rulesFromScan(scan, new Date(await $.clock.now()).toISOString().slice(0, 10))
-  $.ui.log(`How your team seems to file tickets:\n${scanLines(scan).join('\n')}`)
-  const seen = await ask($, 'Is the summary above right? Pick "Correct it", or type what to change under Other.', ['Looks right', 'Correct it'], 'Ticket rules')
+  if (data.own.length === 0 && data.team.length === 0) return scanFailed($, place, data.project, `The scan found nothing to read: ${data.project} has no issues yet`, tries)
+  const items = checklistOf(data)
+  const how = data.own.length > 0 ? `read from ${data.own.length} of your latest tickets` : `read from the team's latest ${data.team.length} tickets, as you have none in ${data.project}`
+  logLines($, [`How you file tickets in ${data.project}, ${how}:`, ...checklistLines(items)].join('\n'))
+  const seen = await ask($, 'Is this checklist right? Items marked "?" are asked next. Pick "Correct it", or type the fixes under Other.', ['Looks right', 'Correct it'], 'Ticket rules')
   if (seen === undefined) return NOBODY
-  if (seen === 'Looks right') return saveRules($, place, draft)
-  if (seen !== 'Correct it') return toModel('corrected the scan', seen, draft)
-  const correction = await ask($, 'What should change? Type it under Other.', ['Keep the scan as it is', EXPLAIN], 'Ticket rules')
-  if (correction === undefined) return NOBODY
-  if (correction === 'Keep the scan as it is') return saveRules($, place, draft)
-  if (correction === EXPLAIN) return explain($, data.project)
-  return toModel('corrected the scan', correction, draft)
+  const draft = checklistFile(items, data.project, `${how}, then confirmed by the person`)
+  if (seen === 'Correct it') {
+    const fixes = await ask($, 'What should change? Type it under Other.', ['Keep it as it is', EXPLAIN], 'Ticket rules')
+    if (fixes === undefined) return NOBODY
+    if (fixes === EXPLAIN) return explain($, place, data.project)
+    if (fixes !== 'Keep it as it is') return toModel(fixes, draft)
+  } else if (seen !== 'Looks right') return toModel(seen, draft)
+  const answered = await askItems($, items)
+  if (answered === undefined) return NOBODY
+  return writeRules($, place, checklistFile(answered, data.project, `${how}, then confirmed by the person`))
 }
 
-/** Serves `ticket_rules` (D74): the main thread in any mode, the setup agent in setup mode. */
+/** Serves `ticket_rules` (D74, D76): the main thread in any mode, the setup agent in setup mode. */
 export async function serveTicketRules($: EngineInterface, e: { agentId?: string } & Record<string, unknown>) {
   if ((await read($, isOn)) !== true) return { deny: 'godmode is off, so it keeps no ticket rules. The person switches it on with `/godmode`.' }
   const current = await read($, mode)
@@ -383,7 +564,7 @@ export async function serveTicketRules($: EngineInterface, e: { agentId?: string
     }
   }
   const project = typeof place.answers.jiraProject === 'string' ? place.answers.jiraProject : 'the project'
-  const how = await ask($, 'How should godmode learn how your team files tickets?', ['Scan the board, then I confirm', EXPLAIN], 'Ticket rules')
+  const how = await ask($, 'How should godmode learn how you file tickets?', ['Scan my tickets, then I confirm', EXPLAIN], 'Ticket rules')
   if (how === undefined) return { result: NOBODY }
-  return { result: how === EXPLAIN ? await explain($, project) : await scanAndConfirm($, place) }
+  return { result: how === EXPLAIN ? await explain($, place, project) : await scanAndConfirm($, place) }
 }

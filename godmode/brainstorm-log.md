@@ -828,3 +828,78 @@ D69)" notes above mark where D69-D73 change earlier decisions.
   change-setup mode and the PM applies the fixes the person picks, saved on their yes.
   After a reload, the prompt hook compares the loaded version with the note's and suggests
   the audit in one line, once per version (kept in the person's store); it never runs it.
+
+- **D76. The ticket-filing scan answers a fixed checklist — decided by Gael 2026-11-23.**
+  The 0.7.1 scan counted issue types across the team's last 30 tickets, missed the sprint
+  the "Atlassian MCP" server reports under `customFields` by label, and its multi-line
+  log rendered stray characters. Counting types is noise. The scan now answers only the
+  decisions godmode makes each time it files: the issue type per kind of work (bug,
+  feature or change, chore, piece of a bigger item); where a new ticket goes, with the
+  sprint naming pattern; the parent (required or not, of which type; ask the person which
+  one unless one clear rule shows); the assignee (the person); each type's fields
+  (Jira-required apart from team habit, with usual values, and template text as "fill or
+  leave"); the title convention; the description template; labels and components only
+  when used. The person's own tickets come first (reporter or creator, the last 40); the
+  team's only settle what theirs do not, and each answer says its source. An item nothing
+  settles is "?" and asked in plain words, never guessed. "Explain it myself" goes
+  through the same checklist, and `ticket-filing.md` keeps its headings. Every multi-line
+  text is logged one line per `$.ui.log` call, and every question is one line.
+
+- **D77. Required human code review — decided by Gael 2026-11-23.** godmode's reviewer is a
+  pre-review; some teams still need another person's approval before a PR merges. A team
+  question, "Does a person other than the author have to approve the PR before it merges?",
+  with the approval count and whose approvals count (anyone, or named people), its default
+  read from GitHub branch protection when `gh` can read it. `update` and `/godmode audit`
+  offer it to existing notes, and it sits in the `qa` change-setup topic. After godmode's
+  clean review the PR is marked ready and named reviewers are requested; code review and
+  QA run side by side, and the per-prompt check reports both. The merge needs the
+  approvals at the PR's current commit, from someone other than the author and the person
+  (GitHub's `reviewDecision` followed where branch protection gives one, else the latest
+  review per person counted), plus QA and godmode's verdict as before. With code review on,
+  a PR approval is a code-review approval, never a QA pass: the PR-approval QA signal
+  counts only named QA approvers and is skipped when none are named. A review requesting
+  changes shows in the per-prompt check, and the PM offers a fix round from it.
+
+- **D78. godmode follows the project's rules; its own rules only fill gaps. Decided by Gael
+  on 2026-11-23.** This supersedes D37's "hard rules in code" wherever a rule is a project
+  policy.
+
+  godmode is plug-and-play on any kind of dev project: solo or with others, with or without
+  QA, reviewers, a tracker, CI or staging. Nothing is assumed from the kind of project.
+  Gael: "IT DEPENDS. godmode will be a nice tool if it can make sense out of the
+  instructions its given." It should feel like doing everything by hand, except that the
+  tool does it.
+
+  - **The project's instructions are the rules.** A rule a project could want differently
+    comes from that project: setup answers, one plain-language rules file the person can
+    edit, and what the person tells the PM. Examples are merge conditions, approvals, QA,
+    the ticket flow, and how far godmode acts on its own. godmode enforces exactly those
+    rules. Its own defaults apply only where the project said nothing, and they say so.
+  - **Check the real state or ask; never refuse on unknown.** When godmode lacks
+    information, it reads the live state (GitHub, the tracker, CI) or asks the person. A
+    PR, branch or ticket godmode did not make is never refused for that reason, and godmode
+    never asks to link, record or adopt it. No refusal suggests switching a rule off.
+  - **The person's word goes through.** An explicit ask from the person is carried out,
+    unless the project's own rules attach a condition to that action.
+  - **godmode's way of working stays its own.** Its reviewer, QA agent, fix rounds, model
+    tiers and thin main thread shape only the work godmode does. They never block the
+    person, and they never become conditions on work godmode did not do.
+  - **A short safety list stays fixed:** irreversible actions, and acting on other people's
+    work. godmode asks the person first instead of refusing.
+
+  **Setup starts with two questions**, then the scan, then one confirmation:
+  1. Alone, or with others? With others, setup scans for or asks about their process:
+     peer review, QA, conventions.
+  2. Careful or not? godmode has full access either way. Careful means it asks the person
+     before risky actions such as merging, force-pushing, deleting or touching others'
+     work. Not careful means it does them.
+
+  These two answers pre-fill every other answer. They decide behaviour only, never which
+  tools exist. Tools and environments (tracker, CI, staging, PR template, branch
+  protection) are facts about the project: the scan detects them or setup asks, whatever
+  the two answers were. The person confirms everything on one summary. Setup asks only
+  what the two answers and the scan could not settle. Every answer can be changed later.
+
+  Not built yet. An audit of the current code (2026-11-23) lists 100 fixed rules: 63
+  project policy, 16 safety, 21 internal. 41 of them refuse on unknown. That audit is the
+  rebuild's checklist.

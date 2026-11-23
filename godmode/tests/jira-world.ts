@@ -159,6 +159,26 @@ export const sidePath = (key: string) => `${HOME}/.claude/godmode/projects/${FIR
 export const archivedPath = (key: string) => sidePath(key).replace(/\/jira\/([^/]+)$/, '/jira/archived/$1')
 
 /** Every field a scan reads, as Jira gives them with `*all`. */
+/** The id the "Atlassian MCP" server gives a custom field's label: stable for the run. */
+const runnerIds = new Map<string, string>()
+export const runnerIdOf = (label: string) => {
+  if (!runnerIds.has(label)) runnerIds.set(label, `customfield_${11000 + runnerIds.size}`)
+  return runnerIds.get(label) ?? ''
+}
+
+/**
+ * The "Atlassian MCP" server's custom fields: under `customFields` by label, each
+ * `{ id, value }`, only the ones holding a value. With an explicit field list, only the ids
+ * it names; with none (the "evidence" view), all of them.
+ */
+const runnerCustom = (issue: FakeIssue, named?: readonly unknown[]) =>
+  Object.fromEntries(
+    Object.entries(issue.custom ?? {}).flatMap(([label, value]) => {
+      const id = runnerIdOf(label)
+      return named === undefined || named.includes(id) ? [[label, { id, value }]] : []
+    }),
+  )
+
 const allFields = (issue: FakeIssue, isMapped = false) => ({
   issuetype: { name: issue.type ?? 'Task' },
   ...(issue.sprint === undefined ? {} : { [SPRINT_FIELD]: issue.sprint.map((sprint, index) => ({ id: index + 1, ...sprint })) }),
@@ -208,8 +228,10 @@ const search = (jira: FakeJira, jql: string) => {
   ]
   if (unknown.length > 0) throw new Error(unknown.join(' '))
   const skipped = listIn(/key not in \(([^)]*)\)/.exec(jql)?.[1] ?? '')
-  if (project !== undefined) return [...jira.issues.values()].filter(issue => issue.key.startsWith(`${project}-`) && !skipped.includes(issue.key))
-  const scope = listIn(/^key in \(([^)]*)\)/.exec(jql)?.[1] ?? '').filter(key => jira.hidden?.includes(key) !== true)
+  // `currentUser()` is the person whose token the server uses: their account.
+  const isMine = (issue: FakeIssue) => !/currentUser\(\)/.test(jql) || (jira.account !== undefined && issue.creator === jira.account)
+  if (project !== undefined) return [...jira.issues.values()].filter(issue => issue.key.startsWith(`${project}-`) && !skipped.includes(issue.key) && isMine(issue))
+  const scope = listIn(/^key in \(([^)]*)\)/.exec(jql)?.[1] ?? /^key = (\S+)/.exec(jql)?.[1] ?? '').filter(key => jira.hidden?.includes(key) !== true)
   const missing = scope.find(key => !jira.issues.has(key))
   if (missing !== undefined) throw new Error(`An issue with key '${missing}' does not exist for field 'key'.`)
   const status = /status = "([^"]+)"/.exec(jql)?.[1]
@@ -286,9 +308,19 @@ const answer = (jira: FakeJira, tool: string, args: Record<string, unknown>): un
   if (tool === 'searchJiraIssuesUsingJql') {
     // A scan names the fields it needs; every field comes with it, as the fake has few.
     const isAll = Array.isArray(args.fields) && (args.fields.includes('*all') || args.fields.includes('issuetype'))
+    const isRunner = jira.flavour === 'runner'
+    const fields = Array.isArray(args.fields) ? (args.fields as unknown[]) : undefined
     const rows = search(jira, String(args.jql))
       .slice(0, typeof args.maxResults === 'number' ? args.maxResults : undefined)
-      .map(found => issueRow(jira, found, isAll, args.view === 'evidence'))
+      .map(found => {
+        if (!isRunner || (fields === undefined && args.view !== 'evidence')) return issueRow(jira, found, isAll)
+        // This server returns a custom field only when named by id, or every one in the "evidence" view.
+        const row = issueRow(jira, found, true)
+        const base: Record<string, unknown> = { ...row.fields, ...allFields(found, true) }
+        delete base.customFields
+        const custom = runnerCustom(found, fields)
+        return { ...row, fields: { ...base, ...(Object.keys(custom).length === 0 ? {} : { customFields: custom }) } }
+      })
     return jira.isNodes === true ? { issues: { nodes: rows, pageInfo: { hasNextPage: false } } } : { issues: rows }
   }
   if (tool === 'getJiraProjectIssueTypesMetadata') return { issueTypes: (jira.issueTypes ?? ['Task', 'Bug', 'Story']).map((name, index) => ({ id: String(10_000 + index), name })) }

@@ -10,8 +10,26 @@ export type RunAnswer = { exitCode: number; stdout: string; stderr?: string }
 /** One command the plugin ran: its argv, folder and standard input. */
 export type Run = { argv: string[]; cwd?: string; stdin?: string }
 
-/** An open PR on the pretend GitHub. */
-export type GhPr = { number: number; title: string; branch: string; author: string; files: string[]; head: string; isDraft?: boolean }
+/** A review on a pretend PR: who, what, and at which commit. */
+export type GhReview = { login: string; state: 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED'; commit: string }
+
+/** A check on a pretend PR's head commit, as `statusCheckRollup` gives it. */
+export type GhCheck = { name: string; status: 'COMPLETED' | 'IN_PROGRESS' | 'QUEUED'; conclusion?: 'SUCCESS' | 'FAILURE' | 'SKIPPED' }
+
+/** An open PR on the pretend GitHub, with its reviews, checks and merge state when a test gives them. */
+export type GhPr = {
+  number: number
+  title: string
+  branch: string
+  author: string
+  files: string[]
+  head: string
+  isDraft?: boolean
+  reviews?: GhReview[]
+  checks?: GhCheck[]
+  /** GitHub's `mergeStateStatus`: `CLEAN`, `BEHIND`, `BLOCKED`, ... */
+  mergeState?: string
+}
 
 /**
  * A pretend GitHub: `origin` points there, `gh` is signed in as `login`, and these PRs are open.
@@ -48,6 +66,8 @@ export type World = {
   gh?: Gh
   /** Local branches, which `git worktree add -b` adds to. */
   branches: string[]
+  /** Branches `origin` holds, for `git ls-remote`; absent, the open PRs' branches. */
+  pushed?: string[]
   /** The plugin's own `templates/` folder (Step 4's files), by path inside it: `required/AGENTS.md`. */
   templates: Map<string, string>
   /** The plugin's other files, by path inside its folder: `agents/pm.md`. */
@@ -167,6 +187,21 @@ const ghList = (gh: Gh) =>
     })),
   )
 
+/** What `gh pr view --json ...` prints for one PR: every field godmode reads. */
+const ghView = (pr: GhPr) => ({
+  number: pr.number,
+  title: pr.title,
+  headRefName: pr.branch,
+  headRefOid: pr.head,
+  author: { login: pr.author },
+  state: 'OPEN',
+  isDraft: pr.isDraft ?? true,
+  mergeStateStatus: pr.mergeState ?? 'CLEAN',
+  reviewDecision: '',
+  reviews: (pr.reviews ?? []).map(review => ({ author: { login: review.login }, state: review.state, commit: { oid: review.commit } })),
+  statusCheckRollup: (pr.checks ?? []).map(check => ({ __typename: 'CheckRun', name: check.name, status: check.status, conclusion: check.conclusion ?? '' })),
+})
+
 /** `gh`, and the git calls of a GitHub-hosted repo with ticket worktrees. */
 const github = (world: World, argv: readonly string[]): RunAnswer | undefined => {
   const command = argv.join(' ')
@@ -188,9 +223,14 @@ const github = (world: World, argv: readonly string[]): RunAnswer | undefined =>
       const pr = gh.prs.find(candidate => String(candidate.number) === argv[3])
       return pr === undefined
         ? { exitCode: 1, stdout: '', stderr: `no pull requests found for ${argv[3]}` }
-        : { exitCode: 0, stdout: JSON.stringify({ headRefOid: pr.head }) }
+        : { exitCode: 0, stdout: JSON.stringify(ghView(pr)) }
     }
     return undefined
+  }
+  if (argv[0] === 'git' && argv[1] === 'ls-remote') {
+    const branch = argv.at(-1) ?? ''
+    const pushed = world.pushed ?? gh?.prs.map(pr => pr.branch) ?? []
+    return pushed.includes(branch) ? { exitCode: 0, stdout: `abc\trefs/heads/${branch}\n` } : { exitCode: 2, stdout: '' }
   }
   if (command === 'git symbolic-ref --quiet --short refs/remotes/origin/HEAD') {
     return gh === undefined ? { exitCode: 1, stdout: '' } : { exitCode: 0, stdout: 'origin/main\n' }

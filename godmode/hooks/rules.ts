@@ -1,6 +1,7 @@
-import { APPROVAL_POLICIES } from './answers'
-import type { ApprovalPolicy } from './answers'
+import type { ReviewRule } from './code-review'
 import { prNumberOf } from './host'
+import { autoMergeOf, careOf, mergeConditionsOf } from './project-rules'
+import type { Care, MergeCondition } from './project-rules'
 import { qaModeOf } from './role'
 import type { QaMode } from './role'
 import { effectiveModel, MODEL_RANK } from './storage'
@@ -8,42 +9,75 @@ import type { AgentRole, Answer, ModelTier, PersonalNote, SharedNote } from './s
 import type { TicketHeader } from './tickets'
 
 /*
- * The loop's rules as plain data and pure functions (Step 7, D37): which writes ask the person,
- * how a shell command reads as loop actions, what the main thread may do. Nothing here
- * takes `$`; `loop.ts` applies these rules to the session.
+ * The loop's rules as plain data and pure functions (Step 7, D37, D78): which actions are
+ * risky, how a shell command reads as loop actions, what the main thread may do. Nothing
+ * here takes `$`; `loop.ts` applies these rules to the session.
  */
 
 /**
- * The controlled actions (D74). Reads are never restricted and every other write is free;
- * these run only on the person's explicit ask for that one target, which the PM records with
- * `allow_once`. Merging is not among them: the verdict and QA gates and the auto-merge
- * setting hold it.
+ * The risky actions (D78). Under "careful" godmode asks the person first, and their explicit
+ * ask is the yes: the PM records it with `allow_once`. Under "not careful" godmode just acts.
+ * Reads are never restricted, and every other write is free.
  */
-export const CONTROLLED = ['approve-pr', 'close-pr', 'delete-branch', 'force-push', 'edit-ticket', 'host-write'] as const
+export const RISKY = ['merge', 'merge-anyway', 'approve-pr', 'close-pr', 'delete-branch', 'delete-ticket', 'force-push', 'others-pr', 'others-ticket'] as const
 
-export type ControlledAction = (typeof CONTROLLED)[number]
+export type RiskyAction = (typeof RISKY)[number]
 
-/** How a controlled action reads in a refusal. */
-export const CONTROLLED_WORDS: Readonly<Record<ControlledAction, string>> = {
+/**
+ * The person's asks that let one of godmode's own ways of working step aside (D78): work on
+ * the main thread, and one more agent past the cap. They are never risky; they exist so the
+ * person's explicit ask is never refused.
+ */
+export const OWN_WAY_ASKS = ['main-thread', 'extra-agent', 'ready-as-is'] as const
+
+/** Every ask `allow_once` records. */
+export const ASKS = [...RISKY, ...OWN_WAY_ASKS] as const
+
+export type AskAction = (typeof ASKS)[number]
+
+/** How a risky action reads in a refusal. */
+export const RISKY_ACTION_WORDS: Readonly<Record<RiskyAction, string>> = {
+  merge: 'merging a PR',
+  'merge-anyway': 'merging a PR whose merge conditions are not met',
   'approve-pr': 'approving a PR',
   'close-pr': 'closing a PR',
-  'delete-branch': 'deleting a branch godmode did not create',
-  'force-push': 'force-pushing over a reviewed commit',
-  'edit-ticket': 'moving or editing a ticket that is neither godmode\'s nor created by you',
-  'host-write': 'a raw write through the git host\'s API',
+  'delete-branch': 'deleting a branch',
+  'delete-ticket': 'deleting a ticket',
+  'force-push': 'force-pushing over pushed work',
+  'others-pr': 'acting on someone else\'s PR',
+  'others-ticket': 'acting on someone else\'s ticket',
 }
 
-/** One controlled action on one target: a PR number, a branch, a ticket key or an API endpoint; `reason` when the target's owner could not be told. */
-export type Controlled = { action: ControlledAction; target: string; reason?: string }
+/** What the person might say for each risky action, so the PM knows the ask when it hears it. */
+const SAID: Readonly<Record<RiskyAction, (target: string) => string>> = {
+  merge: target => `merge ${target}`,
+  'merge-anyway': target => `merge ${target} anyway`,
+  'approve-pr': target => `approve ${target}`,
+  'close-pr': target => `close ${target}`,
+  'delete-branch': target => `delete ${target}`,
+  'delete-ticket': target => `delete ${target}`,
+  'force-push': target => `force-push ${target}`,
+  'others-pr': target => `go ahead on ${target}`,
+  'others-ticket': target => `go ahead on ${target}`,
+}
+
+/** One risky action on one target: a PR number, a branch or a ticket key; `state` is the live state that makes it risky. */
+export type Risky = { action: RiskyAction; target: string; state?: string }
 
 /** A target as an unlock and a step compare it, without case: `#12` is `12`, `origin/x` is `x`. */
 export const targetKey = (target: string) => target.trim().replace(/^#/, '').replace(/^origin\//, '').toLowerCase()
 
-/** The refusal of a controlled action nobody unlocked (D74). */
-export const controlledRefusal = (held: readonly Controlled[]) => {
-  const whats = held.map(entry => `${CONTROLLED_WORDS[entry.action]} (${entry.target}${entry.reason === undefined ? '' : `: ${entry.reason}`})`).join(' and ')
+const shownTarget = (action: RiskyAction, target: string) => (/^\d+$/.test(target) && ['merge', 'merge-anyway', 'approve-pr', 'close-pr', 'others-pr'].includes(action) ? `#${target}` : target)
+
+/**
+ * The refusal of risky actions under "careful" (D78): what each is, with its live state, and
+ * the exact ask that lets it run. Never a rule to switch off.
+ */
+export const riskyRefusal = (held: readonly Risky[]) => {
+  const whats = held.map(entry => `${RISKY_ACTION_WORDS[entry.action]} (${shownTarget(entry.action, entry.target)}${entry.state === undefined ? '' : `: ${entry.state}`})`).join(' and ')
+  const said = held.map(entry => `"${SAID[entry.action](shownTarget(entry.action, entry.target))}"`).join(' and ')
   const calls = held.map(entry => `allow_once (action: ${entry.action}, target: ${entry.target})`).join(', ')
-  return `This is a controlled action: ${whats}. It runs only when the person asks for it explicitly: ask for it explicitly and it goes through. When the person has asked for exactly this, the PM records their words with mcp__godmode__${calls}, then it runs again. An agent never records an ask itself. Nothing ran.`
+  return `This is a risky action, and godmode asks the person first: ${whats}. It runs once the person asks for it explicitly, such as ${said}: the PM records their words with mcp__godmode__${calls}, then runs it again. An agent never records an ask itself. Nothing ran.`
 }
 
 /** The writes the loop reads in a shell line (D13). */
@@ -91,11 +125,15 @@ export const ACTION_WORDS: Readonly<Record<Action, string>> = {
 
 /** Every loop rule as a setting (D26, D37), read from the setup note's answers. */
 export type LoopSettings = {
-  /** Approving a PR: never unasked, or once review and QA passed (D74). */
-  prApproval: ApprovalPolicy
+  /** Careful asks the person before a risky action; not careful just acts (D78). */
+  care: Care
+  /** What a PR needs before it merges, whoever made it (D78); empty when the project sets nothing. */
+  mergeConditions: readonly MergeCondition[]
+  /** The approvals merge condition, when the project has one (D77): the per-prompt review lines read it. */
+  humanReview?: ReviewRule
   /** False blocks commit messages and PR texts that carry AI attribution (D15). */
   isAttributionAllowed: boolean
-  /** Arming auto-merge, off unless the person turns it on (D53). */
+  /** godmode merges on its own once the merge conditions hold (D78); else it waits for the person's "merge". */
   isAutoMergeOn: boolean
   /** Agents running at once (D58). */
   agentCap: number
@@ -137,7 +175,6 @@ export type LoopSettings = {
 
 /** The answers' names for each setting, for messages that say how to change one. */
 export const SETTING = {
-  prApproval: 'prApproval',
   attribution: 'attribution',
   autoMerge: 'autoMerge',
   agentCap: 'agentCap',
@@ -180,11 +217,15 @@ const textOf = (value: Answer | undefined) => (typeof value === 'string' && valu
 /** The loop settings from a note's answers, shared then personal; anything unset takes its default. */
 export const settingsOf = (answers: Readonly<Record<string, Answer>>): LoopSettings => {
   const tools = textOf(answers[SETTING.mainThreadTools])
-  // A note's old `permissions` preset (D18) is no longer read (D74).
+  const mergeConditions = mergeConditionsOf(answers)
+  const approvals = mergeConditions.find(condition => condition.kind === 'approvals')
+  // A note's old `permissions` preset (D18) and `prApproval` (D74) are no longer read: approving is a risky action (D78).
   return {
-    prApproval: APPROVAL_POLICIES.find(policy => policy === answers[SETTING.prApproval]) ?? 'ask',
+    care: careOf(answers),
+    mergeConditions,
+    ...(approvals === undefined ? {} : { humanReview: { count: approvals.count, reviewers: approvals.reviewers } }),
     isAttributionAllowed: booleanOf(answers[SETTING.attribution], true),
-    isAutoMergeOn: booleanOf(answers[SETTING.autoMerge], false),
+    isAutoMergeOn: autoMergeOf(answers),
     agentCap: Math.floor(numberOf(answers[SETTING.agentCap], 5, 1)),
     isThinMainThread: booleanOf(answers[SETTING.thinMainThread], true),
     mainThreadReadLimit: Math.floor(numberOf(answers[SETTING.mainThreadReadLimit], 2, 0)),
@@ -206,8 +247,6 @@ export const settingsOf = (answers: Readonly<Record<string, Answer>>): LoopSetti
   }
 }
 
-/** How a refusal says to change a setting. */
-export const howToChange = (setting: string) => `the person can change this with \`/godmode setup\` (setting \`${setting}\`)`
 
 // ---------------------------------------------------------------------------
 // Shell commands as loop actions
@@ -506,32 +545,17 @@ export const hasQaPassAt = (result: TicketHeader['qaResult'], head: string | und
 
 const RECORD_PASS = 'Once the person or a tester says it passed, record that with ticket_move (qaResult: passed)'
 
-const qaRule = () => `To change how this project is tested, ${howToChange(SETTING.qaMode)}.`
-
 /**
- * Why a PR may not be marked ready or merged in `human-pr` before people passed it at its
- * current commit (D69), or undefined when QA does not hold it. `ticket` is the PR's ticket,
- * undefined when no ticket names the PR.
+ * Where people's QA stands for one ticket at a PR's current commit, as the `qa` merge
+ * condition reads it (D69, D78): met with a pass recorded there, else the live state in words.
  */
-export const qaGateRefusal = (settings: LoopSettings, pr: string, doing: string, ticket: QaTicket | undefined, head: string): string | undefined => {
-  if (settings.qaMode !== 'human-pr') return undefined
-  const label = `PR #${pr}`
-  if (ticket === undefined) {
-    return `In this project people test a PR before it is ${doing} (QA mode human-pr), and no ticket names ${label}, so godmode cannot tell whether it waits on QA. Set the PR on its ticket with ticket_move (pr: ${pr}), then try again. Nothing ran. ${qaRule()}`
-  }
-  if (!waitsOnPeople(settings.qaMode, ticket) || hasQaPassAt(ticket.qaResult, head)) return undefined
+export const qaPassState = (ticket: QaTicket, head: string): { met: boolean; state: string } => {
+  if (!ticket.visibleChange) return { met: true, state: `${ticket.id} changes nothing a user sees` }
+  if (hasQaPassAt(ticket.qaResult, head)) return { met: true, state: `${ticket.id} passed QA at ${shortCommit(head)}` }
   const result = ticket.qaResult
-  if (result !== undefined && result.commit !== head) {
-    return `${ticket.id}'s QA ${result.result} was recorded at commit ${shortCommit(result.commit)}, and ${label} is now at ${shortCommit(head)}: a new commit needs a new QA pass before it is ${doing}. Move ${ticket.id} to qa (ticket_move status: qa) and ask the testers to test again. ${RECORD_PASS}. Nothing ran. ${qaRule()}`
-  }
-  if (result?.result === 'failed') {
-    return `QA failed for ${ticket.id} at ${label}'s current commit ${shortCommit(head)}, so it cannot be ${doing}. Run the fix round, have the change reviewed again, and send it back to the testers; it is ${doing} only once they pass the new commit. Nothing ran. ${qaRule()}`
-  }
-  if (ticket.status !== 'qa') {
-    const first = settings.isQaBotFirst ? ', once the QA agent passed it,' : ''
-    return `In this project people test a PR before it is ${doing} (QA mode human-pr), and ${ticket.id} is not waiting in qa yet (it is in ${ticket.status}). Move it to qa${first} with ticket_move (status: qa) and tell the testers. ${RECORD_PASS}. Nothing ran. ${qaRule()}`
-  }
-  return `${label} is waiting on people's QA (QA mode human-pr): ${ticket.id} has no pass recorded at its current commit ${shortCommit(head)}, so it cannot be ${doing}. ${RECORD_PASS}; a fail is recorded with qaResult: failed and starts a fix round. Nothing ran. ${qaRule()}`
+  if (result?.result === 'failed' && result.commit === head) return { met: false, state: `${ticket.id} failed QA at ${shortCommit(head)}` }
+  if (result !== undefined) return { met: false, state: `${ticket.id}'s last QA ${result.result} was at ${shortCommit(result.commit)}, and the PR is now at ${shortCommit(head)}` }
+  return { met: false, state: `no QA pass recorded for ${ticket.id} at ${shortCommit(head)}${ticket.status === 'qa' ? '' : ` (it is in ${ticket.status})`}` }
 }
 
 /**
@@ -620,7 +644,7 @@ const isFilter = (words: readonly string[]) => {
 /** The PR actions the PM itself takes: relaying a verdict, marking ready, merging on the person's go; never a raw API call. */
 const isPmLoopAction = (words: readonly string[]) => {
   const step = words[0] === 'gh' ? ghStep(words) : undefined
-  return step !== undefined && step.isApi !== true && ['pr-comment', 'pr-ready', 'pr-merge'].includes(step.action)
+  return step !== undefined && step.isApi !== true && ['pr-comment', 'pr-ready', 'pr-merge', 'pr-approve', 'pr-edit'].includes(step.action)
 }
 
 /** Whether a shell line is a quick status check (or the PM's own PR action) the main thread may run. */
@@ -650,36 +674,47 @@ const isOwnFile = (path: unknown, pluginRoot: string | undefined) =>
 /** What the main thread may do, or why not. */
 export type MainThreadVerdict = { isAllowed: true; isRead?: boolean } | { isAllowed: false; reason: string }
 
+/** The tools the main thread hands to agents (D63, D78): editing, code search and web research; reads past the limit and foreground commands besides status checks too. */
+const EDIT_WORK: readonly string[] = ['Edit', 'Write', 'NotebookEdit']
+const SEARCH_WORK: readonly string[] = ['Grep', 'Glob', 'LSP']
+const WEB_WORK: readonly string[] = ['WebFetch', 'WebSearch']
+
 /**
- * Whether the main thread may make a call (D63): talking, the ticket tools, dispatching
- * agents and shells, quick status checks, and a couple of reads per prompt. Reading
- * godmode's own role and rules (under `pluginRoot`) is the PM's job, so it never counts.
+ * Whether the main thread may make a call (D63, D78). It refuses actual work only: editing,
+ * code search, reads past the per-prompt limit, foreground commands that are not status
+ * checks, and web research. Every other tool is the PM's, one added later included. Reading
+ * godmode's own role and rules (under `pluginRoot`) never counts. A tool in `unlocked` was
+ * asked for by the person for this message, so it runs.
  */
-export const mainThreadVerdict = (call: MainThreadCall, settings: LoopSettings, readsThisPrompt: number, pluginRoot?: string): MainThreadVerdict => {
+export const mainThreadVerdict = (
+  call: MainThreadCall,
+  settings: LoopSettings,
+  readsThisPrompt: number,
+  pluginRoot?: string,
+  unlocked: readonly string[] = [],
+): MainThreadVerdict => {
   const { tool } = call
   if (MAIN_THREAD_TOOLS.has(tool) || tool.startsWith('mcp__godmode__') || settings.mainThreadTools.includes(tool)) return { isAllowed: true }
-  const refuse = (what: string, setting: string = SETTING.thinMainThread): MainThreadVerdict => ({
+  if (unlocked.some(name => name.toLowerCase() === tool.toLowerCase())) return { isAllowed: true }
+  const refuse = (what: string): MainThreadVerdict => ({
     isAllowed: false,
-    reason: `godmode keeps the main thread thin: ${what} is work for an agent, not the PM. Dispatch a researcher, a dev agent or a background shell to do it, and keep this thread for talking, tickets and dispatch. If the person asked for it, do it that way now: their ask is never a reason to refuse. To loosen the rule, ${howToChange(setting)}.`,
+    reason: `godmode keeps this thread for talking, tickets and dispatch, and ${what} is work it hands to an agent: dispatch a dev agent, a researcher or a background shell for it. If the person asked you to do it yourself, here, record their words with mcp__godmode__allow_once (action: main-thread, target: ${tool}), then run it again: it holds until their next message. Nothing ran.`,
   })
   if (tool === 'Read') {
     if (isOwnFile(call.file_path, pluginRoot)) return { isAllowed: true }
     if (readsThisPrompt < settings.mainThreadReadLimit) return { isAllowed: true, isRead: true }
-    return refuse(
-      `reading more than ${settings.mainThreadReadLimit} file${settings.mainThreadReadLimit === 1 ? '' : 's'} in one prompt`,
-      SETTING.mainThreadReadLimit,
-    )
+    return refuse(`reading more than ${settings.mainThreadReadLimit} file${settings.mainThreadReadLimit === 1 ? '' : 's'} in one message`)
   }
   if (tool === 'Bash') {
     if (call.run_in_background === true) return { isAllowed: true }
     const command = typeof call.command === 'string' ? call.command : ''
     if (isMainThreadShell(command)) return { isAllowed: true }
-    return refuse(`running \`${command.split('\n')[0]?.slice(0, 80) ?? ''}\` (only quick git and gh status checks run here; a background shell is fine)`)
+    return refuse(`running \`${command.split('\n')[0]?.slice(0, 80) ?? ''}\` in the foreground (quick git and gh status checks run here, and a background shell is fine)`)
   }
-  if (['Edit', 'Write', 'NotebookEdit'].includes(tool)) return refuse('editing files')
-  if (['Grep', 'Glob', 'LSP'].includes(tool)) return refuse('searching code')
-  if (['WebFetch', 'WebSearch'].includes(tool)) return refuse('research on the web')
-  return refuse(`\`${tool}\``, SETTING.mainThreadTools)
+  if (EDIT_WORK.includes(tool)) return refuse('editing files')
+  if (SEARCH_WORK.includes(tool)) return refuse('searching code')
+  if (WEB_WORK.includes(tool)) return refuse('research on the web')
+  return { isAllowed: true }
 }
 
 // ---------------------------------------------------------------------------

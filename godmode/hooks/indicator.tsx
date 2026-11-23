@@ -7,10 +7,11 @@ import type { On } from 'claude-code'
  * - `mode`: a red `godmode` label among the footer's mode labels, right of the prompt.
  * - `hint`: a `godmode` tag at the end of the hint line under the prompt.
  * - `band`: a dark red strip saying GODMODE directly above the prompt.
+ * - `pane`: godmode's side pane (`pane.tsx`); the band stands in while it cannot be shown.
  */
-export type Indicator = 'mode' | 'hint' | 'band'
+export type Indicator = 'mode' | 'hint' | 'band' | 'pane'
 
-export const INDICATORS: readonly Indicator[] = ['mode', 'hint', 'band']
+export const INDICATORS: readonly Indicator[] = ['mode', 'hint', 'band', 'pane']
 
 export const DEFAULT_INDICATOR: Indicator = 'mode'
 
@@ -31,6 +32,9 @@ export const indicatorOf = (value: unknown): Indicator =>
  */
 const isOn = atom({ plugin: 'godmode', key: 'isOn' } as const, false)
 const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, DEFAULT_INDICATOR as Indicator)
+// The side pane's own flags (`pane.tsx`): it could not be placed, or the person closed it.
+const paneFallback = atom({ plugin: 'godmode', key: 'paneFallback' } as const, false)
+const paneClosed = atom({ plugin: 'godmode', key: 'paneClosed' } as const, false)
 
 export function registerIndicator(on: On) {
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
@@ -55,7 +59,11 @@ export function registerIndicator(on: On) {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    if ((await read($, isOn)) !== true || indicatorOf(await read($, indicator)) !== 'band') return next(e)
+    if ((await read($, isOn)) !== true) return next(e)
+    const style = indicatorOf(await read($, indicator))
+    // The band stands in for the side pane while it is not shown, so the person always sees that godmode is on.
+    const isPaneAway = style === 'pane' && ((await read($, paneFallback)) || (await read($, paneClosed)))
+    if (style !== 'band' && !isPaneAway) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box backgroundColor={BAND_COLOR} width={e.props.bodyColumns} justifyContent="center">

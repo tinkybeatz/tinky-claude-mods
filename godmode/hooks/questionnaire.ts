@@ -1,5 +1,6 @@
 import type { ScanFacts } from '../types'
 import type { SetupScope } from '../types'
+import { WORKING_KEYS } from './project-rules'
 import { qaSignalsOf } from './role'
 import type { Answer } from './storage'
 import { trackerKindOf } from './tickets'
@@ -55,15 +56,18 @@ export type Question = {
 export type ExtraQuestion = { key: string; question: string; options: string[]; header?: string }
 
 /** The QA flow's keys (D69, D70, D71); `qa` is the on or off answer notes before D69 hold. */
-export const QA_KEYS: readonly string[] = ['qa', 'qaHuman', 'qaMode', 'qaBotFirst', 'qaWaitStatus', 'qaSignals', 'qaPassStatus', 'qaApprovers']
+export const QA_KEYS: readonly string[] = ['qa', 'qaHuman', 'qaMode', 'qaAgent', 'qaBotFirst', 'qaWaitStatus', 'qaSignals', 'qaPassStatus', 'qaApprovers']
+
+/** The merge conditions' keys (D77, D78): the list, the approvals it needs and whose count, and the working answers setup asks them by. */
+export const MERGE_KEYS: readonly string[] = ['mergeConditions', 'humanReview', 'humanReviewCount', 'humanReviewers', 'mergeApprovals', 'mergeCi', 'mergeUpToDate', 'ciRequired']
 
 /**
  * One more round's answers over a setup run's earlier ones. A round that answers the QA flow
  * again replaces every earlier QA answer, so a branch not taken this time leaves nothing.
  */
 export const mergeAnswers = (earlier: Readonly<Record<string, Answer>>, round: Readonly<Record<string, Answer>>): Record<string, Answer> => {
-  const qaAgain = Object.keys(round).some(key => QA_KEYS.includes(key))
-  const kept = qaAgain ? Object.fromEntries(Object.entries(earlier).filter(([key]) => !QA_KEYS.includes(key))) : earlier
+  const qaAgain = Object.keys(round).some(key => QA_KEYS.includes(key) && key !== 'qaAgent')
+  const kept = qaAgain ? Object.fromEntries(Object.entries(earlier).filter(([key]) => !QA_KEYS.includes(key) || key === 'qaAgent')) : earlier
   return { ...kept, ...round }
 }
 
@@ -72,6 +76,10 @@ export const JIRA_KEYS: readonly string[] = ['jiraServer', 'jiraCloudId', 'jiraP
 
 /** The keys of the fixed questions; an extra question may not reuse one. */
 export const FIXED_KEYS: readonly string[] = [
+  'who',
+  'care',
+  'confirmed',
+  ...MERGE_KEYS,
   'prApproval',
   'storage',
   'tracker',
@@ -92,7 +100,7 @@ export const FIXED_KEYS: readonly string[] = [
  * Answers that steer the questionnaire but are not written into the note: the storage
  * answer is where the note goes, and `qaHuman` only leads to the `qaMode` it records.
  */
-export const UNRECORDED_KEYS: readonly string[] = ['storage', 'qaHuman', 'jiraStatusMap']
+export const UNRECORDED_KEYS: readonly string[] = ['storage', 'qaHuman', 'jiraStatusMap', 'confirmed', ...WORKING_KEYS]
 
 /** Where PRs live, as the questionnaire and the scan settled it. */
 export const isGitHubHost = (facts: ScanFacts, answers: Readonly<Record<string, Answer>>) =>
@@ -102,9 +110,88 @@ export const isGitHubHost = (facts: ScanFacts, answers: Readonly<Record<string, 
  * Answers that stay one person's (D61), even when the setup agent passes them. The Jira
  * server is one: each person's session names its Atlassian connector its own way.
  */
-export const PERSONAL_KEYS: readonly string[] = ['prApproval', 'attribution', 'autoMerge', 'agentCap', 'fixRoundLimit', 'indicator', 'trackerAccount', 'jiraServer']
+export const PERSONAL_KEYS: readonly string[] = ['care', 'prApproval', 'attribution', 'autoMerge', 'agentCap', 'fixRoundLimit', 'indicator', 'trackerAccount', 'jiraServer']
 
 export const isPersonalKey = (key: string) => PERSONAL_KEYS.includes(key)
+
+/** Setup's first question (D78): alone or with others. It pre-fills the people side of the rules, never which tools exist. */
+export const WHO_QUESTION: Question = {
+  key: 'who',
+  header: 'Who',
+  question: 'Do you work on this project alone, or with others?',
+  choices: [
+    { label: 'Alone', value: 'alone' },
+    { label: 'With others', value: 'others' },
+  ],
+  half: 'shared',
+}
+
+/** Setup's second question (D78): whether godmode asks before a risky action. It has full access either way. */
+export const CARE_QUESTION: Question = {
+  key: 'care',
+  header: 'Care',
+  question:
+    'godmode has full access either way. Careful: it asks you before risky actions (merging, force-pushing, deleting, touching others\' work). Not careful: it just does them.',
+  choices: [
+    { label: 'Careful: ask me first', value: 'careful' },
+    { label: 'Not careful: just do it', value: 'not-careful' },
+  ],
+  half: 'personal',
+}
+
+/** Approvals from others before a merge (D78), asked when protection cannot tell; "None" sets no condition. */
+export const APPROVALS_QUESTION: Question = {
+  key: 'mergeApprovals',
+  header: 'Approvals',
+  question: 'Must someone other than the author approve a PR before it merges? Pick how many, or type another number under Other.',
+  choices: [
+    { label: 'None', value: 0 },
+    { label: '1 approval', value: 1 },
+    { label: '2 approvals', value: 2 },
+  ],
+  half: 'shared',
+  freeText: text => ({ mergeApprovals: text.trim() }),
+  followUps: answers =>
+    Number(answers.mergeApprovals ?? 0) >= 1
+      ? [
+          {
+            key: 'humanReviewers',
+            header: 'Reviewers',
+            question: 'Whose approval counts: anyone but the author, or named people? Type GitHub logins, or a team as org/team, under Other.',
+            choices: [
+              { label: 'Anyone', value: '' },
+              { label: 'Decide later', value: '' },
+            ],
+            half: 'shared',
+            freeText: text => ({ humanReviewers: text.trim() }),
+          },
+        ]
+      : [],
+}
+
+/** Green CI before a merge (D78): asked only when the person changes it; the scan settles it otherwise. */
+export const CI_QUESTION: Question = {
+  key: 'mergeCi',
+  header: 'CI',
+  question: 'Must CI be green before a PR merges?',
+  choices: [
+    { label: 'Yes', value: true },
+    { label: 'No', value: false },
+  ],
+  half: 'shared',
+}
+
+/** godmode's own QA agent on godmode's own visible changes (D78): the scan's runnable UI settles it; asked only on a change. */
+export const QA_AGENT_QUESTION: Question = {
+  key: 'qaAgent',
+  header: 'QA agent',
+  question: 'Should godmode\'s QA agent run the app and try each of godmode\'s own visible changes before its PR is marked ready?',
+  choices: [
+    { label: 'On', value: true },
+    { label: 'Off', value: false },
+  ],
+  half: 'shared',
+}
 
 /**
  * Merging, the headline of what godmode does alone (D53, D74): merge once review (and QA,
@@ -113,8 +200,7 @@ export const isPersonalKey = (key: string) => PERSONAL_KEYS.includes(key)
 export const AUTO_MERGE: Question = {
   key: 'autoMerge',
   header: 'Merging',
-  question:
-    'godmode\'s agents commit, push, open draft PRs, comment and move tickets on their own. Merging is yours to control: once a PR passed review (and QA, where it runs), should godmode merge it, or wait for your go? With people testing the PR, it always waits.',
+  question: 'Once a PR meets this project\'s merge conditions, should godmode merge it on its own, or wait for you to say "merge"?',
   choices: [
     { label: 'Wait for my go', value: false },
     { label: 'Merge when green', value: true },
@@ -122,20 +208,7 @@ export const AUTO_MERGE: Question = {
   half: 'personal',
 }
 
-/** Approving a PR (D74): never unasked, or once review and QA passed. */
-export const APPROVAL: Question = {
-  key: 'prApproval',
-  header: 'Approvals',
-  question:
-    'Should godmode ever approve a PR? Never unasked: only when you ask for that PR. When it passed: godmode may approve once review (and QA, where it runs) passed.',
-  choices: [
-    { label: 'Never unasked', value: 'ask' },
-    { label: 'When it passed', value: 'when-passed' },
-  ],
-  half: 'personal',
-}
-
-const STORAGE: Question = {
+export const STORAGE: Question = {
   key: 'storage',
   header: 'Storage',
   question:
@@ -180,48 +253,14 @@ export const INDICATOR: Question = {
   key: 'indicator',
   header: 'Indicator',
   question:
-    'How should the session show that godmode is on? Mode label: a red "godmode" among the footer\'s mode labels. Hint tag: a red tag at the end of the hint line under the prompt. Band: a thin dark red GODMODE strip above the prompt.',
+    'How should the session show that godmode is on? Mode label: a red "godmode" among the footer\'s mode labels. Hint tag: a red tag at the end of the hint line under the prompt. Band: a thin dark red GODMODE strip above the prompt. Side pane: a godmode panel beside the chat with live tickets, running agents and what waits on you.',
   choices: [
     { label: 'Mode label', value: 'mode' },
     { label: 'Hint tag', value: 'hint' },
     { label: 'Band', value: 'band' },
+    { label: 'Side pane', value: 'pane' },
   ],
   half: 'personal',
-}
-
-/**
- * A question the QA agent's work answers: the scan's runnable-UI finding only picks which
- * choice is the default (D34, D69, D71), since the agent needs an app it can run.
- */
-const uiDefault = (facts: ScanFacts, yes: Choice, no: Choice) => {
-  const marked = (choice: Choice): Choice => ({ ...choice, label: `${choice.label} (default)` })
-  return facts.hasUi
-    ? { why: `The scan found a runnable UI (${facts.uiReason ?? 'an app'}), so it defaults to ${yes.label.toLowerCase()}.`, choices: [marked(yes), no] }
-    : { why: `The scan found no runnable UI, so it defaults to ${no.label.toLowerCase()}.`, choices: [marked(no), yes] }
-}
-
-/** No people test: the QA agent tests, or nobody does (D69). */
-const qaAgentQuestion = (facts: ScanFacts): Question => {
-  const { why, choices } = uiDefault(facts, { label: 'On', value: 'bot' }, { label: 'Off', value: 'none' })
-  return {
-    key: 'qaMode',
-    header: 'QA agent',
-    question: `Should a QA agent run the app and try each visible change after review, before it is ready for you? ${why}`,
-    choices,
-    half: 'shared',
-  }
-}
-
-/** In a human mode, whether the QA agent tests before the people do (D71). */
-const botFirstQuestion = (facts: ScanFacts): Question => {
-  const { why, choices } = uiDefault(facts, { label: 'Yes', value: true }, { label: 'No', value: false })
-  return {
-    key: 'qaBotFirst',
-    header: 'QA bot first',
-    question: `Should the QA agent try each visible change first, so the people only get changes that already passed it? ${why}`,
-    choices,
-    half: 'shared',
-  }
 }
 
 /** A status on the board, by its exact name: two common names to pick, or the board's own typed under Other. */
@@ -334,42 +373,34 @@ const signalsQuestion = (facts: ScanFacts, answers: Readonly<Record<string, Answ
   }
 }
 
-/** People test: on the PR or on staging, then the bot pass first, the board's waiting status and the signals. */
-const whereQuestion = (facts: ScanFacts): Question => ({
+/**
+ * Whether anyone tests changes besides their author (D78), and where: the QA mode's people part.
+ * "No one" leaves no rule; godmode's own QA agent is its own answer (`qaAgent`).
+ */
+export const peopleQaQuestion = (facts: ScanFacts): Question => ({
   key: 'qaMode',
-  header: 'QA where',
-  question: 'Where do the people test: on the PR before it merges, or on staging after the merge?',
+  header: 'QA',
+  question: 'Does anyone test changes besides their author: on the PR before it merges, or on staging after?',
   choices: [
+    { label: 'No one', value: 'none' },
     { label: 'On the PR', value: 'human-pr' },
     { label: 'On staging', value: 'human-staging' },
   ],
   half: 'shared',
   followUps: answers => {
+    if (answers.qaMode !== 'human-pr' && answers.qaMode !== 'human-staging') return []
     const signals = signalsQuestion(facts, answers)
-    return [botFirstQuestion(facts), ...unlessRuledOut(hasBoard(answers), WAIT_STATUS, BOARD_ONLY), ...(signals === undefined ? [] : [signals])]
+    return [...unlessRuledOut(hasBoard(answers), WAIT_STATUS, BOARD_ONLY), ...(signals === undefined ? [] : [signals])]
   },
 })
 
-/** The QA mode (D69): whether people test first, then where they test, or else whether the QA agent does. */
-export const qaQuestion = (facts: ScanFacts): Question => ({
-  key: 'qaHuman',
-  header: 'QA',
-  question: 'Do people (QA engineers) test changes before they count as done?',
-  choices: [
-    { label: 'Yes, people test', value: true },
-    { label: 'No', value: false },
-  ],
-  half: 'shared',
-  followUps: answers => [answers.qaHuman === true ? whereQuestion(facts) : qaAgentQuestion(facts)],
-})
-
-/** A count the loop reads, asked only by a change-setup: three common values, or another typed under Other. */
-const countQuestion = (key: 'fixRoundLimit' | 'agentCap', header: string, question: string, counts: readonly number[]): Question => ({
+/** A count the loop reads: three common values, or another typed under Other. */
+const countQuestion = (key: 'fixRoundLimit' | 'agentCap', header: string, question: string, counts: readonly number[], half: NoteHalf = 'personal'): Question => ({
   key,
   header,
   question: `${question} Pick one, or type another number under Other.`,
   choices: counts.map(count => ({ label: String(count), value: count })),
-  half: 'personal',
+  half,
   // The answer rules read the count, and ask again with the reason when it is none.
   freeText: text => ({ [key]: text.trim() }),
 })
@@ -430,7 +461,7 @@ const STACK: Question = {
     { label: 'TypeScript', value: 'TypeScript' },
     { label: 'Python', value: 'Python' },
     { label: 'Go', value: 'Go' },
-    { label: 'Rust', value: 'Rust' },
+    { label: 'Not decided yet', value: '' },
   ],
   half: 'shared',
   freeText: text => ({ stack: text.trim() }),
@@ -471,14 +502,14 @@ export const extraQuestion = (extra: ExtraQuestion): Question | string => {
 }
 
 /**
- * Every question a setup asks, in order. `full`: the gaps, then the person's own choices
- * (D74's merging and approval, D19, D23, D15, D69, D68), the QA question bringing its follow-ups. `personal`, a
- * teammate on a committed note (D61): only the personal ones, the team's answers being in
- * the note already.
+ * The questions every setup asks (D78), in order: Who and Care, then the gaps the scan left,
+ * storage and the tracker. The summary's other "?" items follow, as the answers leave them
+ * open. `personal`, a teammate on a committed note (D61): Care alone, the team's answers being
+ * in the note already.
  */
 export const questionsFor = (facts: ScanFacts, scope: SetupScope, extras: readonly Question[] = []): Question[] => {
-  if (scope === 'personal') return [AUTO_MERGE, APPROVAL, ATTRIBUTION, INDICATOR, ...extras.filter(question => question.half === 'personal')]
-  return [...gapQuestions(facts), ...extras, AUTO_MERGE, APPROVAL, STORAGE, TRACKER, ATTRIBUTION, qaQuestion(facts), INDICATOR]
+  if (scope === 'personal') return [CARE_QUESTION, ...extras.filter(question => question.half === 'personal')]
+  return [WHO_QUESTION, CARE_QUESTION, ...gapQuestions(facts), ...extras, STORAGE, TRACKER]
 }
 
 // A label may carry a mark: `(default)` from the scan, `(current)` or `(suggested)` in a change-setup.

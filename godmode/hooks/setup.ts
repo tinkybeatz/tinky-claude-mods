@@ -1,12 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ToolSpec } from 'claude-code'
 
-import type { GodmodeMode, ScanFacts, SetupRun, SetupScope } from '../types'
+import type { GodmodeMode, IndicatorStyle, ScanFacts, SetupRun, SetupScope } from '../types'
 import {
   answerChanges,
   applyChange,
   changePlan,
   changeSetupBrief,
+  migratedAnswers,
+  MIGRATED_AWAY,
   OWNED_KEYS,
   pendingUpdates,
   sameAnswers,
@@ -18,19 +20,35 @@ import {
 import { answerIssueLines, checkAnswer, savedAnswers } from './answers'
 import { answerFindings, auditBrief, auditNote, auditText } from './audit'
 import { indicatorOf } from './indicator'
+import { logLines, questionText } from './ui-text'
 import { jiraSetup, personalJiraQuestions } from './jira'
+import { liveFactsOf } from './live-facts'
+import { openGodmodePane } from './pane'
+import { toNoteAnswers, NO_LIVE_FACTS, WORKING_KEYS, prefill, PROJECT_RULES_FILE, projectRulesText, ownRulesIn, summaryLines, summaryText, workingAnswersOf } from './project-rules'
+import type { AreaFiles, Source } from './project-rules'
 import {
+  APPROVALS_QUESTION,
+  ATTRIBUTION,
+  AUTO_MERGE,
+  CARE_QUESTION,
+  CI_QUESTION,
   extraQuestion,
+  gapQuestions,
   isGitHubHost,
   isPersonalKey,
   JIRA_KEYS,
   mergeAnswers,
   namesChoice,
   outline,
+  peopleQaQuestion,
+  QA_AGENT_QUESTION,
   QA_KEYS,
   questionsFor,
   resolveAnswer,
+  STORAGE,
+  TRACKER,
   UNRECORDED_KEYS,
+  WHO_QUESTION,
   withBoardStatuses,
 } from './questionnaire'
 import type { ExtraQuestion, Question } from './questionnaire'
@@ -50,6 +68,7 @@ import {
   presetTarget,
   projectOf,
   readNote,
+  REPO_FOLDER,
   STORAGE_MODES,
   writeNote,
   writePersonalNote,
@@ -80,7 +99,7 @@ const setupScope = atom({ plugin: 'godmode', key: 'setupScope' } as const, 'full
 const recheck = atom({ plugin: 'godmode', key: 'recheck' } as const, [] as string[])
 const setupRun = atom({ plugin: 'godmode', key: 'setupRun' } as const, { consented: [], written: [] } as SetupRun)
 const setupReport = atom({ plugin: 'godmode', key: 'setupReport' } as const, '')
-const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as 'mode' | 'hint' | 'band')
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as IndicatorStyle)
 
 export type SetupToolName = 'setup_scan' | 'setup_questionnaire' | 'setup_confirm' | 'setup_write_preset' | 'setup_finish'
 
@@ -296,7 +315,7 @@ async function factsOf($: EngineInterface, project: Project) {
 /** Asks one question in godmode's own dialog (D66's way of asking); undefined when nobody could answer. */
 async function askQuestion($: EngineInterface, question: Question) {
   try {
-    return await $.ui.ask(question.question, { options: question.choices.map(choice => choice.label), header: question.header, multiSelect: question.multiSelect })
+    return await $.ui.ask(questionText(question.question), { options: question.choices.map(choice => choice.label), header: question.header, multiSelect: question.multiSelect })
   } catch {
     return undefined
   }
@@ -381,6 +400,187 @@ async function askAll($: EngineInterface, root: string, questions: readonly Ques
     }
   }
   return { answers, notes, unasked }
+}
+
+/** Where each area's detailed rules live, for the summary: the conventions folder and the files in it. */
+const areaFilesOf = (facts: ScanFacts, answers: Readonly<Record<string, Answer>>): AreaFiles => {
+  const storage = answers.storage
+  const conventionsDir = storage === undefined || storage === 'committed' ? 'docs/conventions' : `${REPO_FOLDER}/conventions`
+  const workflow = facts.conventions.find(path => /git-workflow|contributing/i.test(path))
+  const rules = typeof answers.ticketRules === 'string' ? answers.ticketRules : undefined
+  return {
+    conventionsDir,
+    ...(facts.conventions.includes('.github/pull_request_template.md') ? { prTemplate: '.github/pull_request_template.md' } : {}),
+    gitWorkflow: workflow ?? `${conventionsDir}/git-workflow.md`,
+    ...(rules === undefined ? {} : { ticketRules: rules }),
+    existing: facts.conventions,
+  }
+}
+
+/** Logs the summary (D78), one line per call, under its heading. */
+function logSummary($: EngineInterface, facts: ScanFacts, working: Readonly<Record<string, Answer>>, sources: Readonly<Record<string, Source>>, heading: string) {
+  logLines($, [heading, ...summaryText(summaryLines(facts, working, sources, areaFilesOf(facts, working)))].join('\n'))
+}
+
+/** The question that asks each open key ("?") on the summary, in the order setup asks them. */
+const openQuestionsOf = (facts: ScanFacts, scope: SetupScope, open: readonly string[], extras: readonly Question[], isFirstRound: boolean): Question[] => {
+  const byKey: Record<string, Question> = { mergeApprovals: APPROVALS_QUESTION, qaMode: peopleQaQuestion(facts), attribution: ATTRIBUTION }
+  const asked = open.flatMap(key => byKey[key] ?? [])
+  if (scope === 'personal') return [...asked.filter(question => question.half === 'personal'), ...extras.filter(question => question.half === 'personal')]
+  return isFirstRound ? [...gapQuestions(facts), ...extras, STORAGE, TRACKER, ...asked] : asked
+}
+
+/** The questions behind each part of the summary the person can change (D78); labels hold no comma, as a multi-select joins them with commas. */
+const changeGroups = (facts: ScanFacts, scope: SetupScope): { label: string; questions: Question[] }[] => {
+  const isFull = scope === 'full'
+  return [
+    { label: 'Who or care', questions: isFull ? [WHO_QUESTION, CARE_QUESTION] : [CARE_QUESTION] },
+    { label: 'Merging', questions: isFull ? [APPROVALS_QUESTION, CI_QUESTION, AUTO_MERGE] : [AUTO_MERGE] },
+    ...(isFull ? [{ label: 'QA', questions: [peopleQaQuestion(facts), QA_AGENT_QUESTION] }] : []),
+    { label: isFull ? 'Tickets and the rest' : 'Attribution', questions: isFull ? [TRACKER, STORAGE, ATTRIBUTION] : [ATTRIBUTION] },
+  ]
+}
+
+const SAVE = 'Save'
+const CHANGE = 'Change something'
+
+/** What the person said to the summary: save it, change some parts by name, or a change typed in their own words. */
+type Confirm = { kind: 'save' } | { kind: 'groups'; picked: string[] } | { kind: 'typed'; text: string } | { kind: 'unasked' }
+
+/** Asks the person to confirm the summary, and what to change when they want a change. */
+async function askConfirm($: EngineInterface, groups: readonly { label: string }[]): Promise<Confirm> {
+  let answer: string
+  try {
+    answer = await $.ui.ask('Save these settings, or change something first?', { options: [SAVE, CHANGE], header: 'Setup' })
+  } catch {
+    return { kind: 'unasked' }
+  }
+  if (answer === SAVE) return { kind: 'save' }
+  let picked: string
+  try {
+    picked = await $.ui.ask('What should change? Pick the parts, or say it under Other.', { options: groups.map(group => group.label), header: 'Change', multiSelect: true })
+  } catch {
+    return { kind: 'unasked' }
+  }
+  const parts = picked.split(',').map(part => part.trim()).filter(part => part !== '')
+  const named = parts.filter(part => groups.some(group => group.label === part))
+  return named.length === parts.length && named.length > 0 ? { kind: 'groups', picked: named } : { kind: 'typed', text: picked }
+}
+
+/** How many times the summary may be changed before the setup saves what it has, saying so. */
+const CHANGE_ROUNDS = 5
+
+/** The setup stopped because nobody could answer: the questions left, as an outline for the PM to relay. */
+const unaskedError = (unasked: readonly Question[], answers: Readonly<Record<string, Answer>>) =>
+  new SetupError(
+    [
+      'godmode could not ask the person (a headless run, or the question was dismissed), so setup stops here. Nothing was written.',
+      'Report these questions to the PM, who asks the person and dispatches the setup again with the answers as `given`:',
+      ...unasked.flatMap(question => outline(question, answers)),
+    ].join('\n'),
+  )
+
+/**
+ * The setup's questions (D78). The scan already ran and is silent. Two questions come first,
+ * Who and Care; with the scan and the live facts they pre-fill every other answer. One summary
+ * shows each value and its source, then only the "?" items are asked, one question each, every
+ * one with an answer that leaves no rule. The person confirms with "Save" or "Change something".
+ * A personal setup (a teammate on a committed note) asks only what is theirs.
+ */
+async function askSetup($: EngineInterface, project: Project, facts: ScanFacts, scope: SetupScope, extras: readonly Question[], given: Readonly<Record<string, Answer>>) {
+  const team = scope === 'personal' ? await teamAnswersOf($, project) : {}
+  const known: Record<string, Answer> = { ...given }
+  delete known.confirmed
+  // The person's answers, each read through its question: asked, or given and resolved.
+  const person: Record<string, Answer> = {}
+  const notes: string[] = []
+  const ask = async (questions: readonly Question[], known: Readonly<Record<string, Answer>>, suggest?: (question: Question) => Question) => {
+    const round = await askAll($, project.root, questions, known, suggest)
+    notes.push(...round.notes)
+    if (round.unasked.length > 0) throw unaskedError(round.unasked, { ...team, ...person, ...round.answers })
+    // Answers given as working keys are read as the person's too.
+    for (const [key, value] of Object.entries(round.answers)) person[key] = value
+  }
+  await ask(scope === 'personal' ? [CARE_QUESTION] : [WHO_QUESTION, CARE_QUESTION], known)
+  const live = await liveFactsOf($, facts).catch(() => NO_LIVE_FACTS)
+  const settle = () => {
+    const pre = prefill(facts, live, { ...team, ...person })
+    const sources: Record<string, Source> = { ...pre.sources }
+    for (const key of Object.keys(person)) sources[key] = 'you'
+    for (const key of pre.open) if (!(key in person)) sources[key] = '?'
+    if (scope === 'full') for (const key of [...gapQuestions(facts).map(question => question.key), 'storage', 'tracker']) if (!(key in person)) sources[key] = '?'
+    return { working: { ...team, ...pre.values, ...person }, sources, open: pre.open.filter(key => !(key in person)) }
+  }
+  let state = settle()
+  logSummary($, facts, state.working, state.sources, 'godmode found this, and your two answers pre-fill the rest. Each "?" is asked next:')
+  await ask(openQuestionsOf(facts, scope, state.open, extras, true), known)
+  // An answer given for an item the scan settled wins over the scan, read through its own question.
+  Object.assign(person, leftoverGiven(facts, extras, known, person))
+  state = settle()
+  const groups = changeGroups(facts, scope)
+  for (let round = 0; given.confirmed !== true && given.confirmed !== 'yes'; round += 1) {
+    if (round >= CHANGE_ROUNDS) {
+      notes.push('The summary was changed several times; the last version is saved, and `/godmode setup` changes it later.')
+      break
+    }
+    logSummary($, facts, state.working, state.sources, 'godmode setup: what it will save.')
+    const answer = await askConfirm($, groups)
+    if (answer.kind === 'save') break
+    if (answer.kind === 'unasked') {
+      throw new SetupError(
+        [
+          'godmode could not ask the person to confirm the summary (a headless run, or the question was dismissed). Nothing was written.',
+          'Report this summary to the PM, who shows it to the person and, on their yes, dispatches the setup again with these answers and `confirmed: true` as `given`:',
+          ...summaryText(summaryLines(facts, state.working, state.sources, areaFilesOf(facts, state.working))),
+          `given: ${JSON.stringify(person)}`,
+        ].join('\n'),
+      )
+    }
+    if (answer.kind === 'typed') {
+      await saveRun($, run => ({ ...run, answers: mergeAnswers(run.answers ?? {}, toNoteAnswers(person)) }))
+      throw new SetupError(
+        [
+          `The person wants this changed before saving: "${answer.text}". Nothing was written.`,
+          `Report it to the PM, who works out the answers it means and dispatches the setup again with them over these as \`given\`: ${JSON.stringify(person)}`,
+        ].join('\n'),
+      )
+    }
+    const suggestions = suggestionsOf(state.working)
+    const asked = groups.filter(group => answer.picked.includes(group.label)).flatMap(group => group.questions)
+    for (const question of asked) delete person[question.key]
+    await ask(asked, {}, question => withSuggestion(question, suggestions))
+    state = settle()
+    await ask(openQuestionsOf(facts, scope, state.open, extras, false), person)
+    state = settle()
+  }
+  const composed = toNoteAnswers(state.working)
+  const answers = scope === 'personal' ? Object.fromEntries(Object.entries(composed).filter(([key]) => isPersonalKey(key))) : composed
+  return { answers, notes }
+}
+
+/**
+ * The given answers no question asked this run: each read through its own question where it
+ * has one (`"No attribution"` is false), else kept as given (a setting with no question).
+ */
+const leftoverGiven = (facts: ScanFacts, extras: readonly Question[], known: Readonly<Record<string, Answer>>, person: Readonly<Record<string, Answer>>) => {
+  const questions = [WHO_QUESTION, CARE_QUESTION, APPROVALS_QUESTION, CI_QUESTION, AUTO_MERGE, peopleQaQuestion(facts), QA_AGENT_QUESTION, TRACKER, STORAGE, ATTRIBUTION, ...gapQuestions(facts), ...extras]
+  const out: Record<string, Answer> = {}
+  for (const [key, value] of Object.entries(known)) {
+    if (key in person) continue
+    const question = questions.find(candidate => candidate.key === key)
+    const resolved = question === undefined ? { [key]: value } : resolveAnswer(question, value).values
+    for (const [name, raw] of Object.entries(resolved)) {
+      const checked = checkAnswer(name, raw)
+      if ('value' in checked) out[name] = checked.value
+    }
+  }
+  return out
+}
+
+/** The team's answers on a committed note, for a teammate's personal setup. */
+async function teamAnswersOf($: EngineInterface, project: Project): Promise<Record<string, Answer>> {
+  const found = await readNote($, project).catch(() => undefined)
+  return found?.status === 'found' ? { ...found.shared.answers } : {}
 }
 
 /** Starts a setup run: clears what an earlier one left. The PM is told to dispatch the setup agent. */
@@ -473,20 +673,10 @@ export async function setupQuestionnaire($: EngineInterface, input: Record<strin
     const found = await readNote($, project).catch(() => undefined)
     if (found?.status === 'found' && trackerKindOf(found.shared.answers.tracker ?? '') === 'jira') extras.push(...(await personalJiraQuestions($)))
   }
-  const { answers, notes, unasked } = await askAll($, project.root, questionsFor(facts, scope, extras), answersIn(input.given, 'given'))
+  const { answers, notes } = await askSetup($, project, facts, scope, extras, answersIn(input.given, 'given'))
   await saveRun($, current => ({ ...current, answers: mergeAnswers(current.answers ?? {}, answers) }))
-  if (unasked.length > 0) {
-    const lines = unasked.flatMap(question => outline(question, answers))
-    throw new SetupError(
-      [
-        'godmode could not ask the person (a headless run, or the question was dismissed), so setup stops here. Nothing was written.',
-        'Report these questions to the PM, who asks the person and dispatches the setup again with the answers as `given`:',
-        ...lines,
-      ].join('\n'),
-    )
-  }
   const shown = Object.entries(answers).map(([key, value]) => `- ${key}: ${JSON.stringify(value)}`)
-  return ['The person answered:', ...shown, ...notes.map(note => `Note: ${note}`)].join('\n')
+  return ['The person confirmed:', ...shown, ...notes.map(note => `Note: ${note}`)].join('\n')
 }
 
 /** `setup_confirm`: the person's yes before weak conventions are improved in place (D32). */
@@ -499,7 +689,7 @@ export async function setupConfirm($: EngineInterface, input: Record<string, unk
   const files = (stringsIn(input.files, 'files') ?? facts.conventions).map(path => absoluteIn(project, path))
   let answer: string
   try {
-    answer = await $.ui.ask(`Improve your existing conventions in place? ${change} Why: ${why}`, {
+    answer = await $.ui.ask(questionText(`Improve your existing conventions in place? ${change} Why: ${why}`), {
       options: ['Yes, improve them', 'No, keep them'],
       header: 'Conventions',
     })
@@ -636,6 +826,12 @@ async function verifiedOrRefused($: EngineInterface, root: string, answers: Read
   )
 }
 
+/** Writes the rules file from the answers, keeping the person's own section of the file it replaces. */
+async function writeProjectRules($: EngineInterface, path: string, answers: Readonly<Record<string, Answer>>, files: AreaFiles) {
+  const old = await $.fs.read(path).catch(() => undefined)
+  await $.fs.write(path, projectRulesText(answers, files, ownRulesIn(old)))
+}
+
 /** The answers a note holds, as one line per half, for a report built from what was saved. */
 const savedLine = (label: string, answers: Readonly<Record<string, Answer>>) =>
   `${label}: ${Object.entries(answers).map(([key, value]) => `${key} ${JSON.stringify(value)}`).join(', ') || 'none'}.`
@@ -655,6 +851,8 @@ async function finishInto($: EngineInterface, report: string, personal: Readonly
   await update($, indicator, () => indicatorOf(personal.indicator))
   await update($, setupReport, () => report)
   await update($, mode, () => 'coding')
+  // The side pane, when it is the person's indicator, opens now that the setup says so.
+  await openGodmodePane($).catch(() => undefined)
   $.ui.toast(isChange ? 'godmode setup change is done: coding mode.' : 'godmode setup is done: coding mode.')
 }
 
@@ -708,7 +906,27 @@ export async function setupFinish($: EngineInterface, input: Record<string, unkn
     )
   }
   const listed = stringsIn(input.conventions, 'conventions') ?? facts.conventions
-  const conventions = [...new Set([...listed, ...coveredPaths, ...run.written.map(entry => entry.path)].map(path => notePath(project, absoluteIn(project, path))))]
+  // The plain-language rules file (D78), written from the answers into the conventions folder.
+  const rulesDir = conventionsDirOf(project, storage as StorageMode, await claudeDirOf($))
+  const rulesPath = rulesDir === undefined ? undefined : `${rulesDir}/${PROJECT_RULES_FILE}`
+  if (rulesPath !== undefined) {
+    const written = (template: string) => run.written.find(entry => entry.template === `required/${template}`)?.path
+    const coveredBy = (template: string) => (typeof covered[template] === 'string' ? String(covered[template]) : undefined)
+    const shown = (path: string | undefined) => (path === undefined ? undefined : notePath(project, absoluteIn(project, path)))
+    const prTemplate = shown(written('pr-template.md') ?? coveredBy('pr-template.md') ?? facts.conventions.find(path => /pull_request_template/i.test(path)))
+    const gitWorkflow = shown(written('git-workflow.md') ?? coveredBy('git-workflow.md'))
+    const files: AreaFiles = {
+      conventionsDir: notePath(project, rulesDir ?? ''),
+      ...(prTemplate === undefined ? {} : { prTemplate }),
+      ...(gitWorkflow === undefined ? {} : { gitWorkflow }),
+      ...(typeof shared.ticketRules === 'string' ? { ticketRules: shared.ticketRules } : {}),
+      existing: facts.conventions,
+    }
+    await writeProjectRules($, rulesPath, { ...shared, ...personal }, files)
+  }
+  const conventions = [
+    ...new Set([...listed, ...coveredPaths, ...run.written.map(entry => entry.path), ...(rulesPath === undefined ? [] : [rulesPath])].map(path => notePath(project, absoluteIn(project, path)))),
+  ]
   const dir = await writeNote(
     $,
     { storage: storage as StorageMode, sharedAnswers: shared, minimumModels: {}, conventions, personalAnswers: personal, models: {} },
@@ -791,7 +1009,7 @@ export async function runAudit($: EngineInterface, found: FoundNote, switchToCha
 /** Asks whether to answer the questions new since the note's version (D60); `unasked` when nobody could answer. */
 async function offerUpdate($: EngineInterface, noteVersion: string, version: string, whats: readonly string[]): Promise<'yes' | 'no' | 'unasked'> {
   try {
-    const answer = await $.ui.ask(`godmode ${version} asks something new since this project's setup (${noteVersion}): ${whats.join('; ')}. Answer it now? Nothing changes until you do.`, {
+    const answer = await $.ui.ask(questionText(`godmode ${version} asks something new since this project's setup (${noteVersion}): ${whats.join('; ')}. Answer it now? Nothing changes until you do.`), {
       options: ['Answer now', 'Not now'],
       header: 'Update',
     })
@@ -877,7 +1095,9 @@ async function changeQuestionnaire($: EngineInterface, input: Record<string, unk
   }
   const suggestions = suggestionsOf(current)
   const given = { ...plan.given, ...answersIn(input.given, 'given') }
-  const { answers, notes, unasked } = await askAll($, project.root, plan.questions, given, question => withSuggestion(question, suggestions))
+  const asked = await askAll($, project.root, plan.questions, given, question => withSuggestion(question, suggestions))
+  const { notes, unasked } = asked
+  const answers = changedAnswers(current, plan.topics, asked.answers)
   if (unasked.length > 0) {
     throw new SetupError(
       [
@@ -889,8 +1109,24 @@ async function changeQuestionnaire($: EngineInterface, input: Record<string, unk
   }
   // Staying on Jira, a Jira answer the round could not settle (no server connected, a site left for later) keeps its old value.
   const staysOnJira = answers.tracker === 'jira' && current.tracker === 'jira'
-  const dropped = staysOnJira ? plan.dropped.filter(key => !JIRA_KEYS.includes(key) || key in answers) : plan.dropped
-  await saveRun($, run => ({ ...run, change: { topics: plan.topics, dropped, answers, isUpdate } }))
+  const dropped = [
+    ...(staysOnJira ? plan.dropped.filter(key => !JIRA_KEYS.includes(key) || key in answers) : plan.dropped),
+    ...(plan.topics.includes('start') ? MIGRATED_AWAY : []),
+  ]
+  // A round after "Change something" adds to the one before it, until setup_finish saves both.
+  await saveRun($, run => {
+    const before = run.change
+    if (before === undefined) return { ...run, change: { topics: plan.topics, dropped, answers, isUpdate } }
+    return {
+      ...run,
+      change: {
+        topics: [...new Set([...before.topics, ...plan.topics])],
+        dropped: [...new Set([...before.dropped, ...dropped])],
+        answers: { ...before.answers, ...answers },
+        isUpdate: before.isUpdate || isUpdate,
+      },
+    }
+  })
   const shown = Object.entries(answers).map(([key, value]) => `- ${key}: ${JSON.stringify(value)}`)
   return [
     ...(check?.lines ?? []),
@@ -900,6 +1136,18 @@ async function changeQuestionnaire($: EngineInterface, input: Record<string, unk
     'Nothing is saved yet. Call setup_finish: it shows the person every change and saves only on their yes.',
     ...(wantsTickets ? [TICKETS_LINE] : []),
   ].join('\n')
+}
+
+/**
+ * A change round's answers in the note's keys (D78): Who and Care from a note before them bring
+ * its old answers mapped onto the merge conditions, and the merging and QA questions' working
+ * answers become the conditions list and the QA mode, over the note's own values.
+ */
+const changedAnswers = (current: Readonly<Record<string, Answer>>, topics: readonly string[], round: Readonly<Record<string, Answer>>) => {
+  const migrated = topics.includes('start') ? migratedAnswers(current) : {}
+  const isWorking = Object.keys(round).some(key => WORKING_KEYS.includes(key) || key === 'qaMode')
+  if (!isWorking) return { ...migrated, ...round }
+  return toNoteAnswers({ ...workingAnswersOf(current), ...migrated, ...round })
 }
 
 /** What the PM is told for the `tickets` topic: ticket_rules asks the person and saves on their yes. */
@@ -1004,23 +1252,62 @@ async function changeFinish($: EngineInterface, input: Record<string, unknown>) 
   const team = found.shared.storage === 'committed' && isShared ? ' The team\'s half is committed: the others get it once the change is committed.' : ''
   let answer: string
   try {
-    // The changes go in a log line above the dialog, so the question itself is never cut off.
-    $.ui.log(`The setup changes to save:\n${lines.map(line => `- ${line}`).join('\n')}`)
-    answer = await $.ui.ask(`Save the setup changes shown above?${team}`, { options: ['Save', 'Discard'], header: 'Save setup' })
+    // The rules as they will stand (D78), then the changes, each in log lines above the dialog, so the question itself is never cut off.
+    if (isRulesChange(change?.topics ?? [])) {
+      const facts = await factsOf($, project)
+      const marked: Record<string, Source> = Object.fromEntries(Object.keys(after).map(key => [key, changedKeys.has(key) ? 'you' : 'saved']))
+      logSummary($, facts, { ...workingAnswersOf(after), ...after }, marked, 'The project rules after this change:')
+    }
+    logLines($, `The setup changes to save:\n${lines.map(line => `- ${line}`).join('\n')}`)
+    answer = await $.ui.ask(`Save the setup changes shown above?${team}`, { options: [SAVE, CHANGE, 'Discard'], header: 'Save setup' })
   } catch {
     await endChangeSetup($, found, `godmode: the setup change ended, as nobody could answer whether to save it. Nothing was saved. ${BACK_TO_CODING}`)
     throw new SetupError(`godmode could not ask the person whether to save (a headless run, or the question was dismissed). Nothing was saved. ${BACK_TO_CODING} Tell the person the changes in plain words; \`/godmode setup\` starts the change again once they can answer.`)
   }
-  if (answer !== 'Save') return changeEndedUnsaved($, found, 'the person discarded the setup change, so nothing was saved.')
+  if (answer === CHANGE) {
+    return 'The person wants to change something before saving; nothing is saved yet, and this round is kept. Ask them what, in a line, then call setup_questionnaire with its topic in `change`, then setup_finish again.'
+  }
+  if (answer !== SAVE) return changeEndedUnsaved($, found, 'the person discarded the setup change, so nothing was saved.')
 
   const writtenAt = new Date(await $.clock.now()).toISOString()
+  // The rules file follows the note (D78): written again whenever the team's half changes.
+  const saving = isSharedChanged ? await rewriteProjectRules($, project, found, next.shared, conventions) : conventions
   if (isShared) {
-    await writeSharedNote($, found.dir, { ...found.shared, godmodeVersion: isRestamped ? version : noteVersion, writtenAt, answers: next.shared, conventions })
+    await writeSharedNote($, found.dir, { ...found.shared, godmodeVersion: isRestamped ? version : noteVersion, writtenAt, answers: next.shared, conventions: saving })
   }
   if (!sameAnswers(saved.personal, next.personal)) await writePersonalNote($, found.dir, next.personal, found.personal?.models ?? {})
   const report = [changeReport(notePath(project, found.dir), lines, before, after, still.map(entry => entry.what)), ...warnings].join('\n')
   await endChangeSetup($, found, report, next.personal)
   return `${report}\nTell the person this in a line or two.`
+}
+
+/** The change topics that move the project rules, so the summary is shown before the save. */
+const RULES_TOPICS: readonly string[] = ['start', 'who', 'care', 'merging', 'qa', 'autoMerge', 'prApproval', 'tracker']
+
+const isRulesChange = (topics: readonly string[]) => topics.some(topic => RULES_TOPICS.includes(topic))
+
+/**
+ * Writes the rules file again from the note's new team answers (D78), where the note keeps it,
+ * else in the conventions folder, and resolves the conventions with its new fingerprint.
+ */
+async function rewriteProjectRules($: EngineInterface, project: Project, found: FoundNote, shared: Readonly<Record<string, Answer>>, conventions: SharedNote['conventions']) {
+  const listed = conventions.find(file => file.path.endsWith(PROJECT_RULES_FILE))?.path
+  const dir = conventionsDirOf(project, found.shared.storage, await claudeDirOf($))
+  const path = listed === undefined ? (dir === undefined ? undefined : `${dir}/${PROJECT_RULES_FILE}`) : absoluteIn(project, listed)
+  if (path === undefined) return conventions
+  const facts = await factsOf($, project)
+  const find = (pattern: RegExp) => conventions.find(file => pattern.test(file.path))?.path
+  const prTemplate = find(/pull_request_template|pr-template/i)
+  const gitWorkflow = find(/git-workflow/i)
+  const files: AreaFiles = {
+    conventionsDir: notePath(project, path.replace(/\/[^/]*$/, '')),
+    ...(prTemplate === undefined ? {} : { prTemplate }),
+    ...(gitWorkflow === undefined ? {} : { gitWorkflow }),
+    ...(typeof shared.ticketRules === 'string' ? { ticketRules: shared.ticketRules } : {}),
+    existing: facts.conventions,
+  }
+  await writeProjectRules($, path, shared, files)
+  return recheckedConventions($, project, conventions, [path])
 }
 
 /** Takes the setup's report for the PM, once (D64: carried by `prompt.submit`, which runs on every account). */

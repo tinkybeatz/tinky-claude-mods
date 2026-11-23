@@ -665,3 +665,45 @@ test('without the merge signal, a merge outside godmode is no pass: the PM is to
   expect(line).toContain('still waiting')
   expect(line).toContain('carol merged PR #12 outside godmode, which this setup does not count as a QA pass, so ask the person whether QA passed')
 })
+
+// ---------------------------------------------------------------------------
+// Code review apart from QA (D77)
+
+/** The code-review lines the latest prompt carried. */
+const reviewLines = (qa: Qa) => (qa.contexts.at(-1) ?? []).flatMap(block => block.split('\n')).filter(line => line.startsWith('Code review'))
+
+test('with code review on and no QA approvers named, a colleague\'s approval is code review, never a QA pass', async ($, on) => {
+  const qa = await startQa($, on, { shared: { humanReview: true, qaApprovers: '' } })
+  await waitingOnQa(qa, 'Export button')
+  qa.prs.set('12', { head: HEAD, reviews: [{ login: 'bob', state: 'APPROVED', commit: HEAD }] })
+
+  await prompt($)
+
+  expect(qaLines(qa)).toEqual(['QA T-1 ("Export button"): still waiting.'])
+  expect(reviewLines(qa)).toEqual(['Code review T-1: approved (1/1) at PR #12\'s current commit; it merges once QA passes too.'])
+})
+
+test('with code review on, the named QA approver\'s approval is still the QA pass', async ($, on) => {
+  const qa = await startQa($, on, { shared: { humanReview: true, qaApprovers: 'alice' } })
+  await waitingOnQa(qa, 'Export button')
+  qa.prs.set('12', { head: HEAD, reviews: [{ login: 'alice', state: 'APPROVED', commit: HEAD }] })
+
+  await prompt($)
+
+  expect(qaLines(qa)[0]).toContain('alice approved PR #12\'s current commit a1b2c3d. That is a QA pass')
+})
+
+test('the per-prompt check reports code review waiting, and changes requested with the fix-round offer', async ($, on) => {
+  const qa = await startQa($, on, { shared: { humanReview: true, humanReviewCount: 2 } })
+  await waitingOnQa(qa, 'Export button', '12')
+  await waitingOnQa(qa, 'Import button', '14')
+  qa.prs.set('12', { head: HEAD, reviews: [{ login: 'bob', state: 'APPROVED', commit: HEAD }] })
+  qa.prs.set('14', { head: HEAD, reviews: [{ login: 'carol', state: 'CHANGES_REQUESTED', commit: HEAD }] })
+
+  await prompt($)
+
+  expect(reviewLines(qa)).toEqual([
+    'Code review T-1: waiting for code review (1/2) on PR #12.',
+    'Code review T-2: carol requested changes on PR #14. Offer the person a fix round from the review comments; start it only on their word or under the fix-round rules.',
+  ])
+})

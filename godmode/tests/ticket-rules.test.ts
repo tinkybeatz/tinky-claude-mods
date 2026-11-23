@@ -3,17 +3,17 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { pendingUpdates } from '../hooks/change-setup'
-import { rulesFromScan, scanBoard, scanLines, unclearScan } from '../hooks/ticket-rules'
 import type { Answer } from '../hooks/storage'
 import { plainError } from '../hooks/jira'
-import { makeJira, mountJira, RUNNER_SERVER, SERVER, SPRINT_FIELD, TOO_LARGE_TEXT } from './jira-world'
+import { makeJira, mountJira, RUNNER_SERVER, SERVER, TOO_LARGE_TEXT } from './jira-world'
 import type { FakeJira } from './jira-world'
 import { makeWorld, mountWorld, REPO, setUpProject } from './world'
 import type { World } from './world'
 
 /*
- * The ticket-filing rules (D74), learned from a messy board: mixed issue types, half the
- * tickets in no sprint, a field left holding template text, a required field.
+ * The ticket-filing rules (D74, D76): a checklist of the decisions godmode makes when it
+ * files a ticket, answered from the person's own tickets first, the team's where theirs say
+ * nothing, and "?" where nothing does. Board data is messy on purpose.
  */
 
 const SITE = '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90'
@@ -93,92 +93,131 @@ const shared = (world: World) => JSON.parse(world.files.get(SHARED) ?? 'null') a
 /** A set-up project on the PROD board, at godmode 0.7.0. */
 const onProd = async (world: World, server = SERVER) => setUpProject(world, { sharedAnswers: ON_PROD, personalAnswers: { jiraServer: server, prApproval: 'ask' } })
 
-test('a messy board reads as rules: types and where each goes, half in no sprint, usual field values, template text and required fields', () => {
-  const jira = messyBoard()
-  const rows = [...jira.issues.values()].map(issue => ({ key: issue.key, fields: { creator: { accountId: issue.creator }, ...rowFields(issue) } }))
-  const scan = scanBoard({ project: 'PROD', site: SITE, issues: rows, account: 'acc-me', typeFields: { Bug: [{ id: 'customfield_10100', name: 'Team', isRequired: true, hasDefault: false }] } })
-  const lines = scanLines(scan).join('\n')
 
-  expect(scan.total).toBe(10)
-  expect(scan.mine).toBe(1)
-  expect(lines).toContain('- Bug: 4 of 10. Goes to: next sprint 3, backlog 1. No parent, usually priority High.')
-  expect(lines).toContain('- Story: 3 of 10. Goes to: backlog 3.')
-  expect(lines).toContain('- Task: 2 of 10. Goes to: active sprint 2.')
-  expect(lines).toContain('- Sub-task: 1 of 10. Goes to: backlog 1. A parent on 1 of 1 (Story).')
-  expect(lines).toContain(`- The sprint field is ${SPRINT_FIELD}.`)
-  expect(lines).toContain('- Team (customfield_10100) is set on 9 of 10, usually Platform (8), Editor (1).')
-  expect(lines).toContain('- A Bug requires Team (customfield_10100).')
-  expect(lines).toContain('- description still holds template text on 3 issues')
-  expect(lines).toContain('- customfield_10200 still holds template text on 3 issues ("<describe the customer impact>")')
-  expect(rulesFromScan(scan, '2026-11-23')).toContain('ask the person, never guess')
-  expect(unclearScan({ ...scan, total: 0 })).toBe('PROD has no issues yet')
-})
+/**
+ * The live shape (the "Atlassian MCP" server, `{ issues: { nodes } }`, custom fields under
+ * `customFields` by label): the person's own bugs go in the next cooldown sprint with a
+ * "P3 - " prefix, a dev team, a priority field and a description template; their stories
+ * sit in the backlog under an epic; only the team's tickets show chores.
+ */
+const liveBoard = (overrides: Partial<FakeJira> = {}) => {
+  const jira = makeJira({ flavour: 'runner', isNodes: true, projects: [{ key: 'PROD', name: 'Product' }], account: 'acc-me', ...overrides })
+  const sprint = [{ id: 2237, name: 'Web - Cooldown 12.2', state: 'future' }]
+  const add = (number: number, fields: Partial<Parameters<typeof jira.issues.set>[1]>) =>
+    jira.issues.set(`PROD-${number}`, { key: `PROD-${number}`, summary: `Issue ${number}`, status: 'To Do', ...fields })
+  for (const number of [48, 49, 50, 51, 52]) {
+    add(number, {
+      type: 'Bug',
+      summary: `P3 - Export fails ${number}`,
+      creator: 'acc-me',
+      parent: { key: 'PROD-1', type: 'Epic' },
+      description: '## Repro steps\n1. Open the editor\n## Observed\nIt fails.\n## Expected\nIt works.',
+      custom: { Sprint: sprint, 'Dev Team': { value: 'Squad A' }, 'Bug Priority': { value: 'P3' }, 'Impact Analysis': 'Impact: <describe the customer impact>' },
+    })
+  }
+  for (const number of [5760, 5761, 5762]) add(number, { type: 'Story', summary: `Feature ${number}`, creator: 'acc-me', parent: { key: 'PROD-2', type: 'Epic' }, custom: { 'Dev Team': { value: 'Squad A' } } })
+  // The team's: chores, and noise the checklist must not count.
+  for (const number of [6001, 6002]) add(number, { type: 'Task', summary: `Chore ${number}`, creator: 'acc-sam' })
+  for (const number of [6003, 6004, 6005, 6006]) add(number, { type: 'Finding', summary: `Finding ${number}`, creator: 'acc-sam' })
+  return jira
+}
 
-/** An issue's fields as the board gives them with `*all`, for the pure scan. */
-const rowFields = (issue: Parameters<ReturnType<typeof makeJira>['issues']['set']>[1]) => ({
-  issuetype: { name: issue.type ?? 'Task' },
-  ...(issue.sprint === undefined ? {} : { [SPRINT_FIELD]: issue.sprint }),
-  ...(issue.parent === undefined ? {} : { parent: { key: issue.parent.key, fields: { issuetype: { name: issue.parent.type } } } }),
-  labels: issue.labels ?? [],
-  components: (issue.components ?? []).map(name => ({ name })),
-  ...(issue.priority === undefined ? {} : { priority: { name: issue.priority } }),
-  description: issue.description ?? null,
-  ...issue.custom,
-})
+/** Whether a line counts issue types across the board, as the old scan did. */
+const isNoise = (line: string) => /\b\d+ of \d+\. Goes to\b|: \d+ of \d+\.$|Finding/.test(line)
 
-test('the tickets topic scans the board; the person corrects it, the PM rewrites the rules, and they are saved and fingerprinted on a yes', async ($, on) => {
+test('the live shape: sprint, fields and templates under customFields are read from the person\'s own tickets, one line per log, and no type counts', async ($, on) => {
   const world = makeWorld({ pluginVersion: '0.7.0' })
-  await onProd(world)
-  const person = mount(on, world, messyBoard(), { 'Ticket rules': ['Scan the board, then I confirm', 'Bugs go in the active sprint, not the next one', 'Save'] })
-
+  await onProd(world, RUNNER_SERVER)
+  const person = mount(on, world, liveBoard(), { 'Ticket rules': ['Scan my tickets, then I confirm', 'Looks right', 'Sub-task', 'Leave it out'] })
   await godmode($, 'setup')
-  expect(resultOf(await call($, 'setup_questionnaire', { change: ['tickets'] }))).toContain('call mcp__godmode__ticket_rules with no arguments')
-  const corrected = resultOf(await call($, 'ticket_rules'))
 
-  expect(person.logs[0]).toContain('How your team seems to file tickets:')
-  expect(person.logs[0]).toContain('- Bug: 4 of 10. Goes to: next sprint 3, backlog 1.')
-  expect(person.texts[1]).toBe('Is the summary above right? Pick "Correct it", or type what to change under Other.')
+  const saved = resultOf(await call($, 'ticket_rules'))
+  const shown = person.logs.join('\n')
+
+  expect(person.logs.every(line => !line.includes('\n'))).toBe(true)
+  expect(person.logs[0]).toBe('How you file tickets in PROD, read from 8 of your latest tickets:')
+  expect(shown).toContain('- Bug: Bug (from 5 of your tickets)')
+  expect(shown).toContain('- Feature or change: Story (from 3 of your tickets)')
+  expect(shown).toContain('- Chore or maintenance: Task (from 2 of the team\'s tickets; none of yours settle it)')
+  expect(shown).toContain('- Piece of a bigger item: ?')
+  expect(person.logs[1]).toBe('Issue type:')
+  expect(shown).toContain('- Bug: the next sprint, named like "Web - Cooldown <n>.<n>" (e.g. "Web - Cooldown 12.2") (from 5 of your tickets)')
+  expect(shown).toContain('- Story: the backlog (from 3 of your tickets)')
+  expect(shown).toContain('Parent:\n- Bug: an Epic; ask the person which one each time (from 5 of your tickets)')
+  expect(shown).toContain('- Assignee: you, unless you say otherwise')
+  expect(shown).toContain('- Bug: Dev Team = Squad A (habit, 5 of 5); Bug Priority = P3 (habit, 5 of 5); fill or leave: Impact Analysis (template text)')
+  expect(shown).toContain('- Bug: starts "P<n> - " (from 5 of your tickets)')
+  expect(shown).toContain('- Bug: Description: Repro steps, Observed, Expected (from 5 of your tickets)')
+  expect(shown).toContain('- Task: none (from 2 of the team\'s tickets; none of yours settle it)')
+  expect(person.logs.some(isNoise)).toBe(false)
+  // The "?" item is asked, and the answer saved under its heading.
+  expect(person.texts).toContain('Which issue type does a piece of a bigger item get? Type it under Other.')
+  expect(saved).toContain('Saved docs/conventions/ticket-filing.md')
+  const file = world.files.get(RULES) ?? ''
+  expect(file).toContain('## Issue type')
+  expect(file).toContain('- Piece of a bigger item: Sub-task (your answer)')
+  expect(file).toContain('## Placement')
+  expect(file.split('\n').some(isNoise)).toBe(false)
+})
+
+test('with no tickets of their own, the person sees the team\'s answers, each saying so', async ($, on) => {
+  const world = makeWorld({ pluginVersion: '0.7.0' })
+  await onProd(world, RUNNER_SERVER)
+  const person = mount(on, world, liveBoard({ account: 'acc-nobody' }), { 'Ticket rules': ['Scan my tickets, then I confirm', 'Looks right', 'Leave it out'] })
+  await godmode($, 'setup')
+
+  resultOf(await call($, 'ticket_rules'))
+
+  expect(person.logs[0]).toBe('How you file tickets in PROD, read from the team\'s latest 14 tickets, as you have none in PROD:')
+  expect(person.logs).toContain('- Bug: Bug (from 5 of the team\'s tickets; none of yours settle it)')
+})
+
+test('a correction typed over the checklist goes to the PM with the checklist, to rewrite and confirm', async ($, on) => {
+  const world = makeWorld({ pluginVersion: '0.7.0' })
+  await onProd(world, RUNNER_SERVER)
+  const person = mount(on, world, liveBoard(), { 'Ticket rules': ['Scan my tickets, then I confirm', 'Correct it', 'Bugs go in the active sprint, not the next one', 'Save'] })
+  await godmode($, 'setup')
+
+  const corrected = resultOf(await call($, 'ticket_rules'))
   expect(corrected).toContain('"Bugs go in the active sprint, not the next one"')
-  expect(corrected).toContain('# Ticket filing')
+  expect(corrected).toContain('## Placement')
   expect(world.files.has(RULES)).toBe(false)
 
-  const saved = resultOf(await call($, 'ticket_rules', { rules: '# Ticket filing\n\n- Bugs go in the active sprint, with Team set.\n' }))
-
-  expect(saved).toContain('Saved docs/conventions/ticket-filing.md')
-  expect(person.texts[2]).toBe('Save the ticket-filing rules shown above?')
-  expect(person.logs[1]).toContain('- Bugs go in the active sprint, with Team set.')
-  expect(world.files.get(RULES)).toBe('# Ticket filing\n\n- Bugs go in the active sprint, with Team set.\n')
+  resultOf(await call($, 'ticket_rules', { rules: '# Ticket filing\n\n## Placement\n\n- Bug: the active sprint\n' }))
+  expect(person.texts.at(-1)).toBe('Save the ticket-filing rules shown above?')
+  expect(person.logs).toContain('- Bug: the active sprint')
   expect(shared(world).answers.ticketRules).toBe('docs/conventions/ticket-filing.md')
   expect(shared(world).conventions.map(file => file.path)).toContain('docs/conventions/ticket-filing.md')
 })
 
-test('explain only: the person\'s words go to the PM to turn into rules, and rules not confirmed are not saved', async ($, on) => {
+test('explaining it themselves, the person answers the same checklist item by item', async ($, on) => {
   const world = makeWorld({ pluginVersion: '0.7.0' })
   await onProd(world)
-  mount(on, world, messyBoard(), { 'Ticket rules': ['I\'ll explain it myself', 'Bugs: Bug type, next sprint, Team set. Everything else: Task in the backlog.', 'Not yet'] })
-
+  const person = mount(on, world, messyBoard(), { 'Ticket rules': ['I\'ll explain it myself', 'Bug', 'Story', 'Leave it out', 'Leave it out', 'Bugs in the next sprint, the rest in the backlog', 'Ask me each time', 'Leave it out', 'Leave it out', 'Leave it out', 'Leave it out', 'Save'] })
   await godmode($, 'setup')
-  const explained = resultOf(await call($, 'ticket_rules'))
-  const refused = resultOf(await call($, 'ticket_rules', { rules: '# Ticket filing\n\n- Bugs go in the next sprint.\n' }))
 
-  expect(explained).toContain('explained how their team files tickets')
-  expect(explained).toContain('Bugs: Bug type, next sprint, Team set.')
-  expect(refused).toContain('did not save these rules')
-  expect(world.files.has(RULES)).toBe(false)
+  resultOf(await call($, 'ticket_rules'))
+
+  expect(person.texts[1]).toBe('Which issue type does a bug get? Type it under Other.')
+  const file = world.files.get(RULES) ?? ''
+  expect(file).toContain('- Bug: Bug (your answer)')
+  expect(file).toContain('- Placement: Bugs in the next sprint, the rest in the backlog (your answer)')
+  expect(file).toContain('- Parent: ask the person each time (your answer)')
+  expect(file).not.toContain('Chore or maintenance')
 })
 
-test('an empty project says the scan found nothing clear, and falls back to the person explaining', async ($, on) => {
+test('an empty project says the scan found nothing to read, and offers explaining first', async ($, on) => {
   const world = makeWorld({ pluginVersion: '0.7.0' })
   await onProd(world)
   const empty = messyBoard()
   empty.issues.clear()
-  const person = mount(on, world, empty, { 'Ticket rules': ['Scan the board, then I confirm', 'Every ticket is a Task in the backlog.'] })
-
+  const person = mount(on, world, empty, { 'Ticket rules': ['Scan my tickets, then I confirm', 'Skip for now'] })
   await godmode($, 'setup')
-  const answer = resultOf(await call($, 'ticket_rules'))
 
-  expect(person.texts[1]).toContain('The scan found nothing clear: PROD has no issues yet.')
-  expect(answer).toContain('"Every ticket is a Task in the backlog."')
+  await call($, 'ticket_rules')
+
+  expect(person.texts[1]).toBe('The scan found nothing to read: PROD has no issues yet. How should godmode learn your team\'s ticket rules?')
+  expect(person.offered[1]).toEqual(['I\'ll explain it myself', 'Try the scan again'])
 })
 
 test('while coding, the PM reads the rules, adds the person\'s new rule on a yes, and an agent cannot change them', async ($, on) => {
@@ -229,16 +268,16 @@ test('a scan page too large for the session is asked again at half the size, and
   const world = makeWorld({ pluginVersion: '0.7.0' })
   await onProd(world)
   const jira = messyBoard({ isTooLarge: args => Number(args.maxResults) > 5 })
-  const person = mount(on, world, jira, { 'Ticket rules': ['Scan the board, then I confirm', 'Looks right', 'Save'] })
+  const person = mount(on, world, jira, { 'Ticket rules': ['Scan my tickets, then I confirm', 'Looks right', 'Leave it out'] })
   await godmode($, 'setup')
 
   const saved = resultOf(await call($, 'ticket_rules'))
 
-  expect(pageSizes(jira).slice(0, 3)).toEqual([10, 5, 5])
+  expect(pageSizes(jira).slice(0, 2)).toEqual([10, 5])
   const scanned = jira.calls.find(found => found.tool === 'searchJiraIssuesUsingJql' && Array.isArray(found.args.fields))
   expect(scanned?.args.fields).not.toContain('*all')
   expect(scanned?.args.fields).toContain('customfield_10100')
-  expect(person.logs[0]).toContain('Read from the latest 10 issues in PROD')
+  expect(person.logs[0]).toBe('How you file tickets in PROD, read from 1 of your latest tickets:')
   expect(saved).toContain('Saved docs/conventions/ticket-filing.md')
   expect(leaks([...person.texts, ...person.logs, saved])).toBe(false)
 })
@@ -246,28 +285,16 @@ test('a scan page too large for the session is asked again at half the size, and
 test('a scan too large on every try says so in one plain sentence, offers explaining first, and never shows the saved-file notice', async ($, on) => {
   const world = makeWorld({ pluginVersion: '0.7.0' })
   await onProd(world)
-  const person = mount(on, world, messyBoard({ isTooLarge: () => true }), { 'Ticket rules': ['Scan the board, then I confirm', 'I\'ll explain it myself', 'Every ticket is a Task in the backlog.'] })
+  const person = mount(on, world, messyBoard({ isTooLarge: () => true }), { 'Ticket rules': ['Scan my tickets, then I confirm', 'I\'ll explain it myself', 'Leave it out'] })
   await godmode($, 'setup')
 
   const answer = resultOf(await call($, 'ticket_rules'))
 
   expect(person.texts[1]).toBe('godmode could not read the board: Jira\'s answer was too large. How should godmode learn your team\'s ticket rules?')
   expect(person.offered[1]).toEqual(['I\'ll explain it myself', 'Try the scan again'])
-  expect(person.texts[2]).toBe('How does your team file tickets in PROD? Type it under Other: types, sprint or backlog, parents, labels, fields.')
-  expect(answer).toContain('"Every ticket is a Task in the backlog."')
+  expect(person.texts[2]).toBe('Which issue type does a bug get? Type it under Other.')
+  expect(answer).toContain('left every item out')
   expect(leaks([...person.texts, ...person.logs, answer])).toBe(false)
-})
-
-test('the "Atlassian MCP" server\'s { issues: { nodes } } answer, with custom fields mapped under customFields, is read', async ($, on) => {
-  const world = makeWorld({ pluginVersion: '0.7.0' })
-  await onProd(world, RUNNER_SERVER)
-  const person = mount(on, world, messyBoard({ flavour: 'runner', isNodes: true }), { 'Ticket rules': ['Scan the board, then I confirm', 'Looks right', 'Save'] })
-  await godmode($, 'setup')
-
-  resultOf(await call($, 'ticket_rules'))
-
-  expect(person.logs[0]).toContain('- Bug: 4 of 10. Goes to: next sprint 3, backlog 1.')
-  expect(person.logs[0]).toContain('customfield_10100 is set on 9 of 10, usually Platform (8), Editor (1).')
 })
 
 test('an error is one plain sentence of 150 characters at most, with no file path and nothing after it', () => {

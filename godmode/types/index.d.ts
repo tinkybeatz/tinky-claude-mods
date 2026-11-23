@@ -139,8 +139,60 @@ export interface Unlock {
   at: number
 }
 
-/** How the "godmode is on" indicator shows (D68): a footer mode label, a hint-line tag, or a band above the prompt. */
-export type IndicatorStyle = 'mode' | 'hint' | 'band'
+/** How the "godmode is on" indicator shows (D68): a footer mode label, a hint-line tag, a band above the prompt, or the side pane. */
+export type IndicatorStyle = 'mode' | 'hint' | 'band' | 'pane'
+
+/** What the side pane tracks, as the dispatch panel does: an agent or a background shell. */
+export type PaneRowKind = 'agent' | 'shell'
+
+/** The side pane's tabs. */
+export type PaneTab = 'active' | 'finished'
+
+/** One agent or background shell the side pane lists, with its purpose, tokens and duration. */
+export interface PaneRow {
+  id: string
+  kind: PaneRowKind
+  /** Agent type (`Explore`, `godmode:dev`) or `bash`. */
+  label: string
+  /** The Agent call's description, or the Bash call's description or command. */
+  purpose: string
+  status: string
+  startedAt: number
+  endedAt?: number
+  /** Input tokens the agent has sent across all its requests, cache reads and writes included; absent for shells. */
+  inputTokens?: number
+  /** Output tokens the agent has generated across all its requests; absent for shells. */
+  outputTokens?: number
+  /** The start of the agent's prompt, kept so its activity can be classified. */
+  brief?: string
+  /** What the agent is doing, one of the activity labels; absent until classified. */
+  activity?: string
+  /** True once classification was tried, so a failed attempt is not repeated. */
+  isClassified?: boolean
+  /** What a running agent is doing right now ("reading register.tsx", "committing"). */
+  action?: string
+  /** The agent that started this agent or shell; absent when the main thread did. */
+  parentId?: string
+}
+
+/** One of the account's rate-limit windows, as the last API response reported it. */
+export interface PaneLimit {
+  /** `five_hour`, `seven_day`, or a gateway's `spend_limit`. */
+  kind: string
+  /** How much of the window is used, 0 to 100. */
+  percentUsed: number
+  /** When the window resets, as an ISO 8601 timestamp. */
+  resetsAt?: string
+}
+
+/** One open ticket as the side pane lists it, and what it waits on from the person, if anything. */
+export interface PaneTicket {
+  id: string
+  title: string
+  status: string
+  /** `merge go`, `QA`, `go to start`, `fix-round go`: what the person is waited on for; absent when nothing. */
+  waits?: string
+}
 
 declare module 'claude-code' {
   interface PluginState {
@@ -164,7 +216,25 @@ declare module 'claude-code' {
       /** What the PM is told on its next prompt once setup finished; empty when nothing waits. */
       setupReport: string
       /** The style of the on-indicator (D68), a personal answer; `mode` unless the note says otherwise. */
-      indicator: 'mode' | 'hint' | 'band'
+      indicator: 'mode' | 'hint' | 'band' | 'pane'
+      /** The side pane's agents and shells, as the dispatch panel tracks them. */
+      paneRows: PaneRow[]
+      /** The clock as the side pane last drew it, so running rows' durations move. */
+      paneNow: number
+      /** The side pane's tab. */
+      paneTab: PaneTab
+      /** Whether the side pane's width was set this session. */
+      paneSized: boolean
+      /** The sections of the side pane the person folded, by kind. */
+      paneCollapsed: Record<PaneRowKind, boolean>
+      /** The account's rate-limit windows, the side pane's footer bars. */
+      paneLimits: PaneLimit[]
+      /** Open tickets and what each waits on from the person, read on each prompt and after each ticket change. */
+      paneTickets: PaneTicket[]
+      /** The side pane could not be placed (a narrow terminal), so the band shows that godmode is on. */
+      paneFallback: boolean
+      /** The person closed the side pane by hand: it stays closed until godmode is next switched on. */
+      paneClosed: boolean
       /** Whether Fable answered the PM in this session: untried, it works, or the PM runs on Opus (D74). */
       pmModel: 'untried' | 'fable' | 'opus'
       /** The person's asks that unlock one controlled action each (D74). */

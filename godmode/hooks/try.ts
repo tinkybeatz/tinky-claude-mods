@@ -7,6 +7,7 @@ import type { LoopCache, LoopContext } from './loop'
 import { commandKey } from './scan'
 import { backendFor, normaliseId, TICKET_STATUSES, trackerOf } from './tickets'
 import type { TicketHeader } from './tickets'
+import { logLines } from './ui-text'
 import { endProcesses, groupAndDescendants, listenersOn, processTable, runningInside } from './try-procs'
 import type { ProcessRow } from './try-procs'
 
@@ -220,7 +221,7 @@ function readOutput($: EngineInterface, handles: TryHandles, live: LiveTry) {
     await update($, tryRun, current => (current?.ticket === live.run.ticket && current.port === live.run.port ? null : current))
     await endTryProcesses($, live.run, live.pgid, false)
     await forgetTryRecord($, live.pgid)
-    $.ui.log(endedLine(live, false))
+    logLines($, endedLine(live, false))
   })().catch(() => undefined)
 }
 
@@ -299,10 +300,11 @@ function watchLate($: EngineInterface, live: LiveTry) {
       if (url !== undefined) {
         live.watch?.cancel()
         await markAnswering($, live, url)
-        $.ui.log(runningLine(live.run))
+        logLines($, runningLine(live.run))
       } else if (waited >= LATE_WATCH_MS) {
         live.watch?.cancel()
-        $.ui.log(
+        logLines(
+          $,
           `${live.run.ticket}'s app still does not answer on port ${live.run.port} after ${Math.round((READY_WAIT_MS + LATE_WATCH_MS) / 1000)} seconds; it keeps running until \`/godmode try stop\`. ${quoted(live.output)}`,
         )
       }

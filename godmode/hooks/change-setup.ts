@@ -1,19 +1,25 @@
 import type { ScanFacts } from '../types'
+import { careOf, conditionIdsOf, conditionsAnswer, PROJECT_RULES_FILE, whoOf, workingAnswersOf } from './project-rules'
 import {
   AGENT_CAP,
-  APPROVAL,
+  APPROVALS_QUESTION,
   ATTRIBUTION,
   AUTO_MERGE,
+  CARE_QUESTION,
+  CI_QUESTION,
   FIX_ROUNDS,
   gapQuestions,
   hostQuestion,
   INDICATOR,
   isPersonalKey,
   JIRA_KEYS,
+  MERGE_KEYS,
+  peopleQaQuestion,
+  QA_AGENT_QUESTION,
   QA_KEYS,
-  qaQuestion,
   TRACKER,
   UNRECORDED_KEYS,
+  WHO_QUESTION,
 } from './questionnaire'
 import type { Choice, Question } from './questionnaire'
 import { qaModeOf } from './role'
@@ -43,11 +49,18 @@ const TOPICS = {
   tracker: { keys: TRACKER_KEYS, questions: () => [TRACKER] },
   // The tracker question answered as Jira unasked, so only the Jira questions run again.
   jira: { keys: TRACKER_KEYS, questions: () => [TRACKER] },
+  // Who and Care together (D78): `update` offers them to a note from before them, mapping its old answers.
+  start: { keys: ['who', 'care', 'prApproval'], questions: () => [WHO_QUESTION, CARE_QUESTION] },
+  who: { keys: ['who'], questions: () => [WHO_QUESTION] },
+  care: { keys: ['care', 'prApproval'], questions: () => [CARE_QUESTION] },
+  // The project's merge conditions (D77, D78): approvals from others and green CI; QA's part is the qa topic's.
+  merging: { keys: MERGE_KEYS, questions: () => [APPROVALS_QUESTION, CI_QUESTION] },
   attribution: { keys: ['attribution'], questions: () => [ATTRIBUTION] },
-  qa: { keys: QA_KEYS, questions: facts => [qaQuestion(facts)] },
+  qa: { keys: QA_KEYS, questions: facts => [peopleQaQuestion(facts), QA_AGENT_QUESTION] },
   indicator: { keys: ['indicator'], questions: () => [INDICATOR] },
   autoMerge: { keys: ['autoMerge'], questions: () => [AUTO_MERGE] },
-  prApproval: { keys: ['prApproval'], questions: () => [APPROVAL] },
+  // Approving a PR is a risky action now (D78), so the old approval topic asks Care.
+  prApproval: { keys: ['care', 'prApproval'], questions: () => [CARE_QUESTION] },
   // The ticket-filing rules are learned through the ticket_rules tool, not a question.
   tickets: { keys: ['ticketRules'], questions: () => [] },
   agentCap: { keys: ['agentCap'], questions: () => [AGENT_CAP] },
@@ -62,11 +75,11 @@ const TOPIC_ORDER = Object.keys(TOPICS) as ChangeTopic[]
 const isTopic = (name: string): name is ChangeTopic => TOPIC_ORDER.some(topic => topic === name)
 
 /** What `all` re-asks besides the scan's gaps: a full setup's own questions, storage aside. */
-const FULL_SETUP: readonly ChangeTopic[] = ['autoMerge', 'prApproval', 'tracker', 'attribution', 'qa', 'indicator']
+const FULL_SETUP: readonly ChangeTopic[] = ['start', 'merging', 'autoMerge', 'tracker', 'attribution', 'qa', 'indicator']
 
 /** The topic names the PM may pass, for its brief and for a refusal. */
 export const TOPIC_HELP =
-  'autoMerge (merging), prApproval (approving PRs), tickets (the Jira ticket-filing rules, rescanned or explained, through ticket_rules), attribution, indicator, agentCap, fixRoundLimit (the person\'s own); tracker, jira (the Jira questions again: server, site, project, statuses), qa (the QA mode and what it leads to), gitHost (the team\'s); all (every setup question but storage); update (only what is new since the note\'s godmode version); check (checks every saved answer against Jira, GitHub and package.json, saves what godmode repaired, and asks again what does not hold)'
+  'start (who works on the project and how careful godmode is, together), who, care (whether godmode asks before risky actions), merging (the project\'s merge conditions: approvals from others, green CI), autoMerge (whether godmode merges on its own once they hold), tickets (the Jira ticket-filing rules, rescanned or explained, through ticket_rules), attribution, indicator, agentCap, fixRoundLimit (the person\'s own); tracker, jira (the Jira questions again: server, site, project, statuses), qa (the QA mode and what it leads to), gitHost (the team\'s); all (every setup question but storage); update (only what is new since the note\'s godmode version); check (checks every saved answer against Jira, GitHub and package.json, saves what godmode repaired, and asks again what does not hold)'
 
 /** The note's keys only a topic's questions may set: `setup_finish`'s free `answers` may not. */
 export const OWNED_KEYS: readonly string[] = [...new Set([...Object.values(TOPICS).flatMap(topic => topic.keys), ...UNRECORDED_KEYS])]
@@ -89,17 +102,35 @@ export const NEW_QUESTIONS: readonly NewQuestions[] = [
   },
   {
     after: '0.6.0',
-    topic: 'prApproval',
-    what: 'whether godmode may approve a PR (never unasked, or once review and QA passed); the permission tiers are gone, and agents act freely on everything else',
-    isMissing: answers => answers.prApproval === undefined,
-  },
-  {
-    after: '0.6.0',
     topic: 'tickets',
     what: 'how your team files Jira tickets (godmode scans the board and you confirm, or you explain it), kept as ticket-filing.md',
     isMissing: answers => answers.tracker === 'jira' && answers.ticketRules === undefined,
   },
+  {
+    after: '0.7.2',
+    topic: 'start',
+    what: 'two questions, who works on the project and how careful godmode is, with your old answers (merging, approvals, code review, QA) mapped onto the project\'s own rules and shown for your yes',
+    isMissing: answers => answers.who === undefined || answers.care === undefined,
+  },
 ]
+
+/**
+ * A note's answers from before D78 on the new model, for `update` (D78): its code review, QA and
+ * CI answers become the merge conditions list, and the old approval setting is dropped, as
+ * approving is a risky action that Care decides. Shown on the summary before anything is saved.
+ */
+export const migratedAnswers = (answers: Readonly<Record<string, Answer>>): Record<string, Answer> => {
+  const ids = conditionIdsOf(answers)
+  const count = typeof answers.humanReviewCount === 'number' ? answers.humanReviewCount : undefined
+  return {
+    mergeConditions: conditionsAnswer(ids),
+    ...(ids.includes('approvals') && count !== undefined ? { humanReviewCount: count } : {}),
+    ...(typeof answers.autoMerge === 'boolean' ? { autoMerge: answers.autoMerge } : {}),
+  }
+}
+
+/** The old keys `update` drops once their meaning lives in the new ones (D78). */
+export const MIGRATED_AWAY: readonly string[] = ['humanReview', 'prApproval', 'permissions', 'ciRequired']
 
 /** The questions new since the note's version that its answers lack; none unless this godmode is newer than the note. */
 export const pendingUpdates = (noteVersion: string, current: string, answers: Readonly<Record<string, Answer>>) =>
@@ -155,9 +186,21 @@ export type Suggestion = { value: Answer; mark: 'current' | 'suggested' }
  */
 export const suggestionsOf = (answers: Readonly<Record<string, Answer>>): Record<string, Suggestion> => {
   const suggestions: Record<string, Suggestion> = Object.fromEntries(Object.entries(answers).map(([key, value]) => [key, { value, mark: 'current' as const }]))
+  // The working answers the merging and QA questions ask by, read back from the note's keys.
+  for (const [key, value] of Object.entries(workingAnswersOf(answers))) if (suggestions[key] === undefined) suggestions[key] = { value, mark: 'current' }
+  // A note from before Who and Care (D78): its old answers suggest them.
+  const who = whoOf(answers)
+  if (answers.who === undefined && who !== undefined) suggestions.who = { value: who, mark: 'suggested' }
+  if (answers.care === undefined) {
+    const isFree = answers.autoMerge === true && answers.prApproval === 'when-passed'
+    suggestions.care = { value: isFree ? 'not-careful' : careOf(answers), mark: 'suggested' }
+  }
   if (answers.qaMode === undefined && answers.qa === undefined) return suggestions
   const mark = answers.qaMode === undefined ? ('suggested' as const) : ('current' as const)
-  suggestions.qaMode = { value: qaModeOf(answers), mark }
+  const mode = qaModeOf(answers)
+  // The people part of the mode, and godmode's own QA agent apart (D78).
+  suggestions.qaMode = { value: mode === 'bot' ? 'none' : mode, mark }
+  if (answers.qaAgent === undefined) suggestions.qaAgent = { value: mode === 'bot' || answers.qaBotFirst === true, mark }
   suggestions.qaHuman = { value: isHumanQa(answers), mark }
   return suggestions
 }
@@ -241,6 +284,7 @@ export const changeSetupBrief = (note: {
   return [
     `godmode is on in change-setup mode: the person says what to change in their own words, and you apply it through godmode's tools. Never edit the setup note in ${note.dir} yourself.`,
     `The setup as it stands (godmode ${note.noteVersion}, ${note.storage} storage): ${answers.join(', ') || 'no answers'}.`,
+    `The project's rules are mirrored in plain language in ${PROJECT_RULES_FILE}, in the conventions folder: setup_finish writes it again from the saved answers. When the person edited it by hand, read it and carry each rule that differs into the setup through its topic.`,
     `Name what they ask as topics and call mcp__godmode__setup_questionnaire with \`change\`: ${TOPIC_HELP}. It asks the person only those questions and the ones they lead to, in godmode's dialog, offering the current answer first; every other answer is kept. Do not ask those questions yourself.`,
     'Then call mcp__godmode__setup_finish. It shows the person every change and saves only on their yes. Every end of the change, saved or not, switches back to coding mode, and the person typing `/godmode` ends it unsaved. A setting with no question of its own (testCommand, startCommand, baseBranch, branchPrefix, worktreeFolder, ...) goes in its `answers`; a conventions file you edited for the change goes in its `conventions`, so its fingerprint is taken again.',
     ...(note.pending.length === 0
