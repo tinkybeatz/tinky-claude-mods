@@ -108,6 +108,9 @@ const isPlaceholderTest = (script: string) => /no test specified/i.test(script)
 const mentions = (text: string | undefined, name: string) =>
   text !== undefined && new RegExp(`(^|[^A-Za-z0-9_@/-])${name.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}($|[^A-Za-z0-9_-])`, 'mi').test(text)
 
+/** The command answers' keys, as the note records them: `testCommand`, `startCommand`, ... */
+export const commandKey = (key: string) => `${key}Command`
+
 /** Every command the scan looks for. */
 export const COMMAND_KEYS: readonly (keyof ScannedCommands)[] = ['install', 'build', 'test', 'start', 'lint', 'format', 'typecheck']
 

@@ -48,6 +48,9 @@ If the folder was cloned earlier, run `git -C ~/tinky-claude-mods pull` first. T
 - [ ] 9. `/godmode report`: was the status right?
 - [ ] 10. `/godmode setup`: change one answer in your own words. Did only that question
   come up, and did it save only on your yes?
+- [ ] 10b. `/godmode audit`: after a `/plugin update` and `/reload-plugins`, did the next
+  prompt suggest it once? Was the report one line on a clean project, or each issue with
+  its fix, and did a fix save only on your yes?
 - [ ] 11. A fix round: get a review or QA to fail (ask for a ticket with a known flaw, or
   fail QA yourself). Did the same dev agent fix it, and was it reviewed again?
 - [ ] 12. Anything refused or stuck: paste the exact text.

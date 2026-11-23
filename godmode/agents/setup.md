@@ -119,7 +119,8 @@ then `setup_finish` with no arguments.
   address, and an answer that does not hold (a project Jira does not have, a status the
   board lacks, a command naming no script, a login that is no collaborator) is asked
   again with the reason. `setup_finish` refuses a setting of yours that does not hold,
-  and says which and why: correct it or leave it out.
+  and says which and why: correct it or leave it out. Later, `/godmode audit` runs the
+  same checks against the saved setup.
 
 ## Your report
 

@@ -15,7 +15,8 @@ import {
   updateOfferLine,
   withSuggestion,
 } from './change-setup'
-import { answerIssueLines, checkAnswer, savedAnswers, topicOf } from './answers'
+import { answerIssueLines, checkAnswer, savedAnswers } from './answers'
+import { answerFindings, auditBrief, auditNote, auditText } from './audit'
 import { indicatorOf } from './indicator'
 import { jiraSetup, personalJiraQuestions } from './jira'
 import {
@@ -34,7 +35,7 @@ import {
 } from './questionnaire'
 import type { ExtraQuestion, Question } from './questionnaire'
 import { qaModeLine, qaModeOf } from './role'
-import { COMMAND_KEYS, presetFoldersFor, scanProject } from './scan'
+import { COMMAND_KEYS, commandKey, presetFoldersFor, scanProject } from './scan'
 import { trackerKindOf } from './tickets'
 import { verifyAnswer, verifyAnswers } from './verify'
 import {
@@ -205,8 +206,6 @@ export type TemplateFile = { name: string; path: string }
 /** What `templates/` holds: required and optional pieces (D31), and one folder of notes per stack. */
 export type TemplateSet = { required: TemplateFile[]; optional: TemplateFile[]; presets: Record<string, TemplateFile[]> }
 
-/** The command answers' keys, as the note records them: `testCommand`, `startCommand`, ... */
-export const commandKey = (key: string) => `${key}Command`
 
 /**
  * The values the templates' `{{name}}` placeholders take (see `templates/README.md`), from
@@ -307,7 +306,11 @@ async function askQuestion($: EngineInterface, question: Question) {
 const ASK_TRIES = 3
 
 /** A question asked again, with why the last answer could not be used. */
-const askedAgain = (question: Question, problem: string): Question => ({ ...question, question: `That answer could not be used: ${problem}. ${question.question}` })
+const askedAgain = (question: Question, problem: string): Question => ({
+  ...question,
+  // The reason is cut, never the question.
+  question: `That answer could not be used: ${problem.length > 150 ? `${problem.slice(0, 147)}...` : problem}. ${question.question}`,
+})
 
 /**
  * One answer's values through the answer rules (A) and checked against the world (B): the
@@ -771,6 +774,20 @@ export async function beginChangeSetup($: EngineInterface, found: NoteLookup | u
   return { text: lines.filter(line => line !== undefined).join('\n'), context: [[brief, ...fix].join('\n')] }
 }
 
+/**
+ * `/godmode audit` (D75): the report, read-only. With nothing to fix it is one line and the
+ * mode stays as it was; otherwise godmode goes to change-setup mode, so the fixes the person
+ * picks go through setup_questionnaire and setup_finish and are saved only on their yes.
+ */
+export async function runAudit($: EngineInterface, found: FoundNote, switchToChange: () => Promise<string | undefined>) {
+  const report = await auditNote($, found.project, found)
+  const text = auditText(report, notePath(found.project, found.dir))
+  if (report.issues.length === 0 && report.suggestions.length === 0) return { text }
+  const toolsLine = await switchToChange()
+  const change = await beginChangeSetup($, found, toolsLine)
+  return { text: [text, toolsLine].filter(line => line !== undefined).join('\n'), context: [...change.context, auditBrief(report)] }
+}
+
 /** Asks whether to answer the questions new since the note's version (D60); `unasked` when nobody could answer. */
 async function offerUpdate($: EngineInterface, noteVersion: string, version: string, whats: readonly string[]): Promise<'yes' | 'no' | 'unasked'> {
   try {
@@ -896,17 +913,15 @@ const TICKETS_LINE =
  * the lines that say so; a free setting that does not hold is for the PM to correct.
  */
 async function checkNote($: EngineInterface, project: Project, found: FoundNote) {
-  const repairs = found.repairs ?? []
-  const issues = found.issues ?? []
-  const { problems, warnings } = await verifyAnswers($, project.root, answersOfNote(found))
-  const topicFor = (key: string) => topicOf(key)
-  const asked = [...issues.map(issue => ({ key: issue.key, problem: issue.problem })), ...problems]
-  const topics = [...new Set(asked.flatMap(entry => topicFor(entry.key) ?? []))]
-  const free = asked.filter(entry => topicFor(entry.key) === undefined)
+  const { repairs, findings, warnings } = await answerFindings($, project, found)
+  const topics = [...new Set(findings.flatMap(entry => entry.topic ?? []))]
   const lines = [
     ...answerIssueLines(repairs, []),
-    ...asked.filter(entry => topicFor(entry.key) !== undefined).map(entry => `${entry.key} does not hold (${entry.problem}): its question is asked again.`),
-    ...free.map(entry => `${entry.key} does not hold (${entry.problem}): pass the right value in setup_finish's \`answers\`, after asking the person if you do not know it.`),
+    ...findings.map(entry =>
+      entry.topic === undefined
+        ? `${entry.key} does not hold (${entry.problem}): pass the right value in setup_finish's \`answers\`, after asking the person if you do not know it.`
+        : `${entry.key} does not hold (${entry.problem}): its question is asked again.`,
+    ),
     ...warnings,
   ]
   return { topics, isRepaired: repairs.length > 0, lines }
@@ -989,7 +1004,9 @@ async function changeFinish($: EngineInterface, input: Record<string, unknown>) 
   const team = found.shared.storage === 'committed' && isShared ? ' The team\'s half is committed: the others get it once the change is committed.' : ''
   let answer: string
   try {
-    answer = await $.ui.ask(`Save these changes to godmode's setup?\n${lines.map(line => `- ${line}`).join('\n')}${team}`, { options: ['Save', 'Discard'], header: 'Save setup' })
+    // The changes go in a log line above the dialog, so the question itself is never cut off.
+    $.ui.log(`The setup changes to save:\n${lines.map(line => `- ${line}`).join('\n')}`)
+    answer = await $.ui.ask(`Save the setup changes shown above?${team}`, { options: ['Save', 'Discard'], header: 'Save setup' })
   } catch {
     await endChangeSetup($, found, `godmode: the setup change ended, as nobody could answer whether to save it. Nothing was saved. ${BACK_TO_CODING}`)
     throw new SetupError(`godmode could not ask the person whether to save (a headless run, or the question was dismissed). Nothing was saved. ${BACK_TO_CODING} Tell the person the changes in plain words; \`/godmode setup\` starts the change again once they can answer.`)

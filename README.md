@@ -55,7 +55,9 @@ claude plugin update dispatch-panel@tinky-claude-mods
 ```
 
 Then restart Claude Code (or run `/reload-plugins` in an open session). `/plugin` →
-**Installed** also has **Update now**.
+**Installed** also has **Update now**. After a godmode update, `/godmode audit` checks
+each project's saved setup against the new version and the project as it is now, in the
+open session; it changes nothing until you pick the fixes.
 
 ### When it does not work
 

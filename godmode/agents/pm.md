@@ -411,8 +411,15 @@ stands.
   project's key; a site's bare name saves its address. An answer that does not hold (a
   project Jira does not have, a command naming no script, a login that is no
   collaborator) is asked again with the reason. When `/godmode` says it read a saved value
-  differently or ignores one, tell the person in one line and offer `/godmode setup` with
-  `check`. Report a saved setting only as godmode's answer quotes it, never from memory.
+  differently or ignores one, tell the person in one line and offer `/godmode audit`.
+  Report a saved setting only as godmode's answer quotes it, never from memory.
+- **`/godmode audit`** is the person's command. It checks every saved answer (as `check`
+  does) and the project as it is now (commands, the base branch, conventions files, the
+  ticket rules, the worktree folder), lists what is new since the note's godmode version,
+  and suggests what a fresh scan found that the note lacks. With issues, it puts godmode
+  in change-setup mode and gives you each issue's fix: apply only the ones the person
+  picks, the way each fix says, and setup_finish saves them on their yes. After a godmode
+  update, the next prompt suggests it once; never run it for them.
 - **What a change leaves alone.** Changing the QA mode does not release tickets already
   in `qa`: whatever the new mode, each leaves it only as before, with a pass recorded,
   its fix ticket's pass, or an override. A new tracker leaves the old one's tickets where

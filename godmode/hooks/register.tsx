@@ -28,7 +28,8 @@ import type { NoteLookup, Project } from './storage'
 import { qaCheckBlock } from './qa-check'
 import { fableOutcome, isPmModel, PM_FALLBACK_MODEL, PM_MODEL, pmReminder, pmRoleOf, qaModeLine } from './role'
 import { godmodeReport, resumeOf, updateLineOf } from './report'
-import { beginChangeSetup, beginSetup, leaveChangeSetup, offerGitInit, serveSetupTool, SETUP_TOOLS, setupEditRefusal, takeSetupReport } from './setup'
+import { auditNotice } from './audit'
+import { beginChangeSetup, beginSetup, leaveChangeSetup, offerGitInit, runAudit, serveSetupTool, SETUP_TOOLS, setupEditRefusal, takeSetupReport } from './setup'
 import type { SetupToolName } from './setup'
 import { serveTicketRules, TICKET_RULES_TOOL } from './ticket-rules'
 import { runTicketTool, TICKET_TOOLS, TicketError, ticketBackendOf } from './tickets'
@@ -36,7 +37,7 @@ import type { TicketToolName } from './tickets'
 import { forgetStaleTry, startTry, stopTry, stopTryCommand } from './try'
 import type { TryHandles } from './try'
 
-const USAGE = 'Use `/godmode`, `/godmode setup`, `/godmode off`, `/godmode report` or `/godmode try <ticket>`.'
+const USAGE = 'Use `/godmode`, `/godmode setup`, `/godmode audit`, `/godmode off`, `/godmode report` or `/godmode try <ticket>`.'
 
 /*
  * State refs are written in each file that reads or updates them: `validate` follows a
@@ -143,6 +144,15 @@ const setupTool = ($: EngineInterface, name: SetupToolName, e: Record<string, un
 }
 
 const failedSetupTool = () => ({ deny: 'godmode\'s setup tool failed before it could answer.' })
+
+/** Shows the audit suggestion once per loaded godmode version, when it differs from the note's (D75). */
+const noticeAudit = async ($: EngineInterface) => {
+  const project = await gitProject($)
+  const found = project === undefined ? undefined : await readNote($, project).catch(() => undefined)
+  if (project === undefined || found?.status !== 'found') return
+  const line = await auditNotice($, project, found).catch(() => undefined)
+  if (line !== undefined) $.ui.log(line)
+}
 
 /**
  * Prompts the person sent themselves; each starts the main thread's read count over (D63).
@@ -296,6 +306,8 @@ export const register: Register = on => {
     if ((await read($, isOn)) !== true) return next(e)
     if (PERSON_ORIGINS.includes((e.origin as typeof e.origin | undefined)?.kind)) await update($, mainThreadReads, () => 0)
     const report = await takeSetupReport($)
+    // After an update and a reload, which may start no session, one line suggests the audit (D75).
+    if (PERSON_ORIGINS.includes((e.origin as typeof e.origin | undefined)?.kind)) await noticeAudit($)
     // A setup that just finished hands the main thread its PM role; after that, a one-line reminder (D64).
     const role = report === undefined ? undefined : await pmRoleOf($)
     const isCoding = (await read($, mode)) === 'coding'
@@ -352,6 +364,17 @@ export const register: Register = on => {
       if (found?.status === 'found') await update($, indicator, () => indicatorOf(found.personal?.answers.indicator))
       const toolsLine = await switchOn($, 'change-setup')
       return beginChangeSetup($, found, toolsLine)
+    }
+    // Read-only until the person picks fixes (D75); in place, after `/reload-plugins` too.
+    if (action === 'audit') {
+      const project = await gitProject($)
+      if (project === undefined) return { text: NO_GIT_LINE }
+      const found = await readNote($, project).catch(() => undefined)
+      if (found?.status !== 'found') return { text: 'godmode is not set up in this project yet, so there is nothing to audit: `/godmode` runs the setup.' }
+      return runAudit($, found, async () => {
+        await update($, indicator, () => indicatorOf(found.personal?.answers.indicator))
+        return switchOn($, 'change-setup')
+      })
     }
     if (action === 'off') {
       if ((await read($, isOn)) !== true) return { text: 'godmode is already off.' }

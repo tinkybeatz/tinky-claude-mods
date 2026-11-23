@@ -356,7 +356,7 @@ test('/godmode on a note from an older godmode says so in one line beside the re
 
   const lines = answer.text?.split('\n') ?? []
   expect(lines).toHaveLength(2)
-  expect(lines[0]).toBe('A godmode update is available for this project\'s conventions (set up with 0.2.0, now 0.3.0): `/godmode setup` to apply it.')
+  expect(lines[0]).toBe('A godmode update is available for this project\'s conventions (set up with 0.2.0, now 0.3.0): `/godmode audit` checks the setup and lists what is new.')
   expect(lines[1]).toContain(`Resuming ${doing}`)
   expect(project.world.files.get(`${REPO}/.godmode/shared.json`)).toBe(note)
   expect(note).toContain('"godmodeVersion": "0.2.0"')

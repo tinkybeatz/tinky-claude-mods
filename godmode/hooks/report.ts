@@ -47,7 +47,7 @@ const short = (commit: string) => commit.slice(0, 7)
 /** The line `/godmode` and the report give for a note from an older godmode (D60). */
 export const updateLineOf = (noteVersion: string, current: string) =>
   isOlderVersion(noteVersion, current)
-    ? `A godmode update is available for this project's conventions (set up with ${noteVersion}, now ${current}): \`/godmode setup\` to apply it.`
+    ? `A godmode update is available for this project's conventions (set up with ${noteVersion}, now ${current}): \`/godmode audit\` checks the setup and lists what is new.`
     : undefined
 
 /** A list cut at `cap`, with how many more there are. */

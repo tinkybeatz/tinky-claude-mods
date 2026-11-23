@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ToolSpec } from 'claude-code'
 
 import type { GodmodeMode, SetupRun } from '../types'
-import { jiraBoardData } from './jira'
+import { jiraBoardData, plainError } from './jira'
 import type { BoardData, FieldMeta } from './jira'
 import { trackerKindOf } from './tickets'
 import { claudeDirOf, conventionsDirOf, fingerprintOf, notePath, projectOf, readNote, STORAGE_MODES, writeSharedNote } from './storage'
@@ -105,7 +105,7 @@ const placementOf = (sprints: unknown): Placement => {
 const PLACEHOLDER = /\{\{[^}]*\}\}|<[A-Za-z][A-Za-z ]{2,30}>|\[(?:describe|add|insert|enter|fill|your)[^\]]*\]|\bTODO\b|\bfill (?:this|in)\b|\bdelete this\b/i
 
 /** The fields godmode never reads as "usually set": the ones every issue has. */
-const SYSTEM_FIELDS = new Set(['summary', 'status', 'issuetype', 'project', 'created', 'updated', 'reporter', 'creator', 'assignee', 'priority', 'labels', 'components', 'parent', 'description', 'statuscategorychangedate', 'lastViewed', 'watches', 'votes', 'workratio', 'resolution', 'resolutiondate', 'issuelinks', 'subtasks', 'attachment', 'comment', 'worklog', 'timetracking', 'progress', 'aggregateprogress', 'fixVersions', 'versions', 'environment', 'duedate', 'security', 'timespent', 'timeestimate', 'timeoriginalestimate', 'aggregatetimespent', 'aggregatetimeestimate', 'aggregatetimeoriginalestimate', 'statusCategory'])
+const SYSTEM_FIELDS = new Set(['customFields', 'key', 'id', 'self', 'webUrl', 'summary', 'status', 'issuetype', 'project', 'created', 'updated', 'reporter', 'creator', 'assignee', 'priority', 'labels', 'components', 'parent', 'description', 'statuscategorychangedate', 'lastViewed', 'watches', 'votes', 'workratio', 'resolution', 'resolutiondate', 'issuelinks', 'subtasks', 'attachment', 'comment', 'worklog', 'timetracking', 'progress', 'aggregateprogress', 'fixVersions', 'versions', 'environment', 'duedate', 'security', 'timespent', 'timeestimate', 'timeoriginalestimate', 'aggregatetimespent', 'aggregatetimeestimate', 'aggregatetimeoriginalestimate', 'statusCategory'])
 
 /**
  * What the board's latest issues say about how the team files tickets (D74): the issue types
@@ -114,7 +114,13 @@ const SYSTEM_FIELDS = new Set(['summary', 'status', 'issuetype', 'project', 'cre
  * fields, and text left unchanged from a template.
  */
 export const scanBoard = (data: BoardData): BoardScan => {
-  const rows = data.issues.flatMap(issue => (isRecord(issue) && isRecord(issue.fields) ? [issue.fields] : []))
+  // A row's fields, or the row itself when a server answers them flat; custom fields a server
+  // maps to labels under `customFields` are read beside the rest.
+  const rows = data.issues.flatMap(issue => {
+    if (!isRecord(issue)) return []
+    const fields = isRecord(issue.fields) ? issue.fields : issue
+    return [{ ...fields, ...(isRecord(fields.customFields) ? fields.customFields : {}) }]
+  })
   const names = new Map<string, string>()
   for (const meta of Object.values(data.typeFields)) for (const field of meta) names.set(field.id, field.name)
   const sprintField = [...new Set(rows.flatMap(fields => Object.keys(fields).filter(key => isSprintValue(fields[key]))))][0]
@@ -275,7 +281,8 @@ const NOBODY = 'godmode could not ask the person (a headless run, or the questio
  * fingerprint, so a hand edit later is seen like any conventions edit.
  */
 async function saveRules($: EngineInterface, place: Place, rules: string): Promise<string> {
-  const answer = await ask($, `Save these ticket-filing rules?\n\n${rules.trim()}`, ['Save', 'Not yet'], 'Ticket rules')
+  $.ui.log(`The ticket-filing rules godmode would save:\n${rules.trim()}`)
+  const answer = await ask($, 'Save the ticket-filing rules shown above?', ['Save', 'Not yet'], 'Ticket rules')
   if (answer === undefined) return NOBODY
   if (answer !== 'Save') return 'The person did not save these rules. Ask what to change, then call ticket_rules with the new `rules`.'
   const path = `${place.dir}/${TICKET_RULES_FILE}`
@@ -308,10 +315,10 @@ const toModel = (what: string, said: string, draft?: string) =>
   ].join('\n')
 
 /** The person explains the flow in their words; resolves the tool's answer. */
-async function explain($: EngineInterface, project: string, why?: string): Promise<string> {
+async function explain($: EngineInterface, project: string): Promise<string> {
   const answer = await ask(
     $,
-    `${why === undefined ? '' : `${why}. `}How does your team file tickets in ${project}? Type it under Other: which issue type for what, where new tickets go (active sprint, next sprint, backlog), parents, labels, components, and fields to set.`,
+    `How does your team file tickets in ${project}? Type it under Other: types, sprint or backlog, parents, labels, fields.`,
     ['Skip for now', 'Decide later'],
     'Ticket rules',
   )
@@ -320,23 +327,39 @@ async function explain($: EngineInterface, project: string, why?: string): Promi
   return toModel('explained how their team files tickets', answer)
 }
 
+const EXPLAIN = 'I\'ll explain it myself'
+const TRY_AGAIN = 'Try the scan again'
+
+/** The scan could not help: says why in one plain sentence, and offers explaining first, then another try. */
+async function scanFailed($: EngineInterface, place: Place, project: string, why: string, tries: number): Promise<string> {
+  const options = tries < 2 ? [EXPLAIN, TRY_AGAIN] : [EXPLAIN, 'Skip for now']
+  // The reason is cut, never the question: a dialog shows a long text cut off.
+  const reason = why.length > 150 ? `${why.slice(0, 147)}...` : why
+  const answer = await ask($, `${reason.replace(/\.$/, '')}. How should godmode learn your team's ticket rules?`, options, 'Ticket rules')
+  if (answer === undefined) return NOBODY
+  if (answer === TRY_AGAIN) return scanAndConfirm($, place, tries + 1)
+  if (answer === 'Skip for now') return 'The person skipped the ticket rules: nothing was saved. `/godmode setup` with topic `tickets` adds them later.'
+  return answer === EXPLAIN ? explain($, project) : toModel('explained how their team files tickets', answer)
+}
+
 /** Scans the board, shows what it found, and saves it on "Looks right"; corrections go back to the model. */
-async function scanAndConfirm($: EngineInterface, place: Place): Promise<string> {
+async function scanAndConfirm($: EngineInterface, place: Place, tries = 1): Promise<string> {
   const data = await jiraBoardData($, place.answers, SCAN_SIZE)
   const project = typeof place.answers.jiraProject === 'string' ? place.answers.jiraProject : 'the project'
-  if (typeof data === 'string') return explain($, project, `godmode could not read the board (${data})`)
+  if (typeof data === 'string') return scanFailed($, place, project, plainError(data), tries)
   const scan = scanBoard(data)
   const unclear = unclearScan(scan)
-  if (unclear !== undefined) return explain($, data.project, `The scan found nothing clear: ${unclear}`)
+  if (unclear !== undefined) return scanFailed($, place, data.project, `The scan found nothing clear: ${unclear}`, tries)
   const draft = rulesFromScan(scan, new Date(await $.clock.now()).toISOString().slice(0, 10))
-  const seen = await ask($, `Here is how your team seems to file tickets:\n${scanLines(scan).join('\n')}\nIs that right? Pick "Correct it", or type what to change under Other.`, ['Looks right', 'Correct it'], 'Ticket rules')
+  $.ui.log(`How your team seems to file tickets:\n${scanLines(scan).join('\n')}`)
+  const seen = await ask($, 'Is the summary above right? Pick "Correct it", or type what to change under Other.', ['Looks right', 'Correct it'], 'Ticket rules')
   if (seen === undefined) return NOBODY
   if (seen === 'Looks right') return saveRules($, place, draft)
   if (seen !== 'Correct it') return toModel('corrected the scan', seen, draft)
-  const correction = await ask($, 'What should change? Type it under Other.', ['Keep the scan as it is', 'I\'ll explain it myself'], 'Ticket rules')
+  const correction = await ask($, 'What should change? Type it under Other.', ['Keep the scan as it is', EXPLAIN], 'Ticket rules')
   if (correction === undefined) return NOBODY
   if (correction === 'Keep the scan as it is') return saveRules($, place, draft)
-  if (correction === 'I\'ll explain it myself') return explain($, data.project)
+  if (correction === EXPLAIN) return explain($, data.project)
   return toModel('corrected the scan', correction, draft)
 }
 
@@ -360,7 +383,7 @@ export async function serveTicketRules($: EngineInterface, e: { agentId?: string
     }
   }
   const project = typeof place.answers.jiraProject === 'string' ? place.answers.jiraProject : 'the project'
-  const how = await ask($, 'How should godmode learn how your team files tickets?', ['Scan the board, then I confirm', 'I\'ll explain it myself'], 'Ticket rules')
+  const how = await ask($, 'How should godmode learn how your team files tickets?', ['Scan the board, then I confirm', EXPLAIN], 'Ticket rules')
   if (how === undefined) return { result: NOBODY }
-  return { result: how === 'I\'ll explain it myself' ? await explain($, project) : await scanAndConfirm($, place) }
+  return { result: how === EXPLAIN ? await explain($, project) : await scanAndConfirm($, place) }
 }

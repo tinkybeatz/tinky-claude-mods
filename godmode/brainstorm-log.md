@@ -813,3 +813,18 @@ D69)" notes above mark where D69-D73 change earlier decisions.
     a ticket that fits no rule is the person's call. `/godmode setup` has a `tickets`
     topic, `update` offers it to a Jira note without the file, and a rule the person gives
     mid-session goes through `ticket_rules` and their yes.
+
+- **D75. `/godmode audit`, in place after updates — decided by Gael 2026-11-23.** Gael keeps
+  one session open for a long time and updates with `/plugin update` and `/reload-plugins`,
+  never restarting, so nothing may wait on `session.start`. `/godmode audit` re-checks every
+  saved answer (the answer rules and the live checks, the same code as `/godmode setup`'s
+  `check` topic, which stays as the answers-only part), checks drift against the project as
+  it is now (commands whose script is gone, a base branch that no longer exists, conventions
+  files gone or edited by hand, `ticket-filing.md` missing on Jira, a worktree folder that
+  cannot be made), lists what is new since the note's godmode version (what `update` asks),
+  and suggests what a fresh scan finds that the note lacks (a new script, a new package
+  manager). One short report: the checks that hold as a count, then each issue with its
+  fix; one line when nothing needs fixing. It reads only: with issues, godmode goes to
+  change-setup mode and the PM applies the fixes the person picks, saved on their yes.
+  After a reload, the prompt hook compares the loaded version with the note's and suggests
+  the audit in one line, once per version (kept in the person's store); it never runs it.

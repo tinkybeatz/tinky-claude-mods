@@ -25,6 +25,17 @@ proven first on a repo set up by hand.
 
 ## Status (2026-11-16)
 
+- 0.7.1 (2026-11-23): `/godmode audit` (D75) checks the saved setup in place, mid-session
+  and after `/reload-plugins`: the answers through the answer rules and live checks (the
+  `check` topic's code), drift (stale commands, a missing base branch, conventions files
+  gone or edited, missing ticket rules on Jira, a worktree folder that cannot be made),
+  what is new since the note's version, and scan suggestions. It reads only; fixes go
+  through change-setup on the person's yes. The next prompt after a version change
+  suggests it once per version. Also fixed after a live scan failed: every Jira read goes
+  through one size guard (a result too large for the session becomes a short typed error,
+  never the saved-file notice), the board scan reads only the fields it needs in pages of
+  10 and halves a page that is too large, dialogs show errors as one plain sentence with
+  long text in a log line above, and a failed scan offers explaining first.
 - 0.7.0 (2026-11-23), after the first live test (D74): one answer-rule table for every
   setup answer, at save and at read, with a `check` topic in `/godmode setup`; setup checks
   Jira, `gh` and `package.json` before saving and reports what was saved; the Atlassian

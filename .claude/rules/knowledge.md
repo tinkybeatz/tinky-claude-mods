@@ -370,3 +370,16 @@ Learned while fixing `godmode` after its first live test (0.7.0, 2026-11-23).
 - **`$.ui.ask` on a multi-select joins text typed under Other with the picked labels by
   commas**, commas inside the typed sentence included. godmode reads each part for a
   choice's label first, then for its words, so a sentence still maps to the choices.
+- **An MCP answer too large for the session never reaches the hook as data.** Claude Code
+  saves it to a file and answers with text instead: "Error: result (N characters) exceeds
+  maximum allowed tokens. Output has been saved to …/tool-results/….txt. Format: JSON
+  with schema …". godmode's one Jira call wrapper turns that text into a typed
+  "too large" error, and a scan asks again with a smaller page. Ask for named fields, not
+  `*all`.
+- **The "Atlassian MCP" server's search answers `{ issues: { nodes, pageInfo } }`**, takes
+  `view` (`compact` by default, which leaves out custom fields; `evidence` maps them) and
+  puts custom fields under `fields.customFields`, keyed by their labels. The other server
+  answers `{ issues: [...] }` with `customfield_*` keys at the top of `fields`.
+- **A dialog cuts a long question off**, options and all. Put long text (a summary, the
+  rules to save, the changes to save) in a `$.ui.log` line just before the question, and
+  keep the question short.

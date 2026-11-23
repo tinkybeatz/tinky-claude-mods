@@ -4,7 +4,7 @@ import type { EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult
 import type { TryRun } from '../types'
 import { loopContextOf, worktreePathOf } from './loop'
 import type { LoopCache, LoopContext } from './loop'
-import { commandKey } from './setup'
+import { commandKey } from './scan'
 import { backendFor, normaliseId, TICKET_STATUSES, trackerOf } from './tickets'
 import type { TicketHeader } from './tickets'
 import { endProcesses, groupAndDescendants, listenersOn, processTable, runningInside } from './try-procs'

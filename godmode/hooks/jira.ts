@@ -257,7 +257,8 @@ const payloadOf = (result: McpToolResult): unknown => {
  */
 async function callJira($: EngineInterface, server: string, tool: string, args: Record<string, unknown>, timeoutMs?: number): Promise<unknown> {
   const calling = $.mcp.call(server, tool, args).catch((error: unknown) => {
-    throw new JiraUnreachable(`Jira's ${tool} could not be called on ${server}: ${messageOf(error)}`)
+    if (isTooLarge(messageOf(error))) throw new JiraTooLarge(tool)
+    throw new JiraUnreachable(`Jira's ${tool} could not be called on ${server}: ${oneLine(messageOf(error)).slice(0, 200)}`)
   })
   let result: McpToolResult
   if (timeoutMs === undefined) {
@@ -276,11 +277,38 @@ async function callJira($: EngineInterface, server: string, tool: string, args: 
       stop.abort()
     }
   }
+  // The session saves an answer too large for the model to a file and answers with its path
+  // and instructions instead: never parsed or passed on.
+  if (isTooLarge(resultText(result).slice(0, 400))) throw new JiraTooLarge(tool)
   if (result.isError) {
     const said = resultText(result).slice(0, 300)
     throw new JiraRefused(`Jira's ${tool} failed: ${said || 'no reason given'}`, said)
   }
   return payloadOf(result)
+}
+
+/** The session's word that an answer was too large: "exceeds maximum allowed tokens", "Output has been saved to". */
+const isTooLarge = (text: string) => /exceeds maximum allowed tokens|output has been saved to/i.test(text)
+
+/** Jira's answer was too large for the session: the call asked for too much at once. */
+export class JiraTooLarge extends JiraError {
+  constructor(readonly tool: string) {
+    super(`Jira's answer to ${tool} was too large`)
+  }
+}
+
+/**
+ * An error as one plain sentence for a dialog or a log line, about 150 characters at most:
+ * no file paths, no instructions the session appended, no second line.
+ */
+export const plainError = (error: unknown) => {
+  if (error instanceof JiraTooLarge) return 'Jira\'s answer was too large'
+  const text = oneLine(typeof error === 'string' ? error : messageOf(error))
+    .replace(/^Error:\s*/i, '')
+    // A path is left out; a sentence's full stop after it is kept.
+    .replace(/(?:\/[^\s/]+){2,}\/?/g, path => (/[.,;:]$/.test(path) ? `…${path.slice(-1)}` : '…'))
+  const sentence = /^(.+?[.!?])(?:\s|$)/.exec(text)?.[1] ?? text
+  return sentence.length > 150 ? `${sentence.slice(0, 147)}...` : sentence
 }
 
 /** A call that ran out of time: Jira is slow or away, so the other calls of the moment are skipped. */
@@ -669,39 +697,73 @@ async function missingRequired($: EngineInterface, server: string, settings: Jir
   return required.filter(field => !given.has(field.id.toLowerCase()) && !given.has(field.name.toLowerCase())).map(field => `${field.name} (${field.id})`)
 }
 
-/** What a board scan reads: the latest issues with every field, the person's account, and each issue type's fields. */
+/** What a board scan reads: the latest issues with the fields it needs, the person's account, and each issue type's fields. */
 export type BoardData = { project: string; site: string; issues: unknown[]; account?: string; typeFields: Record<string, FieldMeta[]> }
 
+/** The fields every scan reads: what the type, placement, parents, labels and templates are inferred from. */
+const SCAN_FIELDS: readonly string[] = ['summary', 'issuetype', 'status', 'parent', 'labels', 'components', 'priority', 'reporter', 'creator', 'description']
+
+/** Jira Cloud's usual sprint field, asked for when no field list names one. */
+const DEFAULT_SPRINT_FIELD = 'customfield_10020'
+
+/** The most custom fields a scan asks for, and the page size it starts with. */
+const SCAN_CUSTOM_CAP = 15
+const SCAN_PAGE = 10
+
+/** The custom fields worth reading: the sprint field, then the required ones, then the rest, at most `SCAN_CUSTOM_CAP`. */
+export const scanFieldsOf = (typeFields: Readonly<Record<string, FieldMeta[]>>) => {
+  const all = [...new Map(Object.values(typeFields).flat().map(field => [field.id, field])).values()].filter(field => field.id.startsWith('customfield_'))
+  const sprint = all.find(field => /^sprints?$/i.test(field.name))?.id ?? DEFAULT_SPRINT_FIELD
+  const custom = all.filter(field => field.id !== sprint).sort((a, b) => Number(b.isRequired) - Number(a.isRequired)).slice(0, SCAN_CUSTOM_CAP).map(field => field.id)
+  return [...SCAN_FIELDS, sprint, ...custom]
+}
+
 /**
- * The raw data of a board scan (D74), read-only: the project's latest `count` issues with
- * every field, newest first, the person's account (to tell their issues from the team's), and
- * the fields of each issue type in use, where the server lists them. A string says why
- * nothing could be read.
+ * The raw data of a board scan (D74), read-only and slim: each issue type's fields first (the
+ * server with the metadata tools), then the project's latest `count` issues, newest first, with
+ * only the fields the inference needs, in pages of 10. The server without the metadata tools
+ * takes `view: "evidence"` for its custom fields. A page too large for the session is asked
+ * again at half the size, down to one issue, then with the compact view; past that the scan
+ * fails. A string says why nothing could be read, in one plain sentence.
  */
 export async function jiraBoardData($: EngineInterface, answers: Readonly<Record<string, Answer>>, count = 30): Promise<BoardData | string> {
   let jira: Jira
   try {
     jira = await openJira($, answers)
   } catch (error) {
-    return messageOf(error)
+    return plainError(error)
   }
   const { settings, server } = jira
-  const found = await callJira($, server.name, JIRA_TOOLS.search, {
-    cloudId: settings.cloudId,
-    jql: `project = ${jqlText(settings.project)} ORDER BY created DESC`,
-    fields: ['*all'],
-    maxResults: Math.max(count, 50),
-  }).catch((error: unknown) => messageOf(error))
-  if (typeof found === 'string') return found
-  const issues = rowsIn(found, ['issues', 'values', 'results']).slice(0, count)
-  const account = accountIdIn(await callJira($, server.name, 'atlassianUserInfo', {}).catch(() => undefined))
   const tools = server.tools.size > 0 ? server.tools : await probeTools($, server.name, settings.cloudId)
-  const types = [...new Set(issues.flatMap(issue => {
-    const fields = isRecord(issue) && isRecord(issue.fields) ? issue.fields : undefined
-    return isRecord(fields?.issuetype) && typeof fields.issuetype.name === 'string' ? [fields.issuetype.name] : []
-  }))]
   const typeFields: Record<string, FieldMeta[]> = {}
-  for (const type of types) typeFields[type] = await issueTypeFields($, server.name, settings, tools, type, false)
+  if (tools.has(META_TOOLS.types)) {
+    const types = await callJira($, server.name, META_TOOLS.types, { cloudId: settings.cloudId, projectIdOrKey: settings.project }).catch(() => undefined)
+    const names = rowsIn(unwrapped(types), ['issueTypes', 'values', 'results']).flatMap(row => (isRecord(row) && typeof row.name === 'string' ? [row.name] : [])).slice(0, 8)
+    for (const name of names) typeFields[name] = await issueTypeFields($, server.name, settings, tools, name, false)
+  }
+  const isListing = tools.has(JIRA_TOOLS.transitions)
+  const shape = isListing ? { fields: scanFieldsOf(typeFields) } : { fields: [...SCAN_FIELDS], view: 'evidence' }
+  const issues: unknown[] = []
+  let size = SCAN_PAGE
+  let isCompact = false
+  while (issues.length < count) {
+    const seen = issues.flatMap(issue => (isRecord(issue) && typeof issue.key === 'string' ? [issue.key] : []))
+    const jql = `project = ${jqlText(settings.project)}${seen.length === 0 ? '' : ` AND key not in (${seen.join(', ')})`} ORDER BY created DESC`
+    const args = { cloudId: settings.cloudId, jql, maxResults: Math.min(size, count - issues.length), ...shape, ...(isCompact ? { view: 'compact' } : {}) }
+    let page: unknown[]
+    try {
+      page = rowsIn(unwrapped(await callJira($, server.name, JIRA_TOOLS.search, args)), ['issues', 'values', 'results'])
+    } catch (error) {
+      if (!(error instanceof JiraTooLarge)) return `godmode could not read the board: ${plainError(error)}`
+      if (size > 1) size = Math.floor(size / 2)
+      else if (!isCompact && !isListing) isCompact = true
+      else return 'godmode could not read the board: Jira\'s answer was too large'
+      continue
+    }
+    issues.push(...page)
+    if (page.length < args.maxResults) break
+  }
+  const account = accountIdIn(await callJira($, server.name, 'atlassianUserInfo', {}).catch(() => undefined))
   return { project: settings.project, site: settings.cloudId, issues, ...(account === undefined ? {} : { account }), typeFields }
 }
 
@@ -773,7 +835,14 @@ type SearchKeys = { jqlOf: (keys: readonly string[]) => string; fields: string[]
 /** One JQL search over `keys`. */
 async function searchOnce($: EngineInterface, jira: Jira, keys: readonly string[], options: SearchKeys): Promise<JiraIssue[]> {
   const args = { cloudId: jira.settings.cloudId, jql: options.jqlOf(keys), fields: options.fields, maxResults: 100 }
-  return issuesIn(await callJira($, jira.server.name, JIRA_TOOLS.search, args, options.timeoutMs))
+  try {
+    return issuesIn(await callJira($, jira.server.name, JIRA_TOOLS.search, args, options.timeoutMs))
+  } catch (error) {
+    // Too large: the keys are searched in two halves, so no issue is left out.
+    if (!(error instanceof JiraTooLarge) || keys.length < 2) throw error
+    const half = Math.ceil(keys.length / 2)
+    return [...(await searchOnce($, jira, keys.slice(0, half), options)), ...(await searchOnce($, jira, keys.slice(half), options))]
+  }
 }
 
 /** Each key searched alone; a key Jira says does not exist is gone, any other failure is thrown. */

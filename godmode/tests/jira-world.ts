@@ -68,6 +68,10 @@ export type FakeJira = {
   issueTypes?: string[]
   /** Each issue type's fields, as `getJiraIssueTypeMetaWithFields` answers them. */
   fieldsMeta?: Record<string, { fieldId: string; name: string; required: boolean }[]>
+  /** Search rows as `{ issues: { nodes, pageInfo } }`, the "Atlassian MCP" server's shape. */
+  isNodes?: boolean
+  /** A search the session finds too large: answered with the saved-file notice, not the result. */
+  isTooLarge?: (args: Record<string, unknown>) => boolean
   /** The person's Atlassian account id, as `atlassianUserInfo` answers it; absent, the call fails. */
   account?: string
   /** Makes a tool answer `isError` with this text. */
@@ -130,7 +134,7 @@ const SCHEMAS: Record<JiraFlavour, Record<string, { allowed: string[]; required?
   },
   runner: {
     getJiraIssue: { allowed: ['cloudId', 'issueIdOrKey', 'fields', 'responseContentFormat'] },
-    searchJiraIssuesUsingJql: { allowed: ['cloudId', 'jql', 'fields', 'maxResults', 'nextPageToken'] },
+    searchJiraIssuesUsingJql: { allowed: ['cloudId', 'jql', 'fields', 'maxResults', 'nextPageToken', 'view'] },
     createJiraIssue: {
       allowed: ['cloudId', 'projectKey', 'issueType', 'summary', 'description', 'labels', 'parent', 'priority', 'additional_fields', 'assignToSprint'],
       required: [['issueType']],
@@ -155,7 +159,7 @@ export const sidePath = (key: string) => `${HOME}/.claude/godmode/projects/${FIR
 export const archivedPath = (key: string) => sidePath(key).replace(/\/jira\/([^/]+)$/, '/jira/archived/$1')
 
 /** Every field a scan reads, as Jira gives them with `*all`. */
-const allFields = (issue: FakeIssue) => ({
+const allFields = (issue: FakeIssue, isMapped = false) => ({
   issuetype: { name: issue.type ?? 'Task' },
   ...(issue.sprint === undefined ? {} : { [SPRINT_FIELD]: issue.sprint.map((sprint, index) => ({ id: index + 1, ...sprint })) }),
   ...(issue.parent === undefined ? {} : { parent: { key: issue.parent.key, fields: { issuetype: { name: issue.parent.type } } } }),
@@ -163,14 +167,19 @@ const allFields = (issue: FakeIssue) => ({
   components: (issue.components ?? []).map(name => ({ name })),
   ...(issue.priority === undefined ? {} : { priority: { name: issue.priority } }),
   description: issue.description ?? null,
-  ...issue.custom,
+  // The "Atlassian MCP" server maps custom fields to their labels under `customFields`.
+  ...(isMapped ? { customFields: issue.custom ?? {} } : issue.custom),
 })
 
-const issueRow = (jira: FakeJira, issue: FakeIssue, isAll = false) => {
+/** The saved-file notice the session answers in place of a result too large for it. */
+export const TOO_LARGE_TEXT =
+  'Error: result (349,076 characters) exceeds maximum allowed tokens. Output has been saved to /home/dev/.claude/projects/x/tool-results/mcp-claude_ai_Atlassian_MCP-searchJiraIssuesUsingJql-1.txt. Format: JSON with schema: {issues: {nodes: [{...}], webUrl: string, pageInfo: {...}}} Use offset and limit parameters to read specific portions of the file, and jq to query it.'
+
+const issueRow = (jira: FakeJira, issue: FakeIssue, isAll = false, isMapped = false) => {
   const category = jira.statuses.find(status => status.name === issue.status)?.category ?? 'indeterminate'
   const status = jira.statusShape === 'name' ? { status: issue.status } : jira.statusShape === 'none' ? {} : { status: { name: issue.status, statusCategory: { key: category } } }
   const creator = issue.creator === undefined ? {} : { creator: { accountId: issue.creator, displayName: issue.creator } }
-  return { key: issue.key, fields: { summary: issue.summary, ...status, ...creator, created: issue.created ?? '2026-10-16T09:00:00.000+0000', ...(isAll ? allFields(issue) : {}) } }
+  return { key: issue.key, fields: { summary: issue.summary, ...status, ...creator, created: issue.created ?? '2026-10-16T09:00:00.000+0000', ...(isAll ? allFields(issue, isMapped) : {}) } }
 }
 
 /** An issue's comments as Jira gives them, oldest first, each dated a minute after the last. */
@@ -198,7 +207,8 @@ const search = (jira: FakeJira, jql: string) => {
       .map(name => `The value '${name}' does not exist for the field 'status'.`),
   ]
   if (unknown.length > 0) throw new Error(unknown.join(' '))
-  if (project !== undefined) return [...jira.issues.values()].filter(issue => issue.key.startsWith(`${project}-`))
+  const skipped = listIn(/key not in \(([^)]*)\)/.exec(jql)?.[1] ?? '')
+  if (project !== undefined) return [...jira.issues.values()].filter(issue => issue.key.startsWith(`${project}-`) && !skipped.includes(issue.key))
   const scope = listIn(/^key in \(([^)]*)\)/.exec(jql)?.[1] ?? '').filter(key => jira.hidden?.includes(key) !== true)
   const missing = scope.find(key => !jira.issues.has(key))
   if (missing !== undefined) throw new Error(`An issue with key '${missing}' does not exist for field 'key'.`)
@@ -274,8 +284,12 @@ const answer = (jira: FakeJira, tool: string, args: Record<string, unknown>): un
     return jira.flavour === 'runner' ? { data: { accountId: jira.account } } : { account_id: jira.account, name: 'Me' }
   }
   if (tool === 'searchJiraIssuesUsingJql') {
-    const isAll = Array.isArray(args.fields) && args.fields.includes('*all')
-    return { issues: search(jira, String(args.jql)).map(found => issueRow(jira, found, isAll)) }
+    // A scan names the fields it needs; every field comes with it, as the fake has few.
+    const isAll = Array.isArray(args.fields) && (args.fields.includes('*all') || args.fields.includes('issuetype'))
+    const rows = search(jira, String(args.jql))
+      .slice(0, typeof args.maxResults === 'number' ? args.maxResults : undefined)
+      .map(found => issueRow(jira, found, isAll, args.view === 'evidence'))
+    return jira.isNodes === true ? { issues: { nodes: rows, pageInfo: { hasNextPage: false } } } : { issues: rows }
   }
   if (tool === 'getJiraProjectIssueTypesMetadata') return { issueTypes: (jira.issueTypes ?? ['Task', 'Bug', 'Story']).map((name, index) => ({ id: String(10_000 + index), name })) }
   if (tool === 'getJiraIssueTypeMetaWithFields') {
@@ -338,6 +352,7 @@ export const callJira = (jira: FakeJira, server: string, tool: string, args: Rec
   const refusal = jira.fail?.(tool)
   const text = (body: unknown) => [{ type: 'text' as const, text: typeof body === 'string' ? body : JSON.stringify(body) }]
   if (refusal !== undefined) return Promise.resolve({ content: text(refusal), isError: true })
+  if (tool === 'searchJiraIssuesUsingJql' && jira.isTooLarge?.(args) === true) return Promise.resolve({ content: text(TOO_LARGE_TEXT), isError: false })
   try {
     return Promise.resolve({ content: text(answer(jira, tool, args)), isError: false })
   } catch (error) {
