@@ -29,11 +29,11 @@ test('the mode style adds a godmode label after the footer modes', async ($, on)
   }
 })
 
-test('with no style answered, the mode label is the default', async ($, on) => {
+test('with no style answered, the side pane is the default, so no mode label is drawn', async ($, on) => {
   godmodeState(on, { isOn: true })
   const site = await $.ui.mount({ plugin: 'godmode', surface: 'terminal', component: 'SessionMode', props: { modes: [] } })
-  expect(await site.find({ text: 'godmode' })).toBeDefined()
-  expect(DEFAULT_INDICATOR).toBe('mode')
+  expect(await site.find({ text: 'godmode' })).toBeUndefined()
+  expect(DEFAULT_INDICATOR).toBe('pane')
 })
 
 test('the band style draws GODMODE above the prompt, and only that style does', async ($, on) => {
@@ -91,6 +91,6 @@ test('nothing shows while godmode is off', async ($, on) => {
 
 test('an unknown answer reads as the default style', () => {
   expect(indicatorOf('band')).toBe('band')
-  expect(indicatorOf('neon')).toBe('mode')
-  expect(indicatorOf(undefined)).toBe('mode')
+  expect(indicatorOf('neon')).toBe('pane')
+  expect(indicatorOf(undefined)).toBe('pane')
 })

@@ -13,7 +13,7 @@ export type Indicator = 'mode' | 'hint' | 'band' | 'pane'
 
 export const INDICATORS: readonly Indicator[] = ['mode', 'hint', 'band', 'pane']
 
-export const DEFAULT_INDICATOR: Indicator = 'mode'
+export const DEFAULT_INDICATOR: Indicator = 'pane'
 
 /** Red enough to catch the eye on a dark or a light theme. */
 const LABEL_COLOR = '#e5484d'

@@ -99,7 +99,7 @@ const setupScope = atom({ plugin: 'godmode', key: 'setupScope' } as const, 'full
 const recheck = atom({ plugin: 'godmode', key: 'recheck' } as const, [] as string[])
 const setupRun = atom({ plugin: 'godmode', key: 'setupRun' } as const, { consented: [], written: [] } as SetupRun)
 const setupReport = atom({ plugin: 'godmode', key: 'setupReport' } as const, '')
-const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as IndicatorStyle)
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'pane' as IndicatorStyle)
 
 export type SetupToolName = 'setup_scan' | 'setup_questionnaire' | 'setup_confirm' | 'setup_write_preset' | 'setup_finish'
 

@@ -51,7 +51,7 @@ const mode = atom({ plugin: 'godmode', key: 'mode' } as const, 'coding' as Godmo
 const setupScope = atom({ plugin: 'godmode', key: 'setupScope' } as const, 'full' as SetupScope)
 const recheck = atom({ plugin: 'godmode', key: 'recheck' } as const, [] as string[])
 const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
-const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as IndicatorStyle)
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'pane' as IndicatorStyle)
 const pmModel = atom({ plugin: 'godmode', key: 'pmModel' } as const, 'untried' as 'untried' | 'fable' | 'opus')
 
 /** How `/godmode` switches on: the mode, and what the setup or the PM picks up first. */

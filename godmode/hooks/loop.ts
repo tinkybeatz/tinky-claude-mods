@@ -51,7 +51,7 @@ const mode = atom({ plugin: 'godmode', key: 'mode' } as const, 'coding' as Godmo
 const agents = atom({ plugin: 'godmode', key: 'agents' } as const, {} as Record<string, DispatchedAgent>)
 const pendingReviews = atom({ plugin: 'godmode', key: 'pendingReviews' } as const, [] as PendingReview[])
 const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
-const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as IndicatorStyle)
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'pane' as IndicatorStyle)
 const unlocks = atom({ plugin: 'godmode', key: 'unlocks' } as const, [] as Unlock[])
 
 type FoundNote = Extract<NoteLookup, { status: 'found' }>

@@ -61,9 +61,9 @@ pre-filled, with where each value came from, and asks only what is left. A PR me
 conditions the project sets (approvals, green CI, QA, or none), checked live on every PR,
 and the rules are kept in plain language in `project-rules.md`, which you can edit. Older
 setups keep working; `/godmode setup` offers the two questions and maps the old answers
-for your yes. godmode can show that it is on with a mode label, a hint tag, a band, or its
-own side pane (what waits on you, its tickets, a running try, its agents and shells),
-which sits beside the dispatch panel without clashing; pick one with `/godmode setup`.
+for your yes. godmode shows that it is on with its own side pane by default, or with a mode
+label, a hint tag or a band (what waits on you, its tickets, a running try, its agents and shells),
+which sits beside the dispatch panel without clashing; change it with `/godmode setup`.
 After a godmode update, `/godmode audit` checks
 each project's saved setup against the new version and the project as it is now, in the
 open session; it changes nothing until you pick the fixes.

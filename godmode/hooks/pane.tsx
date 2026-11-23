@@ -56,7 +56,7 @@ const panelStatus = (agent: AgentInfo) => {
 // godmode's own state keys, declared in its contract; the same keys as the other files' atoms.
 const isOn = atom({ plugin: 'godmode', key: 'isOn' } as const, false)
 const mode = atom({ plugin: 'godmode', key: 'mode' } as const, 'coding' as GodmodeMode)
-const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as IndicatorStyle)
+const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'pane' as IndicatorStyle)
 const agents = atom({ plugin: 'godmode', key: 'agents' } as const, {} as Record<string, DispatchedAgent>)
 const tryRun = atom({ plugin: 'godmode', key: 'tryRun' } as const, null as TryRun | null)
 const rows = atom({ plugin: 'godmode', key: 'paneRows' } as const, [] as PaneRow[])

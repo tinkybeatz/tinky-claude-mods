@@ -46,9 +46,8 @@ If the folder was cloned earlier, run `git -C ~/tinky-claude-mods pull` first. T
 - [ ] 7. QA: if you said "With others", did it ask who tests (no one, on the PR, on
   staging) and the right follow-ups (the board's statuses, the pass signals)? Which mode
   (`human-pr`, `human-staging`, `bot`, `none`) did you end on?
-- [ ] 8. Indicator: does the "godmode is on" marker show (the mode label unless changed
-  with `/godmode setup`)? Switch to the side pane (`/godmode setup`, topic `indicator`,
-  "Side pane"):
+- [ ] 8. Indicator: does the "godmode is on" marker show (godmode's side pane by default, the band while the
+  pane cannot be shown)? Check the side pane:
   - [ ] 8a. Does the pane open at the next switch-on, in setup, change-setup and coding
     mode alike, under a red GODMODE header?
   - [ ] 8b. Sections: does "Waits on you" show (a go to start, QA, a merge go, a
