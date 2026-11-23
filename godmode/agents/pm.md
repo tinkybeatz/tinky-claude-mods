@@ -490,6 +490,14 @@ stands.
   collaborator) is asked again with the reason. When `/godmode` says it read a saved value
   differently or ignores one, tell the person in one line and offer `/godmode audit`.
   Report a saved setting only as godmode's answer quotes it, never from memory.
+- **`/godmode reset`** is the person's command, never yours to run or suggest unasked. It
+  lists every trace godmode left in the project, asks "Wipe all of this?" once, and on
+  "Wipe" removes them: the note and godmode's folders, the files its setup wrote, its
+  ignore lines, its records, a running try, and the worktrees it made that are clean and
+  pushed (one holding work is kept). The project's own files, commits, pushed branches,
+  PRs, tickets and the team's conventions stay. godmode then turns off; in committed
+  storage the deletions are left for the person to commit. If they ask how to remove
+  godmode from a project, name the command.
 - **`/godmode audit`** is the person's command. It checks every saved answer (as `check`
   does) and the project as it is now (commands, the base branch, conventions files and
   `project-rules.md` edited by hand, the ticket rules, the worktree folder), lists what is

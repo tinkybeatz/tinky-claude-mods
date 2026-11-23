@@ -927,9 +927,10 @@ export async function setupFinish($: EngineInterface, input: Record<string, unkn
   const conventions = [
     ...new Set([...listed, ...coveredPaths, ...run.written.map(entry => entry.path), ...(rulesPath === undefined ? [] : [rulesPath])].map(path => notePath(project, absoluteIn(project, path)))),
   ]
+  const written = [...new Set([...run.written.map(entry => entry.path), ...(rulesPath === undefined ? [] : [rulesPath])].map(path => notePath(project, absoluteIn(project, path))))]
   const dir = await writeNote(
     $,
-    { storage: storage as StorageMode, sharedAnswers: shared, minimumModels: {}, conventions, personalAnswers: personal, models: {} },
+    { storage: storage as StorageMode, sharedAnswers: shared, minimumModels: {}, conventions, written, personalAnswers: personal, models: {} },
     project,
   )
   // The report quotes the note as read back from disk, so it never claims a value that was not saved.

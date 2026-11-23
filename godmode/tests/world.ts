@@ -68,6 +68,10 @@ export type World = {
   branches: string[]
   /** Branches `origin` holds, for `git ls-remote`; absent, the open PRs' branches. */
   pushed?: string[]
+  /** Worktrees besides the main one, as `git worktree list` names them: dirty with uncommitted changes, pushed when a remote holds their head. */
+  worktrees?: { path: string; branch: string; isDirty?: boolean; isPushed?: boolean }[]
+  /** Files git tracks, relative to the root, for `git ls-files`. */
+  tracked?: string[]
   /** The plugin's own `templates/` folder (Step 4's files), by path inside it: `required/AGENTS.md`. */
   templates: Map<string, string>
   /** The plugin's other files, by path inside its folder: `agents/pm.md`. */
@@ -159,9 +163,14 @@ const list = (world: World, path: string) => {
   return [...names].map(([name, kind]) => ({ name, kind, size: 0, mtimeMs: 0, isLink: false }))
 }
 
-/** `mv` and `mkdir -p` on the world's files: what the markdown tickets need. */
+/** `mv`, `mkdir -p` and `rm -rf` on the world's files: what the markdown tickets and the reset need. */
 const shell = (world: World, argv: readonly string[]): RunAnswer | undefined => {
   if (argv[0] === 'mkdir') return { exitCode: 0, stdout: '' }
+  if (argv[0] === 'rm') {
+    const target = argv.at(-1) ?? ''
+    for (const path of [...world.files.keys()]) if (path === target || path.startsWith(`${target}/`)) world.files.delete(path)
+    return { exitCode: 0, stdout: '' }
+  }
   if (argv[0] !== 'mv') return undefined
   const [from = '', to = ''] = argv.slice(1)
   const text = world.files.get(from)
@@ -250,6 +259,29 @@ const github = (world: World, argv: readonly string[]): RunAnswer | undefined =>
   return undefined
 }
 
+/** git in the world's extra worktrees: their state, their removal, their branches, and the files git tracks. */
+const trees = (world: World, argv: readonly string[], cwd: string | undefined): RunAnswer | undefined => {
+  if (argv[0] !== 'git') return undefined
+  const command = argv.slice(1).join(' ')
+  const tree = world.worktrees?.find(candidate => candidate.path === cwd)
+  if (tree !== undefined && command === 'status --porcelain') return { exitCode: 0, stdout: tree.isDirty === true ? ' M src/a.ts\n' : '' }
+  if (tree !== undefined && command === 'branch -r --contains HEAD') return { exitCode: 0, stdout: tree.isPushed === true ? `  origin/${tree.branch}\n` : '' }
+  if (argv[1] === 'worktree' && argv[2] === 'remove') {
+    world.worktrees = (world.worktrees ?? []).filter(candidate => candidate.path !== argv[3])
+    return { exitCode: 0, stdout: '' }
+  }
+  if (argv[1] === 'branch' && argv[2] === '-D') {
+    world.branches = world.branches.filter(branch => branch !== argv[3])
+    return { exitCode: 0, stdout: '' }
+  }
+  if (argv[1] === 'ls-files') {
+    const asked = argv.slice(3)
+    const listed = (world.tracked ?? []).filter(path => asked.some(prefix => path === prefix || path.startsWith(`${prefix}/`)))
+    return { exitCode: 0, stdout: listed.map(path => `${path}\n`).join('') }
+  }
+  return undefined
+}
+
 const run = (world: World, argv: readonly string[], init: { cwd?: string; stdin?: string } = {}) => {
   const answer = (exitCode: number, stdout: string, stderr?: string) => ({
     exitCode,
@@ -261,12 +293,13 @@ const run = (world: World, argv: readonly string[], init: { cwd?: string; stdin?
   const call: Run = { argv: [...argv], cwd: init.cwd, stdin: init.stdin }
   world.gitRuns.push(argv.join(' '))
   world.runs.push(call)
-  const custom = world.answer?.(call) ?? shell(world, argv) ?? github(world, argv)
+  const custom = world.answer?.(call) ?? shell(world, argv) ?? github(world, argv) ?? trees(world, argv, init.cwd)
   if (custom !== undefined) return answer(custom.exitCode, custom.stdout, custom.stderr)
   if (argv[0] !== 'git' || world.git === undefined) return answer(128, '')
   const args = argv.slice(1).join(' ')
   if (args === 'worktree list --porcelain') {
-    return answer(0, `worktree ${world.git.root}\nHEAD ${world.git.firstCommit ?? '0'.repeat(40)}\nbranch refs/heads/main\n\n`)
+    const extra = (world.worktrees ?? []).map(tree => `worktree ${tree.path}\nHEAD ${'1'.repeat(40)}\nbranch refs/heads/${tree.branch}\n\n`).join('')
+    return answer(0, `worktree ${world.git.root}\nHEAD ${world.git.firstCommit ?? '0'.repeat(40)}\nbranch refs/heads/main\n\n${extra}`)
   }
   if (args === 'rev-parse --path-format=absolute --git-common-dir') return answer(0, `${world.git.root}/.git\n`)
   if (args === 'rev-list --max-parents=0 HEAD') {

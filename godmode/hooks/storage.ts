@@ -59,6 +59,12 @@ export type SharedNote = {
   /** The lowest model each role may run on (D62); personal settings raise it, never lower it. */
   minimumModels: Partial<Record<AgentRole, ModelTier>>
   conventions: ConventionsFile[]
+  /**
+   * The files setup wrote itself (templates, the rules file), as `conventions` names them, so
+   * `/godmode reset` removes those and never a file the team already had. Absent in a note
+   * written before 0.8.2.
+   */
+  written?: string[]
 }
 
 /** What stays one person's (D61): merging and approvals, attribution, models, caps, tracker identity. */
@@ -157,7 +163,7 @@ async function git($: EngineInterface, cwd: string, args: string[]) {
   return result?.exitCode === 0 ? result.stdout : undefined
 }
 
-const pathId = (root: string) => `path-${root.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`
+export const pathId = (root: string) => `path-${root.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`
 
 /** The project the session runs in (see `Project`). */
 export async function projectOf($: EngineInterface): Promise<Project> {
@@ -328,6 +334,8 @@ export type NoteDraft = {
   minimumModels: Partial<Record<AgentRole, ModelTier>>
   /** Paths of the conventions files the setup checked; their fingerprints are taken now. */
   conventions: string[]
+  /** The files among them setup wrote itself, as `conventions` names them. */
+  written?: string[]
   personalAnswers: Record<string, Answer>
   models: Partial<Record<AgentRole, ModelTier>>
 }
@@ -353,6 +361,7 @@ export async function writeNote($: EngineInterface, draft: NoteDraft, project?: 
     answers: draft.sharedAnswers,
     minimumModels: draft.minimumModels,
     conventions,
+    ...(draft.written === undefined ? {} : { written: draft.written }),
   }
   const personal: PersonalNote = { writtenAt, answers: draft.personalAnswers, models: draft.models }
   if (draft.storage === 'gitignored') await ensureExcluded($, at, gitignoreLines(draft.storage))

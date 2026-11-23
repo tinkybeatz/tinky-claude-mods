@@ -66,7 +66,12 @@ label, a hint tag or a band (what waits on you, its tickets, a running try, its 
 which sits beside the dispatch panel without clashing; change it with `/godmode setup`.
 After a godmode update, `/godmode audit` checks
 each project's saved setup against the new version and the project as it is now, in the
-open session; it changes nothing until you pick the fixes.
+open session; it changes nothing until you pick the fixes. `/godmode reset` wipes every
+trace godmode left in a project (its note, the files its setup wrote, its ignore lines, its
+records, a running try, and the worktrees it made that hold no unpushed work) after listing
+them and asking once; your own files, commits, branches, PRs, tickets and the team's
+conventions are never touched, and in committed storage the deletions are left for you to
+commit.
 
 ### When it does not work
 

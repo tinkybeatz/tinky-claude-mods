@@ -25,6 +25,17 @@ proven first on a repo set up by hand.
 
 ## Status (2026-11-16)
 
+- 0.8.2 (2026-11-23), `/godmode reset`: the person's command that lists every trace godmode
+  left in the current project (the setup note and godmode's folders in every storage mode,
+  the tracker's side files, the files setup wrote, its `.gitignore` and `.git/info/exclude`
+  lines, its store keys and this session's state, a running try, its ticket worktrees and
+  their local branches), asks "Wipe all of this?" with Wipe or Cancel, and wipes only on
+  Wipe. A worktree with uncommitted or unpushed work is kept and said so. Convention files
+  the team already had are never touched: setup now records the files it wrote in the note
+  (`written`), and a note from before 0.8.2 has only `project-rules.md` and
+  `ticket-filing.md` known as godmode's outside its own folders. In committed storage the
+  deletions stay in the working tree for the person to commit. godmode turns off and the
+  side pane closes. A project never set up has nothing to wipe.
 - 0.8.0 (2026-11-23), godmode follows the project's rules (D78): setup asks two questions
   first, Who (alone or with others) and Care (careful asks before risky actions, not
   careful just acts), after a silent scan that also reads branch protection, CI files,

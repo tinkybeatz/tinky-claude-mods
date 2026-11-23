@@ -81,6 +81,12 @@ If the folder was cloned earlier, run `git -C ~/tinky-claude-mods pull` first. T
 - [ ] 17. `/godmode audit`: after a `/plugin update` and `/reload-plugins`, did the next
   prompt suggest it once? On a setup from before 0.8.0, did it offer Who and Care and
   show your old answers mapped on the summary? Did a fix save only on your yes?
+- [ ] 17a. `/godmode reset` (at the very end, on a throwaway copy or a project you are
+  done with): did it list every trace first and ask "Wipe all of this?" once? Did Cancel
+  leave everything as it was? After Wipe, are `.godmode/`, the files setup wrote and the
+  ignore lines gone, your own files and the team's conventions still there, a worktree
+  holding work kept, and in committed storage the deletions left uncommitted? Did
+  `/godmode` then start a fresh setup?
 - [ ] 18. A fix round: get a review or QA to fail (ask for a ticket with a known flaw, or
   fail QA yourself). Did the same dev agent fix it, and was it reviewed again?
 - [ ] 19. Anything refused or stuck: paste the exact text. Did any refusal tell you to

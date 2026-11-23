@@ -37,10 +37,11 @@ import { serveTicketRules, TICKET_RULES_TOOL } from './ticket-rules'
 import { runTicketTool, TICKET_TOOLS, TicketError, ticketBackendOf } from './tickets'
 import type { TicketToolName } from './tickets'
 import { forgetStaleTry, startTry, stopTry, stopTryCommand } from './try'
+import { runReset } from './reset'
 import { closeGodmodePane, openGodmodePane, paneAction, paneReceived, paneSpawned, paneStep, refreshPaneTickets, registerPane, startPaneClock } from './pane'
 import type { TryHandles } from './try'
 
-const USAGE = 'Use `/godmode`, `/godmode setup`, `/godmode audit`, `/godmode off`, `/godmode report` or `/godmode try <ticket>`.'
+const USAGE = 'Use `/godmode`, `/godmode setup`, `/godmode audit`, `/godmode off`, `/godmode report`, `/godmode try <ticket>` or `/godmode reset`.'
 
 /*
  * State refs are written in each file that reads or updates them: `validate` follows a
@@ -187,8 +188,8 @@ export const register: Register = on => {
     await $.command.register({
       name: 'godmode',
       description:
-        'Switch godmode on: a PM main thread that files tickets and dispatches dev and review agents (`setup` to change the setup, `off`, `report`, `try <ticket>`)',
-      argumentHint: '[setup|off|report|try <ticket>]',
+        'Switch godmode on: a PM main thread that files tickets and dispatches dev and review agents (`setup` to change the setup, `audit`, `off`, `report`, `try <ticket>`, `reset` to wipe it from the project)',
+      argumentHint: '[setup|audit|off|report|try <ticket>|reset]',
     })
     // A reload runs `register` again while the state says on: declare the tools again.
     if ((await read($, isOn)) === true) await registerTicketTools($)
@@ -407,6 +408,15 @@ export const register: Register = on => {
         await update($, indicator, () => indicatorOf(found.personal?.answers.indicator))
         return switchOn($, 'change-setup')
       })
+    }
+    // The person's own command: it lists every trace first and wipes only on their "Wipe" (0.8.2).
+    if (action === 'reset') {
+      const project = await gitProject($)
+      if (project === undefined) return { text: 'godmode has nothing to wipe here: this folder is not a git repository, so godmode never set it up.' }
+      const isTrying = tries.live !== undefined
+      const text = await runReset($, project, isTrying, () => stopTry($, tries))
+      cache.context = undefined
+      return { text }
     }
     if (action === 'off') {
       if ((await read($, isOn)) !== true) return { text: 'godmode is already off.' }
