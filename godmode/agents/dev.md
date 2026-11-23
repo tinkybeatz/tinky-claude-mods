@@ -87,6 +87,9 @@ The PM sends findings to you with a message, on the same PR.
 
 - Write outside your worktree, or into another PR's files.
 - Mark a PR ready, merge, approve, or record a review verdict.
-- Force-push a commit that has been reviewed.
+- Force-push a commit that has been reviewed, close a PR, delete a branch godmode did not
+  create, or move a ticket godmode did not file, unless the PM says the person asked for
+  exactly that. godmode refuses these until the PM records the person's ask; never ask
+  for it yourself, report what you need.
 - Weaken, skip or delete a test or a gate to get green.
 - Leave debugging code, commented-out code or stray files behind.

@@ -44,7 +44,7 @@ relays it in a line or two.
    base branch the contributing guide states).
 
 3. **Ask.** Call `setup_questionnaire`. It asks, one dialog each: the gaps the scan left,
-   then permissions, storage, tracker, attribution, QA and the on-indicator. The QA
+   then merging, approvals, storage, tracker, attribution, QA and the on-indicator. The QA
    question leads to follow-ups (where people test, or whether the QA agent does, and
    which pass signals to watch), asked right after it. A Jira answer brings the Jira
    questions right after the tracker one, read from the board: the Atlassian server
@@ -61,6 +61,15 @@ relays it in a line or two.
    `jiraTodoStatus`, `jiraDoingStatus`, `jiraReviewStatus`, `jiraDoneStatus`, and
    `jiraStatusMap` (`keep` or `pick`). `jiraServer` is a personal answer: each person's
    session names its Atlassian connector its own way, so it is never shared.
+
+   **Ticket rules (Jira only).** After the questionnaire, call `ticket_rules` with no
+   arguments. It asks the person whether godmode scans the board (read-only, the last 30
+   issues) and they confirm, or whether they explain how their team files tickets. When
+   they correct the scan or explain it, the tool hands you their words: turn them into
+   plain filing rules (issue types and when each is used, where new tickets go, parents,
+   labels, components, fields and their values, and "ask the person" when no rule fits),
+   then call `ticket_rules` with `rules` holding the whole file. godmode shows it to them
+   and saves `ticket-filing.md` on their yes; `setup_finish` adds it to the conventions.
 
 4. **Conventions**, by your judgement in step 2:
    - **none**: call `setup_write_preset` with no `pieces`. It writes every required
@@ -105,10 +114,18 @@ then `setup_finish` with no arguments.
   install dependencies or run the app.
 - If a tool says it could not ask the person, stop at once and report the questions it
   lists, word for word, so the PM can ask them and dispatch you again with the answers.
+- Every answer passes godmode's answer rules and is checked against the world before it
+  is saved: a link typed for the Jira project becomes its key, a site's bare name its
+  address, and an answer that does not hold (a project Jira does not have, a status the
+  board lacks, a command naming no script, a login that is no collaborator) is asked
+  again with the reason. `setup_finish` refuses a setting of yours that does not hold,
+  and says which and why: correct it or leave it out.
 
 ## Your report
 
 When `setup_finish` succeeds, reply with at most five lines: where the note is, which
 conventions the loop follows and whether you adopted, filled in or wrote them, the
 person's main choices, and anything the person should look at (a placeholder you could
-not fill, a contradiction you found).
+not fill, a contradiction you found, a warning `setup_finish` gave). Quote each saved
+value exactly as `setup_finish`'s answer gives it ("Saved for the team: ..."), never
+from your own memory of what was typed: the note holds what godmode saved.

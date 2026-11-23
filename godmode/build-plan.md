@@ -25,6 +25,17 @@ proven first on a repo set up by hand.
 
 ## Status (2026-11-16)
 
+- 0.7.0 (2026-11-23), after the first live test (D74): one answer-rule table for every
+  setup answer, at save and at read, with a `check` topic in `/godmode setup`; setup checks
+  Jira, `gh` and `package.json` before saving and reports what was saved; the Atlassian
+  MCP server's wrapped site list is read; QA free text maps to signals and `pr-merged` is
+  a signal; the permission tiers are gone (free writes, controlled actions unlocked by the
+  person's ask through `allow_once`, an approval setting); the PM starts the app when
+  asked; the PM runs on Fable (Opus when Fable is unavailable) and agents on per-role floors;
+  a Jira ticket is the person's own when godmode filed it or their account created it;
+  Jira ticket-filing rules are learned from a board scan the person confirms, or from
+  their words, kept as `ticket-filing.md`, and followed by `ticket_create`.
+  Not yet run live.
 - Built: M0 (`spikes.md`), M1 (0.1.0 to 0.4.0) and M2 (0.5.0).
 - M3 is built and reviewed: Step 13 (the QA modes, every part from 13.0 to 13.7), Step
   7's fix-round limit, Step 5's Jira and Other backends, and Steps 8, 9, 10 and 11. The

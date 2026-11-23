@@ -46,7 +46,8 @@ type Waiting = {
 
 /** What the check saw for one ticket. */
 export type QaFinding =
-  | { kind: 'pass'; how: string }
+  /** `isMerged` when the pass is the PR's merge outside godmode: the ticket then closes too. */
+  | { kind: 'pass'; how: string; isMerged?: true }
   /** `comment` is the latest comment on a Jira ticket the board failed, where a tester's reason usually is; absent elsewhere. */
   | { kind: 'fail'; how: string; comment?: JiraComment | 'none' | 'unreadable' }
   | { kind: 'waiting'; note?: string }
@@ -154,7 +155,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> => typeof va
  * reviews,headRefOid`; a string says what is wrong with the output. A comment after an
  * approval leaves the approval standing, as on GitHub.
  */
-export const parseReviews = (stdout: string): { head: string; latest: LatestReview[] } | string => {
+export const parseReviews = (stdout: string): { head: string; latest: LatestReview[]; mergedBy?: string } | string => {
   let value: unknown
   try {
     value = JSON.parse(stdout)
@@ -170,7 +171,10 @@ export const parseReviews = (stdout: string): { head: string; latest: LatestRevi
     const commit = isRecord(review.commit) && typeof review.commit.oid === 'string' ? review.commit.oid : undefined
     latest.set(review.author.login.toLowerCase(), { login: review.author.login, state: state as LatestReview['state'], commit })
   }
-  return { head: value.headRefOid, latest: [...latest.values()] }
+  // `state` and `mergedBy` are read when the merge signal is on; a merge with no login known is "someone".
+  const isMerged = value.state === 'MERGED'
+  const mergedBy = isMerged ? (isRecord(value.mergedBy) && typeof value.mergedBy.login === 'string' ? value.mergedBy.login : 'someone') : undefined
+  return { head: value.headRefOid, latest: [...latest.values()], ...(mergedBy === undefined ? {} : { mergedBy }) }
 }
 
 /**
@@ -237,19 +241,30 @@ async function isApprover($: EngineInterface, cwd: string, approvers: Approvers,
  * current commit is a pass, changes requested by one at that commit a fail. An approval
  * at an older commit waits for a new one, as a pass holds only at its commit.
  */
-async function approvalFinding($: EngineInterface, cwd: string, pr: string, approvers: Approvers, lookups: Lookups): Promise<{ head?: string; finding: QaFinding }> {
-  if (approvers.logins.size === 0 && approvers.teams.length === 0) {
+async function approvalFinding($: EngineInterface, cwd: string, pr: string, watch: Watch, lookups: Lookups): Promise<{ head?: string; finding: QaFinding }> {
+  const { approvers } = watch
+  const isApprovalRead = watch.isPrSignalOn && (approvers.logins.size > 0 || approvers.teams.length > 0)
+  if (!isApprovalRead && !watch.isMergeSignalOn) {
     return { finding: { kind: 'waiting', note: 'no QA approvers are named in the setup, so PR approvals are not read' } }
   }
-  const result = await $.process.run(['gh', 'pr', 'view', pr, '--json', 'reviews,headRefOid'], { cwd, timeoutMs: GH_TIMEOUT_MS }).catch((error: unknown) => messageOf(error))
+  const fields = watch.isMergeSignalOn ? 'reviews,headRefOid,state,mergedBy' : 'reviews,headRefOid'
+  const result = await $.process.run(['gh', 'pr', 'view', pr, '--json', fields], { cwd, timeoutMs: GH_TIMEOUT_MS }).catch((error: unknown) => messageOf(error))
   if (typeof result === 'string') return { finding: { kind: 'unchecked', reason: `gh pr view ${pr} did not answer: ${result}` } }
   if (result.exitCode !== 0) {
     return { finding: { kind: 'unchecked', reason: `gh pr view ${pr} failed: ${(result.stderr.trim() || result.stdout.trim()).slice(0, 200) || `exit ${result.exitCode}`}` } }
   }
   const parsed = parseReviews(result.stdout)
   if (typeof parsed === 'string') return { finding: { kind: 'unchecked', reason: `PR #${pr}: ${parsed}` } }
-  const { head, latest } = parsed
+  const { head, latest, mergedBy } = parsed
   const at = `PR #${pr}'s current commit ${short(head)}`
+  // godmode merges in human-pr only after a QA pass recorded at the head, which reads as
+  // "recorded" before this; so a merge of a PR whose ticket still waits was someone else's.
+  if (mergedBy !== undefined && watch.isMergeSignalOn) {
+    return { head, finding: { kind: 'pass', how: `${mergedBy} merged PR #${pr} at ${short(head)} outside godmode`, isMerged: true } }
+  }
+  if (!isApprovalRead) {
+    return { head, finding: { kind: 'waiting', note: mergedBy === undefined ? 'its PR is not merged yet' : `${mergedBy} merged PR #${pr} outside godmode` } }
+  }
   // Team lookups cost a call each, so only a review at the current commit, which decides, gets one.
   const relevant = latest.filter(review => review.state !== 'DISMISSED' && (review.commit === head || approvers.logins.has(review.login.toLowerCase())))
   const answers = await Promise.all(relevant.map(review => isApprover($, cwd, approvers, review.login, lookups)))
@@ -274,7 +289,7 @@ async function approvalFinding($: EngineInterface, cwd: string, pr: string, appr
     const who = older.map(review => `${review.login} at ${short(review.commit ?? '')}`).join(', ')
     return { head, finding: { kind: 'waiting', note: `approved at an older commit (${who}); ${at} needs a new approval` } }
   }
-  return { head, finding: { kind: 'waiting', note: `no approval or change request from the QA approvers at ${at}` } }
+  return { head, finding: { kind: 'waiting', note: `no approval or change request from the QA approvers at ${at}${mergedBy === undefined ? '' : `; ${mergedBy} merged PR #${pr} outside godmode, which this setup does not count as a QA pass, so ask the person whether QA passed`}` } }
 }
 
 /**
@@ -318,6 +333,8 @@ type Watch = {
   signals: readonly QaSignal[]
   /** The PR signal counts only in `human-pr` and on GitHub (D70); in `human-staging` an approval is ignored. */
   isPrSignalOn: boolean
+  /** The merge signal: a merge outside godmode while the ticket waits is a pass, in `human-pr` on GitHub only. */
+  isMergeSignalOn: boolean
   waitStatus: string
   passStatus?: string
   /** The board's done status, read on Jira only. */
@@ -337,6 +354,7 @@ const watchOf = (context: LoopContext, tracker: TrackerKind): Watch => {
     qaMode: context.settings.qaMode,
     signals,
     isPrSignalOn: signals.includes('pr-approval') && context.settings.qaMode === 'human-pr' && isGitHub,
+    isMergeSignalOn: signals.includes('pr-merged') && context.settings.qaMode === 'human-pr' && isGitHub,
     waitStatus: tracker === 'none' ? 'qa' : (textOf(context.answers.qaWaitStatus) ?? 'qa'),
     passStatus: textOf(context.answers.qaPassStatus),
     ...(tracker === 'jira' ? { doneStatus: statusMapOf(context.answers).done } : {}),
@@ -413,14 +431,14 @@ async function findingOf(
     if (seen !== undefined) return { finding: seen }
   }
   const pr = githubPrOf(ticket.pr)
-  if (!watch.isPrSignalOn) return { finding: { kind: 'waiting' } }
+  if (!watch.isPrSignalOn && !watch.isMergeSignalOn) return { finding: { kind: 'waiting' } }
   if (pr === undefined) return { finding: { kind: 'waiting', note: 'godmode knows no PR for it, so it reads no approval' } }
   const old = kept[ticket.id]
   // Only "still waiting" is served from a kept answer. A pass or a fail holds at the commit it
   // was read at, and a push since would have the line name a commit nobody approved; a
   // ticket with a pass recorded is read afresh too, so "recorded" names the current commit.
   const isReusable = old !== undefined && old.pr === pr && now - old.at < QA_CHECK_TTL_MS && old.finding.kind === 'waiting' && ticket.qaResult?.result !== 'passed'
-  const checked = isReusable ? old : { at: now, pr, ...(await approvalFinding($, context.project.root, pr, watch.approvers, lookups)) }
+  const checked = isReusable ? old : { at: now, pr, ...(await approvalFinding($, context.project.root, pr, watch, lookups)) }
   // A failure to check is no answer: the next prompt tries again.
   const keep = checked.finding.kind === 'waiting' ? checked : undefined
   const finding: QaFinding = checked.head !== undefined && hasQaPassAt(ticket.qaResult, checked.head) ? { kind: 'recorded', commit: checked.head } : checked.finding
@@ -446,6 +464,9 @@ export const findingLine = (ticket: { id: string; title?: string }, finding: QaF
   const record = (word: 'passed' | 'failed') => `ticket_move (id: ${ticket.id}, qaResult: ${word}${word === 'passed' ? closes : ''})`
   switch (finding.kind) {
     case 'pass':
+      if (finding.isMerged === true) {
+        return `${label}: ${finding.how}. The setup counts that as a QA pass godmode saw but did not record; the change is merged, so record it and close the ticket with ticket_move (id: ${ticket.id}, qaResult: passed, status: done).`
+      }
       return `${label}: ${finding.how}. That is a QA pass godmode saw but did not record: record it with ${record('passed')}.`
     case 'fail':
       return `${label}: ${finding.how}. That is a QA fail godmode saw but did not record: ${failReason(ticket.id, finding.comment)}, then record it with ${record('failed')}.`
@@ -495,7 +516,7 @@ export async function qaCheckBlock($: EngineInterface, cache: LoopCache): Promis
     const { tickets } = await waitingTickets($, context, watch.waitStatus)
     if (tickets.length === 0) return undefined
     // Only PR reads are kept, so with the PR signal off nothing is read or written.
-    const key = watch.isPrSignalOn ? keptKey(context.project.id, await repoOf($, context.project.root)) : undefined
+    const key = watch.isPrSignalOn || watch.isMergeSignalOn ? keptKey(context.project.id, await repoOf($, context.project.root)) : undefined
     const stored: unknown = key === undefined ? undefined : await $.store.get(key).catch(() => undefined)
     const kept: Record<string, KeptCheck> = {}
     if (isRecord(stored)) for (const [id, check] of Object.entries(stored)) if (isKeptCheck(check)) kept[id] = check

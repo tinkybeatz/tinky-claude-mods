@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: Reads code, docs and the web to answer one question for the godmode PM, with evidence, so the PM's thread stays free of files. Use before writing a ticket, to check a hunch, or to trace how something works. Never edits.
-model: sonnet
+model: haiku
 disallowedTools: Edit, Write, NotebookEdit, mcp__godmode__review_verdict, mcp__godmode__qa_verdict
 ---
 

@@ -3,7 +3,25 @@ import type { On } from 'claude-code'
 import { FIRST_COMMIT, HOME } from './world'
 
 /** An issue on the pretend board. */
-export type FakeIssue = { key: string; summary: string; status: string; created?: string }
+export type FakeIssue = {
+  key: string
+  summary: string
+  status: string
+  created?: string
+  creator?: string
+  /** What a board scan reads, with every field asked for (`*all`). */
+  type?: string
+  sprint?: { name: string; state: 'active' | 'future' | 'closed' }[]
+  parent?: { key: string; type: string }
+  labels?: string[]
+  components?: string[]
+  priority?: string
+  description?: string
+  custom?: Record<string, unknown>
+}
+
+/** The id of the pretend board's sprint field. */
+export const SPRINT_FIELD = 'customfield_10020'
 
 /** One `$.mcp.call` the plugin made. */
 export type JiraCall = { server: string; tool: string; args: Record<string, unknown> }
@@ -32,6 +50,11 @@ export type FakeJira = {
   /** Comments on the board, oldest first; `author` is a tester's display name, absent for godmode's own. */
   comments: { key: string; body: string; author?: string }[]
   sites: { id: string; name: string; url: string }[]
+  /**
+   * How `getAccessibleAtlassianResources` answers: a bare list, one row per product (the
+   * "Rovo" servers), or `{ data: { resources: [{ cloudId, url }] } }` (the "Atlassian MCP" server).
+   */
+  sitesShape?: 'list' | 'per-product' | 'wrapped'
   projects: { key: string; name: string }[]
   /** Statuses no transition leads to. */
   unreachable: string[]
@@ -41,6 +64,12 @@ export type FakeJira = {
   hidden?: string[]
   /** Search rows give the status as its bare name, or leave it out. */
   statusShape?: 'object' | 'name' | 'none'
+  /** The project's issue types, as the metadata tools list them. */
+  issueTypes?: string[]
+  /** Each issue type's fields, as `getJiraIssueTypeMetaWithFields` answers them. */
+  fieldsMeta?: Record<string, { fieldId: string; name: string; required: boolean }[]>
+  /** The person's Atlassian account id, as `atlassianUserInfo` answers it; absent, the call fails. */
+  account?: string
   /** Makes a tool answer `isError` with this text. */
   fail?: (tool: string) => string | undefined
   /** Makes a tool never answer. */
@@ -72,7 +101,7 @@ export const makeJira = (overrides: Partial<FakeJira> = {}): FakeJira => ({
   statuses: BOARD,
   calls: [],
   comments: [],
-  sites: [{ id: 'site-1', name: 'acme', url: 'https://acme.atlassian.net' }],
+  sites: [{ id: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', name: 'acme', url: 'https://acme.atlassian.net' }],
   projects: [
     { key: 'APP', name: 'App' },
     { key: 'OPS', name: 'Ops' },
@@ -89,21 +118,28 @@ const SCHEMAS: Record<JiraFlavour, Record<string, { allowed: string[]; required?
   listing: {
     getJiraIssue: { allowed: ['cloudId', 'issueIdOrKey', 'fields', 'responseContentFormat'] },
     searchJiraIssuesUsingJql: { allowed: ['cloudId', 'jql', 'fields', 'maxResults', 'nextPageToken'] },
-    createJiraIssue: { allowed: ['cloudId', 'projectKey', 'issueTypeName', 'summary', 'description'], required: [['issueTypeName']] },
+    createJiraIssue: { allowed: ['cloudId', 'projectKey', 'issueTypeName', 'summary', 'description', 'parent', 'additional_fields'], required: [['issueTypeName']] },
     transitionJiraIssue: { allowed: ['cloudId', 'issueIdOrKey', 'transition'], required: [['transition']] },
     getTransitionsForJiraIssue: { allowed: ['cloudId', 'issueIdOrKey'] },
     addCommentToJiraIssue: { allowed: ['cloudId', 'issueIdOrKey', 'commentBody'], required: [['commentBody']] },
     getAccessibleAtlassianResources: { allowed: [] },
     getVisibleJiraProjects: { allowed: ['cloudId'] },
+    atlassianUserInfo: { allowed: [] },
+    getJiraProjectIssueTypesMetadata: { allowed: ['cloudId', 'projectIdOrKey'] },
+    getJiraIssueTypeMetaWithFields: { allowed: ['cloudId', 'projectIdOrKey', 'issueTypeId', 'requiredFieldsOnly'] },
   },
   runner: {
     getJiraIssue: { allowed: ['cloudId', 'issueIdOrKey', 'fields', 'responseContentFormat'] },
     searchJiraIssuesUsingJql: { allowed: ['cloudId', 'jql', 'fields', 'maxResults', 'nextPageToken'] },
-    createJiraIssue: { allowed: ['cloudId', 'projectKey', 'issueType', 'summary', 'description'], required: [['issueType']] },
+    createJiraIssue: {
+      allowed: ['cloudId', 'projectKey', 'issueType', 'summary', 'description', 'labels', 'parent', 'priority', 'additional_fields', 'assignToSprint'],
+      required: [['issueType']],
+    },
     listJiraIssueComments: { allowed: ['cloudId', 'issueIdOrKey', 'orderBy', 'maxResults', 'responseContentFormat'] },
     transitionJiraIssue: { allowed: ['cloudId', 'issueIdOrKey', 'transitionId', 'transitionName'], required: [['transitionId', 'transitionName']] },
     addOrEditJiraIssueComment: { allowed: ['cloudId', 'issueIdOrKey', 'commentBody'] },
     getAccessibleAtlassianResources: { allowed: [] },
+    atlassianUserInfo: { allowed: [] },
     discover: { allowed: ['query'], required: [['query']] },
     executeRead: { allowed: ['cloudId', 'name', 'inputs'], required: [['name']] },
   },
@@ -118,10 +154,23 @@ export const sidePath = (key: string) => `${HOME}/.claude/godmode/projects/${FIR
 /** Where godmode archives the side file of an issue Jira no longer has. */
 export const archivedPath = (key: string) => sidePath(key).replace(/\/jira\/([^/]+)$/, '/jira/archived/$1')
 
-const issueRow = (jira: FakeJira, issue: FakeIssue) => {
+/** Every field a scan reads, as Jira gives them with `*all`. */
+const allFields = (issue: FakeIssue) => ({
+  issuetype: { name: issue.type ?? 'Task' },
+  ...(issue.sprint === undefined ? {} : { [SPRINT_FIELD]: issue.sprint.map((sprint, index) => ({ id: index + 1, ...sprint })) }),
+  ...(issue.parent === undefined ? {} : { parent: { key: issue.parent.key, fields: { issuetype: { name: issue.parent.type } } } }),
+  labels: issue.labels ?? [],
+  components: (issue.components ?? []).map(name => ({ name })),
+  ...(issue.priority === undefined ? {} : { priority: { name: issue.priority } }),
+  description: issue.description ?? null,
+  ...issue.custom,
+})
+
+const issueRow = (jira: FakeJira, issue: FakeIssue, isAll = false) => {
   const category = jira.statuses.find(status => status.name === issue.status)?.category ?? 'indeterminate'
   const status = jira.statusShape === 'name' ? { status: issue.status } : jira.statusShape === 'none' ? {} : { status: { name: issue.status, statusCategory: { key: category } } }
-  return { key: issue.key, fields: { summary: issue.summary, ...status, created: issue.created ?? '2026-10-16T09:00:00.000+0000' } }
+  const creator = issue.creator === undefined ? {} : { creator: { accountId: issue.creator, displayName: issue.creator } }
+  return { key: issue.key, fields: { summary: issue.summary, ...status, ...creator, created: issue.created ?? '2026-10-16T09:00:00.000+0000', ...(isAll ? allFields(issue) : {}) } }
 }
 
 /** An issue's comments as Jira gives them, oldest first, each dated a minute after the last. */
@@ -140,6 +189,15 @@ const listIn = (text: string) => text.split(',').map(part => part.trim()).filter
 /** The issues a JQL query names: `key in (...)`, narrowed by `status = "..."` and `OR key in (...)`, or a project's. */
 const search = (jira: FakeJira, jql: string) => {
   const project = /^project = "([^"]+)"/.exec(jql)?.[1]
+  // As Jira does, a JQL value it does not know refuses the whole search, naming each one.
+  const unknown = [
+    ...(project === undefined || jira.projects.some(known => known.key === project) ? [] : [`The value '${project}' does not exist for the field 'project'.`]),
+    ...listIn(/status in \(([^)]*)\)/.exec(jql)?.[1] ?? '')
+      .map(name => name.replace(/^"|"$/g, ''))
+      .filter(name => !jira.statuses.some(status => status.name === name))
+      .map(name => `The value '${name}' does not exist for the field 'status'.`),
+  ]
+  if (unknown.length > 0) throw new Error(unknown.join(' '))
   if (project !== undefined) return [...jira.issues.values()].filter(issue => issue.key.startsWith(`${project}-`))
   const scope = listIn(/^key in \(([^)]*)\)/.exec(jql)?.[1] ?? '').filter(key => jira.hidden?.includes(key) !== true)
   const missing = scope.find(key => !jira.issues.has(key))
@@ -206,9 +264,25 @@ const answer = (jira: FakeJira, tool: string, args: Record<string, unknown>): un
   checkArgs(jira, tool, args)
   const key = String(args.issueIdOrKey ?? '')
   const issue = jira.issues.get(key)
-  if (tool === 'getAccessibleAtlassianResources') return jira.sites
+  if (tool === 'getAccessibleAtlassianResources') {
+    if (jira.sitesShape === 'wrapped') return { data: { resources: jira.sites.map(site => ({ cloudId: site.id, url: site.url, products: [{ id: 'jira' }] })) } }
+    return jira.sitesShape === 'per-product' ? jira.sites.flatMap(site => [{ ...site, scopes: ['read:confluence'] }, { ...site, scopes: ['read:jira-work'] }]) : jira.sites
+  }
   if (tool === 'getVisibleJiraProjects') return { values: jira.projects }
-  if (tool === 'searchJiraIssuesUsingJql') return { issues: search(jira, String(args.jql)).map(found => issueRow(jira, found)) }
+  if (tool === 'atlassianUserInfo') {
+    if (jira.account === undefined) throw new Error('Unauthorized: the token cannot read the user')
+    return jira.flavour === 'runner' ? { data: { accountId: jira.account } } : { account_id: jira.account, name: 'Me' }
+  }
+  if (tool === 'searchJiraIssuesUsingJql') {
+    const isAll = Array.isArray(args.fields) && args.fields.includes('*all')
+    return { issues: search(jira, String(args.jql)).map(found => issueRow(jira, found, isAll)) }
+  }
+  if (tool === 'getJiraProjectIssueTypesMetadata') return { issueTypes: (jira.issueTypes ?? ['Task', 'Bug', 'Story']).map((name, index) => ({ id: String(10_000 + index), name })) }
+  if (tool === 'getJiraIssueTypeMetaWithFields') {
+    const name = (jira.issueTypes ?? ['Task', 'Bug', 'Story'])[Number(args.issueTypeId) - 10_000] ?? ''
+    const fields = (jira.fieldsMeta?.[name] ?? []).filter(field => args.requiredFieldsOnly !== true || field.required)
+    return { fields: fields.map(field => ({ ...field, hasDefaultValue: false })) }
+  }
   if (tool === 'createJiraIssue') {
     const number = jira.issues.size + 1
     const created: FakeIssue = { key: `${String(args.projectKey)}-${number}`, summary: String(args.summary), status: 'To Do' }

@@ -16,7 +16,7 @@ const noteFrom050 = (world: World, qa?: boolean) => {
     `${REPO}/.godmode/shared.json`,
     JSON.stringify({ godmodeVersion: '0.5.0', storage: 'committed', writtenAt: '2026-11-01T10:00:00.000Z', answers, minimumModels: {}, conventions: [] }),
   )
-  world.files.set(`${REPO}/.godmode/personal.json`, JSON.stringify({ writtenAt: '2026-11-01T10:00:00.000Z', answers: { permissions: 'free' }, models: {} }))
+  world.files.set(`${REPO}/.godmode/personal.json`, JSON.stringify({ writtenAt: '2026-11-01T10:00:00.000Z', answers: { autoMerge: false }, models: {} }))
 }
 
 test('QA on or off from an older note reads as bot or none; the four modes read as themselves (D69)', () => {
@@ -36,6 +36,7 @@ test('the qaMode answer setup records wins over an older on or off one; an unkno
   // Only the human modes carry how people test; the others stay one sentence.
   expect(qaModeLine({ qaMode: 'bot', qaBotFirst: true, qaSignals: 'pr-approval' })).not.toContain('Pass signals')
   expect(qaModeLine({ qaMode: 'human-pr', qaSignals: 'pr-approval,slack' })).toContain('Pass signals: being told, a PR approval from nobody named yet.')
+  expect(qaModeLine({ qaMode: 'human-pr', qaSignals: 'pr-merged' })).toContain('Pass signals: being told, the PR merged by someone outside godmode while its ticket waits in qa.')
 })
 
 test('a note written with the four modes tells the PM its mode and pass signals on /godmode', async ($, on) => {

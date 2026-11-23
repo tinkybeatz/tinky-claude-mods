@@ -1,5 +1,8 @@
 import type { EngineInterface } from 'claude-code'
 
+import { cleanAnswers } from './answers'
+import type { AnswerIssue, AnswerRepair } from './answers'
+
 /**
  * Where a project's godmode setup lives (D19): `committed` in the repo, shared with
  * everyone who clones it; `gitignored` in the repo but on this disk only (ignored through
@@ -31,7 +34,7 @@ export const PERSONAL_NOTE = 'personal.json'
 /** The roles godmode dispatches (D33). The PM is the main thread, on the session's model (D39). */
 export type AgentRole = 'dev' | 'reviewer' | 'setup' | 'researcher' | 'qa'
 
-export type ModelTier = 'haiku' | 'sonnet' | 'opus'
+export type ModelTier = 'haiku' | 'sonnet' | 'opus' | 'fable'
 
 /** A questionnaire answer (D18, D19, D23, D15, D34); Step 3 names the questions. */
 export type Answer = string | number | boolean
@@ -58,7 +61,7 @@ export type SharedNote = {
   conventions: ConventionsFile[]
 }
 
-/** What stays one person's (D61): permissions, attribution, models, caps, tracker identity. */
+/** What stays one person's (D61): merging and approvals, attribution, models, caps, tracker identity. */
 export type PersonalNote = {
   writtenAt: string
   answers: Record<string, Answer>
@@ -79,22 +82,30 @@ export type Project = {
   hasGit: boolean
 }
 
-/** What `readNote` found. `personal` is absent for a teammate who has not answered yet (D61). */
+/**
+ * What `readNote` found. `personal` is absent for a teammate who has not answered yet (D61).
+ * Both halves' answers have been through the answer rules: `repairs` lists what they changed
+ * and `issues` what they left out, each as the note saved it.
+ */
 export type NoteLookup =
   | { status: 'none'; project: Project }
   | { status: 'unreadable'; project: Project; path: string; reason: string }
-  | { status: 'found'; project: Project; dir: string; shared: SharedNote; personal?: PersonalNote }
+  | { status: 'found'; project: Project; dir: string; shared: SharedNote; personal?: PersonalNote; repairs?: AnswerRepair[]; issues?: AnswerIssue[] }
 
-/** The default model per role (D39). */
+/**
+ * Each role's floor (D39, D74), by the weight of its work: the researcher reads and fetches
+ * (Haiku), dev and QA build and run the change (Sonnet), the reviewer and setup judge
+ * (Opus). The PM's main loop runs on Fable, above them all.
+ */
 export const DEFAULT_MODELS: Readonly<Record<AgentRole, ModelTier>> = {
   dev: 'sonnet',
   reviewer: 'opus',
   setup: 'opus',
-  researcher: 'sonnet',
+  researcher: 'haiku',
   qa: 'sonnet',
 }
 
-const MODEL_RANK: Readonly<Record<ModelTier, number>> = { haiku: 0, sonnet: 1, opus: 2 }
+export const MODEL_RANK: Readonly<Record<ModelTier, number>> = { haiku: 0, sonnet: 1, opus: 2, fable: 3 }
 
 /**
  * The model a role runs on: the person's pick, or the default, raised to the shared
@@ -276,6 +287,13 @@ const parse = <T>(text: string, check: (value: unknown) => value is T): T | stri
   }
 }
 
+/** The repairs and issues of the halves the answer rules read, absent when there are none. */
+const cleaned = (...halves: ReturnType<typeof cleanAnswers>[]) => {
+  const repairs = halves.flatMap(half => half.repairs)
+  const issues = halves.flatMap(half => half.issues)
+  return { ...(repairs.length === 0 ? {} : { repairs }), ...(issues.length === 0 ? {} : { issues }) }
+}
+
 /**
  * Finds the project's note: in the repo's `.godmode/` first (committed or gitignored, the
  * note says which), then outside the repo. The personal half sits beside the shared one.
@@ -292,10 +310,13 @@ export async function readNote($: EngineInterface, project?: Project): Promise<N
     const shared = parse(await $.fs.read(sharedPath), isSharedNote)
     if (typeof shared === 'string') return { status: 'unreadable', project: at, path: sharedPath, reason: shared }
     const personalPath = `${dir}/${PERSONAL_NOTE}`
-    if (!(await $.fs.exists(personalPath))) return { status: 'found', project: at, dir, shared }
+    const cleanShared = cleanAnswers(shared.answers, 'shared')
+    const found = { status: 'found' as const, project: at, dir, shared: { ...shared, answers: cleanShared.answers } }
+    if (!(await $.fs.exists(personalPath))) return { ...found, ...cleaned(cleanShared) }
     const personal = parse(await $.fs.read(personalPath), isPersonalNote)
     if (typeof personal === 'string') return { status: 'unreadable', project: at, path: personalPath, reason: personal }
-    return { status: 'found', project: at, dir, shared, personal }
+    const cleanPersonal = cleanAnswers(personal.answers, 'personal')
+    return { ...found, personal: { ...personal, answers: cleanPersonal.answers }, ...cleaned(cleanShared, cleanPersonal) }
   }
   return { status: 'none', project: at }
 }

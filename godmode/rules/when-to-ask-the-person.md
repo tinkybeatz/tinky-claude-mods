@@ -14,7 +14,7 @@ own. Ask exactly when their judgement is needed, and never otherwise.
 - **A blocker verdict**, or a finding that needs a product decision.
 - **The fix-round limit** is reached on a ticket.
 - **Anything destructive or hard to undo** the loop did not plan for: deleting data,
-  rewriting reviewed history, acting on someone else's PR.
+  rewriting reviewed history, approving, closing or merging someone else's PR.
 - **A go**: building a ticket, merging a PR, turning auto-merge on. Only their words
   start these.
 

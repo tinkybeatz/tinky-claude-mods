@@ -1,34 +1,52 @@
+import { APPROVAL_POLICIES } from './answers'
+import type { ApprovalPolicy } from './answers'
 import { prNumberOf } from './host'
 import { qaModeOf } from './role'
 import type { QaMode } from './role'
-import { effectiveModel } from './storage'
+import { effectiveModel, MODEL_RANK } from './storage'
 import type { AgentRole, Answer, ModelTier, PersonalNote, SharedNote } from './storage'
 import type { TicketHeader } from './tickets'
 
 /*
- * The loop's rules as plain data and pure functions (Step 7, D37): what a preset allows,
+ * The loop's rules as plain data and pure functions (Step 7, D37): which writes ask the person,
  * how a shell command reads as loop actions, what the main thread may do. Nothing here
  * takes `$`; `loop.ts` applies these rules to the session.
  */
 
-/** The four permission presets (D18). */
-export type PresetName = 'full-freedom' | 'free' | 'local-only' | 'locked'
-
-export const PRESETS: readonly PresetName[] = ['full-freedom', 'free', 'local-only', 'locked']
-
 /**
- * What a rule says about an action (D13). `ask` always means asking the person directly
- * (`$.ui.ask`), never Claude Code's own permission check, which auto mode could settle
- * without them (D66).
+ * The controlled actions (D74). Reads are never restricted and every other write is free;
+ * these run only on the person's explicit ask for that one target, which the PM records with
+ * `allow_once`. Merging is not among them: the verdict and QA gates and the auto-merge
+ * setting hold it.
  */
-export type Level = 'allow' | 'ask' | 'never'
+export const CONTROLLED = ['approve-pr', 'close-pr', 'delete-branch', 'force-push', 'edit-ticket', 'host-write'] as const
 
-const LEVEL_RANK: Readonly<Record<Level, number>> = { allow: 0, ask: 1, never: 2 }
+export type ControlledAction = (typeof CONTROLLED)[number]
 
-export const strictest = (levels: readonly Level[]): Level =>
-  levels.reduce<Level>((worst, level) => (LEVEL_RANK[level] > LEVEL_RANK[worst] ? level : worst), 'allow')
+/** How a controlled action reads in a refusal. */
+export const CONTROLLED_WORDS: Readonly<Record<ControlledAction, string>> = {
+  'approve-pr': 'approving a PR',
+  'close-pr': 'closing a PR',
+  'delete-branch': 'deleting a branch godmode did not create',
+  'force-push': 'force-pushing over a reviewed commit',
+  'edit-ticket': 'moving or editing a ticket that is neither godmode\'s nor created by you',
+  'host-write': 'a raw write through the git host\'s API',
+}
 
-/** The writes the presets gate (D13, D18). */
+/** One controlled action on one target: a PR number, a branch, a ticket key or an API endpoint; `reason` when the target's owner could not be told. */
+export type Controlled = { action: ControlledAction; target: string; reason?: string }
+
+/** A target as an unlock and a step compare it, without case: `#12` is `12`, `origin/x` is `x`. */
+export const targetKey = (target: string) => target.trim().replace(/^#/, '').replace(/^origin\//, '').toLowerCase()
+
+/** The refusal of a controlled action nobody unlocked (D74). */
+export const controlledRefusal = (held: readonly Controlled[]) => {
+  const whats = held.map(entry => `${CONTROLLED_WORDS[entry.action]} (${entry.target}${entry.reason === undefined ? '' : `: ${entry.reason}`})`).join(' and ')
+  const calls = held.map(entry => `allow_once (action: ${entry.action}, target: ${entry.target})`).join(', ')
+  return `This is a controlled action: ${whats}. It runs only when the person asks for it explicitly: ask for it explicitly and it goes through. When the person has asked for exactly this, the PM records their words with mcp__godmode__${calls}, then it runs again. An agent never records an ask itself. Nothing ran.`
+}
+
+/** The writes the loop reads in a shell line (D13). */
 export type Action =
   | 'edit'
   | 'git-write'
@@ -71,37 +89,10 @@ export const ACTION_WORDS: Readonly<Record<Action, string>> = {
   'host-write': 'write to the git host through its API',
 }
 
-const everyAction = (level: Level) => Object.fromEntries(ACTIONS.map(action => [action, level])) as Record<Action, Level>
-
-/**
- * Each preset's level per action (D18). Free acts alone on the person's own PRs, and asks
- * before approving a PR, force-pushing, or a raw host API write. Auto-merge is a separate
- * switch, off in every preset (D53).
- */
-export const PRESET_LEVELS: Readonly<Record<PresetName, Readonly<Record<Action, Level>>>> = {
-  'full-freedom': everyAction('allow'),
-  free: { ...everyAction('allow'), 'force-push': 'ask', 'pr-approve': 'ask', 'host-write': 'ask' },
-  'local-only': { ...everyAction('ask'), edit: 'allow' },
-  locked: everyAction('ask'),
-}
-
-/** What a preset does to a write on someone else's PR (D16, D17, D18). */
-export const OTHERS_PRS_LEVEL: Readonly<Record<PresetName, Level>> = {
-  'full-freedom': 'allow',
-  free: 'ask',
-  'local-only': 'ask',
-  locked: 'ask',
-}
-
 /** Every loop rule as a setting (D26, D37), read from the setup note's answers. */
 export type LoopSettings = {
-  preset: PresetName
-  /** Set when the note's preset answer was missing or unknown, to say so in a refusal. */
-  presetNote?: string
-  /** The preset's levels with the note's `permission.<action>` overrides applied. */
-  levels: Readonly<Record<Action, Level>>
-  /** The level of a write on someone else's PR. */
-  othersPrs: Level
+  /** Approving a PR: never unasked, or once review and QA passed (D74). */
+  prApproval: ApprovalPolicy
   /** False blocks commit messages and PR texts that carry AI attribution (D15). */
   isAttributionAllowed: boolean
   /** Arming auto-merge, off unless the person turns it on (D53). */
@@ -146,7 +137,7 @@ export type LoopSettings = {
 
 /** The answers' names for each setting, for messages that say how to change one. */
 export const SETTING = {
-  preset: 'permissions',
+  prApproval: 'prApproval',
   attribution: 'attribution',
   autoMerge: 'autoMerge',
   agentCap: 'agentCap',
@@ -166,14 +157,7 @@ export const SETTING = {
   worktreeFolder: 'worktreeFolder',
   baseBranch: 'baseBranch',
   branchPrefix: 'branchPrefix',
-  othersPrs: 'permission.others-prs',
 } as const
-
-/** `permission.<action>` overrides one action's level. */
-export const permissionKey = (action: Action) => `permission.${action}`
-
-/** The preset a note names when it names none it knows; every write but an edit asks. */
-export const DEFAULT_PRESET: PresetName = 'local-only'
 
 const booleanOf = (value: Answer | undefined, fallback: boolean) => {
   if (typeof value === 'boolean') return value
@@ -193,38 +177,12 @@ const numberOf = (value: Answer | undefined, fallback: number, minimum: number) 
 
 const textOf = (value: Answer | undefined) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined)
 
-const levelOf = (value: Answer | undefined): Level | undefined => {
-  const word = typeof value === 'string' ? value.trim().toLowerCase().replace(/\s+/g, '-') : undefined
-  if (word === 'allow' || word === 'allowed') return 'allow'
-  if (word === 'ask' || word === 'ask-me') return 'ask'
-  if (word === 'never') return 'never'
-  return undefined
-}
-
-/** `Full freedom`, `full_freedom`, `local only` and the like as a preset name. */
-export const presetOf = (value: Answer | undefined): PresetName | undefined => {
-  const word = typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s_]+/g, '-') : undefined
-  return PRESETS.find(preset => preset === word)
-}
-
 /** The loop settings from a note's answers, shared then personal; anything unset takes its default. */
 export const settingsOf = (answers: Readonly<Record<string, Answer>>): LoopSettings => {
-  const named = presetOf(answers[SETTING.preset])
-  const preset = named ?? DEFAULT_PRESET
-  const levels = { ...PRESET_LEVELS[preset] }
-  for (const action of ACTIONS) {
-    const override = levelOf(answers[permissionKey(action)])
-    if (override !== undefined) levels[action] = override
-  }
   const tools = textOf(answers[SETTING.mainThreadTools])
+  // A note's old `permissions` preset (D18) is no longer read (D74).
   return {
-    preset,
-    presetNote:
-      named === undefined
-        ? `the setup note names no preset godmode knows (\`${String(answers[SETTING.preset] ?? 'none')}\`), so it uses ${DEFAULT_PRESET}`
-        : undefined,
-    levels,
-    othersPrs: levelOf(answers[SETTING.othersPrs]) ?? OTHERS_PRS_LEVEL[preset],
+    prApproval: APPROVAL_POLICIES.find(policy => policy === answers[SETTING.prApproval]) ?? 'ask',
     isAttributionAllowed: booleanOf(answers[SETTING.attribution], true),
     isAutoMergeOn: booleanOf(answers[SETTING.autoMerge], false),
     agentCap: Math.floor(numberOf(answers[SETTING.agentCap], 5, 1)),
@@ -271,6 +229,12 @@ export type ShellStep = {
   bodyFiles: string[]
   /** A raw host API call (`gh api`) that merges or marks ready: gated as that PR step, asked as a host write. */
   isApi?: boolean
+  /** The branches `git branch -d` or `git push --delete` removes. */
+  deletes?: string[]
+  /** The branch a push names (`git push origin x`), when it names one. */
+  branch?: string
+  /** A raw host API call's endpoint (`repos/o/r/pulls/12/reviews`). */
+  endpoint?: string
 }
 
 /**
@@ -328,13 +292,17 @@ const valuesOf = (args: readonly string[], flags: readonly string[]) =>
 
 const GIT_WRITES = new Set(['commit', 'merge', 'rebase', 'reset', 'revert', 'cherry-pick', 'am', 'clean', 'restore', 'rm', 'mv', 'update-ref', 'filter-branch', 'filter-repo', 'replace', 'apply'])
 
-/** A git command as a loop action, or undefined when it writes nothing the presets gate. */
+/** A git command as a loop action, or undefined when it writes nothing the loop reads. */
 const gitStep = (words: readonly string[]): ShellStep | undefined => {
   const { sub, args } = gitParts(words)
   const step = (action: Action, extra: Partial<ShellStep> = {}): ShellStep => ({ action, verb: `git ${sub}`, bodyFiles: [], ...extra })
   if (sub === 'push') {
     const isForce = hasAny(args, ['-f', '--force', '--force-with-lease', '--force-if-includes']) || args.some(arg => /^\+[^+]/.test(arg))
-    return step(isForce ? 'force-push' : 'push')
+    const named = args.filter(arg => !arg.startsWith('-'))
+    // `git push origin --delete a b`, or `git push origin :a`.
+    const deletes = hasAny(args, ['-d', '--delete']) ? named.slice(1) : named.flatMap(arg => /^:(.+)$/.exec(arg)?.[1] ?? [])
+    const branch = named[1]?.replace(/^\+/, '').split(':').at(-1)
+    return step(isForce ? 'force-push' : 'push', { ...(deletes.length === 0 ? {} : { deletes }), ...(branch === undefined || branch === '' ? {} : { branch }) })
   }
   if (sub === 'commit') return step('git-write', { bodyFiles: valuesOf(args, ['-F', '--file']) })
   if (GIT_WRITES.has(sub)) return step('git-write')
@@ -342,7 +310,10 @@ const gitStep = (words: readonly string[]): ShellStep | undefined => {
     return hasAny(args, ['--', '.', '-f', '--force', '-B', '-C', '--discard-changes']) ? step('git-write') : undefined
   }
   if (sub === 'stash') return ['list', 'show'].includes(args[0] ?? '') ? undefined : step('git-write')
-  if (sub === 'branch') return hasAny(args, ['-d', '-D', '--delete', '-m', '-M', '--move', '-f', '--force', '-c', '-C', '--copy']) ? step('git-write') : undefined
+  if (sub === 'branch') {
+    if (hasAny(args, ['-d', '-D', '--delete'])) return step('git-write', { deletes: args.filter(arg => !arg.startsWith('-')) })
+    return hasAny(args, ['-m', '-M', '--move', '-f', '--force', '-c', '-C', '--copy']) ? step('git-write') : undefined
+  }
   if (sub === 'tag') {
     if (hasAny(args, ['-l', '--list'])) return undefined
     return args.some(arg => !arg.startsWith('-')) || hasAny(args, ['-d', '--delete']) ? step('git-write') : undefined
@@ -438,10 +409,11 @@ const ghApiStep = (args: readonly string[], text: string): ShellStep | undefined
   const hasFields = hasAny(args, ['-f', '-F', '--field', '--raw-field', '--input'])
   const isMutation = args.some(arg => /^\s*mutation\b/.test(arg) || /query=\s*mutation\b/.test(arg))
   const isWrite = method !== undefined ? method !== 'GET' && method !== 'HEAD' : hasFields || isMutation
-  return isWrite ? { action: 'host-write', verb: 'gh api', bodyFiles: [] } : undefined
+  const endpoint = args.find(arg => !arg.startsWith('-') && arg.includes('/'))
+  return isWrite ? { action: 'host-write', verb: 'gh api', bodyFiles: [], ...(endpoint === undefined ? {} : { endpoint }) } : undefined
 }
 
-/** A gh command as a loop action, or undefined when it writes nothing the presets gate. `text` is the whole shell line. */
+/** A gh command as a loop action, or undefined when it writes nothing the loop reads. `text` is the whole shell line. */
 const ghStep = (words: readonly string[], text = words.join(' ')): ShellStep | undefined => {
   const { group, sub, args } = ghParts(words)
   if (group === 'api') return ghApiStep(args, text)
@@ -485,7 +457,7 @@ const stepsIn = (command: string, text: string): ShellStep[] =>
     }),
   )
 
-/** Every write the presets gate in a shell line, in order. */
+/** Every write the loop reads in a shell line, in order. */
 export const classifyShell = (command: string): ShellStep[] => stepsIn(command, command)
 
 /** The verbs whose text is a commit message or a PR text, where attribution is looked for (D15). */
@@ -688,7 +660,7 @@ export const mainThreadVerdict = (call: MainThreadCall, settings: LoopSettings, 
   if (MAIN_THREAD_TOOLS.has(tool) || tool.startsWith('mcp__godmode__') || settings.mainThreadTools.includes(tool)) return { isAllowed: true }
   const refuse = (what: string, setting: string = SETTING.thinMainThread): MainThreadVerdict => ({
     isAllowed: false,
-    reason: `godmode keeps the main thread thin: ${what} is work for an agent, not the PM. Dispatch a researcher or a shell to do it, and keep this thread for talking, tickets and dispatch. To loosen the rule, ${howToChange(setting)}.`,
+    reason: `godmode keeps the main thread thin: ${what} is work for an agent, not the PM. Dispatch a researcher, a dev agent or a background shell to do it, and keep this thread for talking, tickets and dispatch. If the person asked for it, do it that way now: their ask is never a reason to refuse. To loosen the rule, ${howToChange(setting)}.`,
   })
   if (tool === 'Read') {
     if (isOwnFile(call.file_path, pluginRoot)) return { isAllowed: true }
@@ -721,18 +693,17 @@ export const roleOf = (subagentType: string): AgentRole | undefined => {
   return ROLES.find(role => role === name)
 }
 
-const TIER_RANK: Readonly<Record<ModelTier, number>> = { haiku: 0, sonnet: 1, opus: 2 }
-
 /** The tier of an alias or a full model id; undefined for a model godmode cannot rank. */
 export const tierOf = (model: string): ModelTier | undefined => {
   const name = model.toLowerCase()
-  return (['opus', 'sonnet', 'haiku'] as const).find(tier => name.includes(tier))
+  return (['fable', 'opus', 'sonnet', 'haiku'] as const).find(tier => name.includes(tier))
 }
 
 /**
- * The model a role's spawn runs on (D39, D62): the role's model is a floor. A request at
- * or above it stands (the PM may pick Opus for a hard ticket); one below, or none, takes
- * the floor. A model godmode cannot rank stands as asked.
+ * The model a role's spawn runs on (D39, D62, D74): the role's model is a floor. A request
+ * at or above it stands, up to Fable (the PM may pick Opus for a hard ticket); one below,
+ * or none, takes the floor. A model godmode cannot rank takes the floor too, as it could
+ * sit below it or above Fable.
  */
 export const spawnModel = (
   requested: string | undefined,
@@ -742,8 +713,8 @@ export const spawnModel = (
   const floor = effectiveModel(role, note)
   if (requested === undefined || requested === '' || requested === 'inherit') return floor
   const tier = tierOf(requested)
-  if (tier === undefined) return requested
-  return TIER_RANK[tier] < TIER_RANK[floor] ? floor : requested
+  if (tier === undefined) return floor
+  return MODEL_RANK[tier] < MODEL_RANK[floor] ? floor : requested
 }
 
 /** A path with `.` and `..` resolved and no trailing slash. */

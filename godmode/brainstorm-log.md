@@ -747,3 +747,69 @@ D69)" notes above mark where D69-D73 change earlier decisions.
   a recorded pass, whatever the new mode; Gael saying it passed counts.
 - Notes written before D69: default: `qa: true` reads as `bot` and `false` as `none` until
   Gael says yes to the update notice (D60), as 13.0 and 13.1 already plan.
+
+---
+
+## Session after the first live test — 2026-11-23
+
+- **D74. Root-cause fixes after the live test, decided by Gael 2026-11-23** (relayed by
+  the session coordinating the fix round). The first live run saved a board link as the
+  Jira project, a bare name as the Jira site, dropped a QA answer typed as a sentence, and
+  the PM refused to start a dev server the person asked for. Each was one case of a class,
+  so the fix closes the class:
+  - Every setup answer passes one answer-rule table (`hooks/answers.ts`), when it is given
+    and again when a saved note is read. A saved value is repaired where that is safe and
+    flagged once per switch-on otherwise, with the `/godmode setup` topic that fixes it.
+    An unusable answer is asked again with the reason, never saved raw or dropped.
+  - Setup checks answers against the world before saving (Jira site, project and
+    statuses; the repo and each approver through `gh`; package-manager commands against
+    `package.json`), read-only, and asks again with the reason. The report the setup agent
+    and the person see is built from the note as saved. `/godmode setup` gains `check`.
+  - Hard rules versus thinness rules: the person's explicit ask always wins over a
+    thinness rule; the PM does it or dispatches it. One principle in `pm.md`.
+  - Tests feed messy, real-world input through setup.
+  - Permissions tiers replaced: free by default, merge and approval are their own
+    settings. Reads are never restricted. Writes are free, a colleague's PR included.
+    Controlled: merging (the `autoMerge` setting), approving a PR (the `prApproval`
+    setting), moving or editing a ticket godmode did not file, force-pushing a reviewed
+    commit, closing a PR, deleting a branch godmode did not create. The person's explicit
+    ask unlocks one controlled action on one target, recorded by the PM with `allow_once`;
+    an agent never unlocks anything. Refusals say "ask for it explicitly and it goes
+    through". A note's old `permissions` value is ignored; `update` asks the approval
+    question.
+  - QA "the PR was merged by someone else" is a pass signal of its own (`pr-merged`).
+  - Models: PM on Fable, agents tiered by weight (researcher haiku, dev and QA sonnet,
+    reviewer and setup opus).
+- Build choices inside D74, not decisions (Gael can overrule any):
+  - A raw write through the git host's API (`gh api`) stays controlled: it could approve,
+    close or merge around the PR commands.
+  - "A ticket the person neither created nor is assigned to" is read as "a ticket godmode
+    did not file" (no side file), which needs no extra Jira read on every call.
+  - An unlock is used once and lapses after an hour, so an agent dispatched for it can
+    still use it after the person's next message.
+  - A Jira status name is checked site-wide by JQL; Jira gives no per-workflow check
+    through the connector.
+  - A model godmode cannot rank takes the role's floor, so nothing runs above Fable.
+- D74, corrections by Gael 2026-11-23:
+  - "My tickets" are the tickets godmode filed (a side file) plus those created with the
+    person's own Atlassian account; the assignee is not enough. godmode reads the account
+    (`atlassianUserInfo`) once per site and each issue's creator (else reporter) once,
+    both kept in the person's store. A ticket whose account or creator cannot be read
+    stays controlled, and the refusal says why. The Other tracker has no creator field, so
+    it is unchanged.
+  - When Fable is unavailable or not allowed, the PM's request is sent again on Opus, and
+    the session stays on Opus from then on, logged once. Overload, rate limits and network
+    errors never trigger it.
+  - Ticket-filing rules (Gael 2026-11-23): the team's Jira is messy and each case is
+    tailored, so godmode learns how tickets are filed and keeps it as a plain conventions
+    file, `ticket-filing.md`, fingerprinted with the others. On Jira, setup asks "Scan the
+    board, then I confirm" or "I'll explain it myself". The scan is read-only: the last 30
+    issues, each issue type's fields, and from them the types in use, where each goes
+    (active sprint, next sprint, backlog), parents, labels, components, fields usually set
+    with their values, required fields, and fields left holding template text. Nothing is
+    saved without the person's yes; an unclear scan falls back to explaining. The PM
+    reads the rules before filing, `ticket_create` takes the Jira fields they call for, a
+    required field the ticket leaves out is refused by name so the PM asks the person, and
+    a ticket that fits no rule is the person's call. `/godmode setup` has a `tickets`
+    topic, `update` offers it to a Jira note without the file, and a rule the person gives
+    mid-session goes through `ticket_rules` and their yes.

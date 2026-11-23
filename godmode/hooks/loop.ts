@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentSpawnInput, EngineInterface, ToolCallInput, ToolCallResult, ToolSpec } from 'claude-code'
 
-import type { DispatchedAgent, GodmodeMode, PendingReview } from '../types'
+import type { DispatchedAgent, GodmodeMode, PendingReview, Unlock } from '../types'
 import { chooseHost, HostError, hostFor, prNumberOf } from './host'
 import type { GitHost, HostKind, PullRequest } from './host'
 import {
@@ -14,8 +14,9 @@ import {
   isInside,
   mainThreadVerdict,
   normalisePath,
+  controlledRefusal,
+  CONTROLLED,
   OVERRIDE_HINT,
-  permissionKey,
   qaGateRefusal,
   qaMoveRefusal,
   relativeTo,
@@ -24,11 +25,12 @@ import {
   SETTING,
   settingsOf,
   spawnModel,
-  strictest,
+  targetKey,
   ticketIn,
   waitsOnPeople,
 } from './rules'
-import type { Level, LoopSettings, ShellStep } from './rules'
+import type { Controlled, ControlledAction, LoopSettings, ShellStep } from './rules'
+import { jiraOwnership } from './jira'
 import { readNote } from './storage'
 import type { Answer, NoteLookup, Project } from './storage'
 import { indicatorOf } from './indicator'
@@ -48,6 +50,7 @@ const agents = atom({ plugin: 'godmode', key: 'agents' } as const, {} as Record<
 const pendingReviews = atom({ plugin: 'godmode', key: 'pendingReviews' } as const, [] as PendingReview[])
 const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
 const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as 'mode' | 'hint' | 'band')
+const unlocks = atom({ plugin: 'godmode', key: 'unlocks' } as const, [] as Unlock[])
 
 type FoundNote = Extract<NoteLookup, { status: 'found' }>
 
@@ -129,7 +132,7 @@ export async function openPullRequests($: EngineInterface, cache: LoopCache, con
   return prs
 }
 
-/** The person's own login on GitHub, so Free can tell their PRs from others' (D18). */
+/** The person's own login on GitHub, so godmode can tell their PRs from others' (D18, D74). */
 async function ownLogin($: EngineInterface, cache: LoopCache, context: LoopContext) {
   if (cache.login !== undefined) return cache.login ?? undefined
   const result = await $.process.run(['gh', 'api', 'user', '--jq', '.login'], { cwd: context.project.root }).catch(() => undefined)
@@ -714,6 +717,14 @@ export function ticketMoveCheck($: EngineInterface, cache: LoopCache): MoveCheck
     const wanted = normaliseId(id) ?? id.trim().toUpperCase()
     const tickets = await openTicketsOf($, trackerOf(context.note.shared.answers), context.note.dir, { id: wanted, withFixes: change.status === 'done' })
     const ticket = tickets.find(header => header.id.toUpperCase() === wanted)
+    // A Jira ticket godmode did not file is moved only when the person created it, or asked for it (D74).
+    if (ticket === undefined && trackerOf(context.note.shared.answers) === 'jira') {
+      const owner = await jiraOwnership($, context.project, wanted)
+      if (!owner.isOwn) {
+        const held = await withUnlocks($, [{ action: 'edit-ticket', target: wanted, reason: owner.why }])
+        if (held.length > 0) throw new TicketError(controlledRefusal(held))
+      }
+    }
     // No such ticket: the move itself says so.
     if (ticket === undefined) return { change }
     const { qaMode } = context.settings
@@ -815,7 +826,7 @@ async function botFirstRefusal(
   return `${botQaRefusal(ticket, record, read.head, what)} An override is for an app the QA agent cannot run, never for a failed test.`
 }
 
-const doingOf = (step: ShellStep) => (step.action === 'pr-ready' ? 'marked ready' : 'merged')
+const doingOf = (step: ShellStep) => (step.action === 'pr-ready' ? 'marked ready' : step.action === 'pr-approve' ? 'approved' : 'merged')
 
 /** Why a gated step that names no PR is refused: godmode cannot tell which PR's verdict and tickets to check. */
 const unnamedPrRefusal = (step: ShellStep) => {
@@ -907,9 +918,6 @@ export type ToolDecision =
   | { deny: string }
   | { deny?: undefined; isMain: boolean; agentId?: string; agent?: DispatchedAgent; opensPr: boolean; merges: string[] }
 
-const who = (agentId: string | undefined, agent: DispatchedAgent | undefined) =>
-  agentId === undefined ? 'The PM (main thread)' : `A ${agent?.role ?? ''}${agent?.role === undefined ? '' : ' '}agent (${agentId})`
-
 /** The texts a commit or PR command carries: the command line and any file it reads its body from. */
 async function textsOf($: EngineInterface, command: string, step: ShellStep) {
   const texts = [command]
@@ -921,7 +929,7 @@ async function textsOf($: EngineInterface, command: string, step: ShellStep) {
   return texts
 }
 
-/** The hard rules a shell step meets before any preset: drafts, attribution, auto-merge, the verdict and QA gate. */
+/** The hard rules that refuse a shell step outright: drafts, attribution, auto-merge, the verdict and QA gate. */
 async function shellRefusal($: EngineInterface, context: LoopContext, step: ShellStep, command: string) {
   const { settings } = context
   if (step.action === 'pr-open' && settings.isDraftsOnly && step.isDraft !== true) {
@@ -936,7 +944,9 @@ async function shellRefusal($: EngineInterface, context: LoopContext, step: Shel
       }
     }
   }
-  const isGated = (step.action === 'pr-ready' || step.action === 'pr-merge') && step.isUndo !== true
+  // Approving once review and QA passed (D74) waits on the same gate as ready and merge.
+  const isApprovalGated = step.action === 'pr-approve' && settings.prApproval === 'when-passed'
+  const isGated = (step.action === 'pr-ready' || step.action === 'pr-merge' || isApprovalGated) && step.isUndo !== true
   if (!isGated) return undefined
   const isAuto = step.action === 'pr-merge' && step.isAuto === true
   if (isAuto && isHumanQaMode(settings.qaMode)) return autoMergeInHumanQaRefusal(settings.qaMode, step)
@@ -993,20 +1003,10 @@ export async function context7Refusal($: EngineInterface, cache: LoopCache, tool
   return why === undefined ? undefined : `godmode's context7 tools work only while godmode is on in a set-up project, and ${why}. Nothing ran.`
 }
 
-/** Asks the person directly (D66): never Claude Code's own permission check, which auto mode could settle alone. */
-async function askPerson($: EngineInterface, question: string): Promise<'yes' | 'no' | 'unasked'> {
-  try {
-    const answer = await $.ui.ask(question, { options: ['Allow', 'Deny'], header: 'godmode' })
-    return answer === 'Allow' ? 'yes' : 'no'
-  } catch {
-    return 'unasked'
-  }
-}
-
 /**
  * The gate every tool call passes while godmode is on: the thin main thread (D63), the
  * dev agent's worktree and held files (D38, D48), drafts, attribution and the verdict
- * gate (D15, D53), then the permission preset (D18), whose "ask" asks the person (D66).
+ * gate (D15, D53), then the few writes that wait for the person's yes (D74), asked directly (D66).
  */
 export async function decideToolCall($: EngineInterface, cache: LoopCache, e: ToolCallInput): Promise<ToolDecision> {
   const isMain = e.agentId === undefined
@@ -1022,60 +1022,124 @@ export async function decideToolCall($: EngineInterface, cache: LoopCache, e: To
     if (!verdict.isAllowed) return { deny: verdict.reason }
     if (verdict.isRead === true) await update($, mainThreadReads, count => count + 1)
   }
-  // No readable note (setup mode): the presets and loop rules are not known yet.
+  // No readable note (setup mode): the loop rules are not known yet.
   if (context === undefined) return allowed
   if (isMain && input.tool === 'SendMessage' && (await read($, mode)) === 'coding') {
     const refusal = await messageFixRoundRefusal($, context, input.to)
     if (refusal !== undefined) return { deny: refusal }
   }
 
-  const asks: { level: Level; what: string; key: string }[] = []
-  let excerpt = ''
+  const held: Controlled[] = []
   if (EDIT_TOOLS.includes(input.tool)) {
     const path = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : undefined
     if (path !== undefined && agent?.role === 'dev') {
       const refusal = await devEditRefusal($, cache, context, agent, path)
       if (refusal !== undefined) return { deny: refusal }
     }
-    excerpt = path ?? input.tool
-    asks.push({ level: settings.levels.edit, what: ACTION_WORDS.edit, key: permissionKey('edit') })
+  }
+  const ticketEdit = /^mcp__.+__(transitionJiraIssue|editJiraIssue)$/.test(input.tool) ? String(input.issueIdOrKey ?? '').trim().toUpperCase() : ''
+  if (ticketEdit !== '') {
+    const owner = await jiraOwnership($, context.project, ticketEdit)
+    if (!owner.isOwn) held.push({ action: 'edit-ticket', target: ticketEdit, reason: owner.why })
   }
   if (input.tool === 'Bash' && typeof input.command === 'string') {
     const command = input.command
-    excerpt = firstLine(command)
     for (const step of classifyShell(command)) {
       const refusal = await shellRefusal($, context, step, command)
       if (refusal !== undefined) return { deny: refusal }
-      // A merge or ready through the raw API is asked as the stricter of that step and a host write.
-      let level = step.isApi === true ? strictest([settings.levels[step.action], settings.levels['host-write']]) : settings.levels[step.action]
-      let what = ACTION_WORDS[step.action]
-      if (step.pr !== undefined && step.action !== 'pr-open' && (await isOthersPr($, cache, context, step.pr))) {
-        level = strictest([level, settings.othersPrs])
-        what = `${what} (PR #${step.pr} is someone else's)`
-      }
-      asks.push({ level, what, key: permissionKey(step.action) })
+      held.push(...(await controlledIn($, cache, context, step, agent)))
       if (step.action === 'pr-open') allowed.opensPr = true
       // A merge that runs now, not one armed for later: what happens after it depends on the QA mode (D69).
       if (step.action === 'pr-merge' && step.isAuto !== true && step.isUndo !== true && step.pr !== undefined) allowed.merges.push(step.pr)
     }
   }
+  if (held.length === 0) return allowed
+  const missing = await withUnlocks($, held)
+  return missing.length === 0 ? allowed : { deny: controlledRefusal(missing) }
+}
 
-  const level = strictest(asks.map(ask => ask.level))
-  if (level === 'allow') return allowed
-  const gated = asks.filter(ask => ask.level === level)
-  const whats = [...new Set(gated.map(ask => ask.what))].join(' and ')
-  const presetLine = `the ${settings.preset} permission preset${settings.presetNote === undefined ? '' : ` (${settings.presetNote})`}`
-  if (level === 'never') {
-    return {
-      deny: `${presetLine} never allows this: ${whats}. Nothing ran. To change it, ${howToChange(gated[0]?.key ?? SETTING.preset)}.`,
-    }
+/** How long a recorded ask stays usable. */
+const UNLOCK_TTL_MS = 60 * 60_000
+
+/**
+ * The controlled actions no recorded ask covers. When every one is covered, their unlocks are
+ * used up: one ask, one action on one target (D74).
+ */
+async function withUnlocks($: EngineInterface, held: readonly Controlled[]): Promise<Controlled[]> {
+  const now = await $.clock.now()
+  const live = (await read($, unlocks)).filter(unlock => now - unlock.at < UNLOCK_TTL_MS)
+  const used = new Set<Unlock>()
+  const missing = held.filter(entry => {
+    const found = live.find(unlock => !used.has(unlock) && unlock.action === entry.action && targetKey(unlock.target) === targetKey(entry.target))
+    if (found !== undefined) used.add(found)
+    return found === undefined
+  })
+  if (missing.length === 0) await update($, unlocks, () => live.filter(unlock => !used.has(unlock)))
+  return missing
+}
+
+/**
+ * Whether a force-push could overwrite a reviewed commit: the pushed branch has an open PR
+ * with a review verdict recorded. Where the PRs cannot be read, it counts as reviewed.
+ */
+async function isReviewedBranch($: EngineInterface, cache: LoopCache, context: LoopContext, branch: string) {
+  const prs = await openPullRequests($, cache, context).catch(() => undefined)
+  if (prs === undefined) return true
+  const pr = prs.find(candidate => targetKey(candidate.branch) === targetKey(branch))
+  return pr !== undefined && (await readVerdicts($, context.project))[pr.ref] !== undefined
+}
+
+/**
+ * The controlled actions in one shell step (D74): approving a PR (unless the setting lets
+ * godmode approve once review and QA passed), closing a PR, deleting a branch whose name does
+ * not start with godmode's branch prefix, force-pushing a branch whose PR has a review
+ * verdict, and a raw host API write. Every other write is free.
+ */
+async function controlledIn($: EngineInterface, cache: LoopCache, context: LoopContext, step: ShellStep, agent: DispatchedAgent | undefined): Promise<Controlled[]> {
+  const { settings } = context
+  const pr = step.pr ?? 'unnamed PR'
+  const found: Controlled[] = []
+  if (step.action === 'pr-approve' && settings.prApproval === 'ask') found.push({ action: 'approve-pr', target: pr })
+  if (step.verb === 'gh pr close') found.push({ action: 'close-pr', target: pr })
+  for (const branch of step.deletes ?? []) if (!targetKey(branch).startsWith(settings.branchPrefix.toLowerCase())) found.push({ action: 'delete-branch', target: branch })
+  if (step.action === 'force-push') {
+    const branch = step.branch ?? agent?.branch
+    if (branch === undefined || (await isReviewedBranch($, cache, context, branch))) found.push({ action: 'force-push', target: branch ?? 'the current branch' })
   }
-  const answer = await askPerson($, `godmode: ${who(e.agentId, agent)} wants to ${whats}: \`${excerpt}\`. Allow it?`)
-  if (answer === 'yes') return allowed
-  if (answer === 'no') return { deny: `The person said no to this (${whats}). Nothing ran. Do not retry it; say what you needed it for.` }
-  return {
-    deny: `Under ${presetLine}, this needs the person's yes (${whats}), and godmode could not ask them: nobody to ask in a headless run, or the question was dismissed. Nothing ran. Ask them in your reply, or ${howToChange(SETTING.preset)}.`,
+  if (step.action === 'host-write' || step.isApi === true) found.push({ action: 'host-write', target: step.endpoint ?? (step.pr === undefined ? 'gh api' : `PR ${step.pr}`) })
+  return found
+}
+
+/** The `allow_once` tool: the PM records the person's explicit ask for one controlled action (D74). */
+export const ALLOW_ONCE_TOOL: ToolSpec & { name: 'allow_once' } = {
+  name: 'allow_once',
+  description:
+    'Record that the person explicitly asked, in their current message, for one controlled action on one target: approving or closing a PR, deleting a branch godmode did not create, force-pushing over a reviewed commit, editing a ticket godmode did not file, or a raw host API write. It lets that one action run once, by you or the agent you dispatch for it. Only the main thread may call it, and only on the person\'s own words, never on your initiative.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: [...CONTROLLED] },
+      target: { type: 'string', description: 'The PR number, the branch, the ticket key or the API endpoint, as the refusal named it.' },
+      ask: { type: 'string', description: 'The person\'s words that ask for it, quoted.' },
+    },
+    required: ['action', 'target', 'ask'],
+  },
+  isDeferred: false,
+}
+
+/** Serves `allow_once`: the main thread alone records an ask; an agent never unlocks anything. */
+export async function serveAllowOnce($: EngineInterface, e: { agentId?: string } & Record<string, unknown>) {
+  if ((await read($, isOn)) !== true) return { deny: 'godmode is off, so nothing is controlled.' }
+  if (e.agentId !== undefined) return { deny: 'Only the PM records the person\'s ask, on the main thread. Report to the PM what you need the person to ask for. Nothing was recorded.' }
+  const action = CONTROLLED.find(name => name === e.action)
+  const target = typeof e.target === 'string' ? e.target.trim() : ''
+  const ask = typeof e.ask === 'string' ? e.ask.trim() : ''
+  if (action === undefined || target === '' || ask === '') {
+    return { deny: `allow_once needs \`action\` (${CONTROLLED.join(', ')}), \`target\` and \`ask\`, the person's own words. Nothing was recorded.` }
   }
+  const at = await $.clock.now()
+  await update($, unlocks, current => [...current.filter(unlock => at - unlock.at < UNLOCK_TTL_MS), { action: action satisfies ControlledAction, target, ask, at }])
+  return { result: `Recorded: the person asked for ${action} on ${target}. It runs once, within the hour.` }
 }
 
 /** A tool result's text as the model would read it. */

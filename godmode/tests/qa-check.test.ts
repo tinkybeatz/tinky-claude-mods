@@ -36,14 +36,14 @@ const prompt = ($: Engine, text = 'status?') => $.prompt.submit({ text } as Para
 const startQa = async ($: Engine, on: On, options: Options = {}) => {
   const world = makeWorld({ gh: { login: 'me', prs: [] } })
   const dir = await setUpProject(world, {
-    personalAnswers: { permissions: 'free', ...options.personal },
+    personalAnswers: { ...options.personal },
     sharedAnswers: { tracker: 'none', qaMode: 'human-pr', qaSignals: 'pr-approval', qaApprovers: 'alice, acme/qa', ...options.shared },
   })
   const qa = {
     world,
     tickets: markdownBackend(worldEngine(world), dir),
     /** Each PR's current commit and its reviews, oldest first. */
-    prs: new Map<string, { head: string; reviews: Review[] }>(),
+    prs: new Map<string, { head: string; reviews: Review[]; mergedBy?: string }>(),
     /** The hidden context each prompt entered with. */
     contexts: [] as (readonly string[] | undefined)[],
     /** Where the repo's `origin` points. */
@@ -60,7 +60,8 @@ const startQa = async ($: Engine, on: On, options: Options = {}) => {
       const pr = qa.prs.get(ref)
       if (pr === undefined) return { exitCode: 1, stdout: '', stderr: `no pull requests found for ${ref}` }
       const reviews = pr.reviews.map(review => ({ author: { login: review.login }, state: review.state, commit: { oid: review.commit }, submittedAt: '2026-11-16T09:00:00Z' }))
-      return { exitCode: 0, stdout: JSON.stringify({ headRefOid: pr.head, reviews }) }
+      const merged = pr.mergedBy === undefined ? { state: 'OPEN', mergedBy: null } : { state: 'MERGED', mergedBy: { login: pr.mergedBy } }
+      return { exitCode: 0, stdout: JSON.stringify({ headRefOid: pr.head, reviews, ...merged }) }
     }
     // GitHub answers 404 for a team gh cannot see, and for its memberships too.
     const team = noun === 'api' ? /^orgs\/([^/]+)\/teams\/([^/]+)(?:\/memberships\/(.+))?$/.exec(verb ?? '') : null
@@ -205,7 +206,7 @@ test('a gh call that times out reads as "could not check", never blocks the prom
 })
 
 /** A Jira project in human-staging whose pass signal is the board status "QA passed", its tickets waiting in "In QA". */
-const JIRA_QA = { tracker: 'jira', jiraCloudId: 'site-1', jiraProject: 'APP', qaMode: 'human-staging', qaSignals: 'ticket-status', qaWaitStatus: 'In QA', qaPassStatus: 'QA passed' }
+const JIRA_QA = { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', qaMode: 'human-staging', qaSignals: 'ticket-status', qaWaitStatus: 'In QA', qaPassStatus: 'QA passed' }
 
 /** Starts a Jira project with `issues` on the board, each with a side file saying godmode's status. */
 const startJiraQa = async (
@@ -624,4 +625,43 @@ test('the ticket-status signal: the pass status is a pass, the waiting status wa
   expect(statusFinding('QA passed', 'In QA', 'qa passed')).toEqual({ kind: 'pass', how: 'its status is "QA passed", the pass status' })
   expect(statusFinding('In QA', 'In QA', 'QA passed')).toBeUndefined()
   expect(statusFinding('In progress', 'In QA', 'QA passed')).toEqual({ kind: 'fail', how: 'it moved from "In QA" to "In progress", not to the pass status "QA passed"' })
+})
+
+test('with the merge signal, a PR someone merged outside godmode while its ticket waits is a pass, recorded with the ticket closed', async ($, on) => {
+  const qa = await startQa($, on, { shared: { qaSignals: 'pr-merged', qaApprovers: '' } })
+  await waitingOnQa(qa, 'Export button')
+  qa.prs.set('12', { head: HEAD, reviews: [], mergedBy: 'carol' })
+
+  await prompt($)
+
+  expect(qaLines(qa)).toEqual([
+    'QA T-1 ("Export button"): carol merged PR #12 at a1b2c3d outside godmode. The setup counts that as a QA pass godmode saw but did not record; the change is merged, so record it and close the ticket with ticket_move (id: T-1, qaResult: passed, status: done).',
+  ])
+})
+
+test('with the merge signal and the PR still open, the ticket waits; without the signal, a merge is told but not counted', async ($, on) => {
+  const qa = await startQa($, on, { shared: { qaSignals: 'pr-merged,pr-approval' } })
+  await waitingOnQa(qa, 'Export button', '12')
+  await waitingOnQa(qa, 'Import button', '14')
+  qa.prs.set('12', { head: HEAD, reviews: [] })
+  qa.prs.set('14', { head: HEAD, reviews: [], mergedBy: 'carol' })
+
+  await prompt($)
+
+  const [open, merged] = qaLines(qa)
+  expect(open).toContain('still waiting')
+  expect(merged).toContain('carol merged PR #14')
+  expect(merged).toContain('qaResult: passed, status: done')
+})
+
+test('without the merge signal, a merge outside godmode is no pass: the PM is told to ask the person', async ($, on) => {
+  const qa = await startQa($, on)
+  await waitingOnQa(qa, 'Export button')
+  qa.prs.set('12', { head: HEAD, reviews: [], mergedBy: 'carol' })
+
+  await prompt($)
+
+  const [line] = qaLines(qa)
+  expect(line).toContain('still waiting')
+  expect(line).toContain('carol merged PR #12 outside godmode, which this setup does not count as a QA pass, so ask the person whether QA passed')
 })

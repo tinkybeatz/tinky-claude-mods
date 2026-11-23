@@ -190,7 +190,7 @@ test('a gate reads the open tickets, plus the ticket it moves and its fix ticket
 
 test('on Jira, a gate searches the open tickets, the ticket it moves and its fix tickets, never every done one', async () => {
   const world = makeWorld()
-  await setUpProject(world, { sharedAnswers: { tracker: 'jira', jiraCloudId: 'site-1', jiraProject: 'APP', qaWaitStatus: 'In QA' } })
+  await setUpProject(world, { sharedAnswers: { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', qaWaitStatus: 'In QA' } })
   const jira = makeJira()
   const sides: [string, string, string, Record<string, unknown>][] = [
     ['APP-1', 'In Progress', 'doing', {}],
@@ -214,7 +214,7 @@ test('on Jira, a gate searches the open tickets, the ticket it moves and its fix
       },
     },
   } as unknown as Parameters<typeof jiraBackend>[0]
-  const backend = jiraBackend($, { tracker: 'jira', jiraCloudId: 'site-1', jiraProject: 'APP', qaWaitStatus: 'In QA', jiraServer: SERVER })
+  const backend = jiraBackend($, { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', qaWaitStatus: 'In QA', jiraServer: SERVER })
   const scope = () => jira.calls.map(call => /^key in \(([^)]*)\)/.exec(String(call.args.jql))?.[1])
 
   const ids = (await backend.list({ statuses: OPEN_STATUSES, around: { id: 'app-3', withFixes: true } })).map(header => header.id)
@@ -475,7 +475,7 @@ test('switching on declares the four ticket tools, the verdict tools and the set
 
   await godmode($)
 
-  expect(world.tools).toEqual([...TICKET_TOOL_NAMES, 'review_verdict', 'qa_verdict', ...SETUP_TOOL_NAMES])
+  expect(world.tools).toEqual([...TICKET_TOOL_NAMES, 'review_verdict', 'qa_verdict', 'allow_once', 'ticket_rules', ...SETUP_TOOL_NAMES])
 })
 
 test('the ticket tools work end to end through the plugin, in the note\'s storage', async ($, on) => {
@@ -498,7 +498,7 @@ test('the ticket tools work end to end through the plugin, in the note\'s storag
 
 test('a ticket tool answers an error the model reads: while off, and on Jira with no server or no project, never falling back to files (D25)', async ($, on) => {
   const world = makeWorld()
-  await setUpProject(world, { sharedAnswers: { tracker: 'jira', jiraCloudId: 'site-1' } })
+  await setUpProject(world, { sharedAnswers: { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90' } })
   const jira = makeJira({ isDisconnected: true })
   mountWorld(on, world)
   mountJira(on, jira)
@@ -506,11 +506,11 @@ test('a ticket tool answers an error the model reads: while off, and on Jira wit
   const off = await callTool($, 'ticket_list', {})
   await godmode($)
   const noProject = await callTool($, 'ticket_create', { title: 'x', ask: 'y', visibleChange: false })
-  await setUpProject(world, { sharedAnswers: { tracker: 'jira', jiraCloudId: 'site-1', jiraProject: 'APP' } })
+  await setUpProject(world, { sharedAnswers: { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP' } })
   const noServer = await callTool($, 'ticket_create', { title: 'x', ask: 'y', visibleChange: false })
 
   expect(off.error).toContain('godmode is off')
-  expect(noProject.error).toBe('The setup recorded no Jira project for the Jira tracker, so godmode does not know where to file tickets. Record it with `/godmode setup`.')
+  expect(noProject.error).toBe('The setup recorded no usable Jira project for the Jira tracker, so godmode does not know where to file tickets. Record it with `/godmode setup`.')
   expect(noServer.error).toContain('No Atlassian (Jira) server is connected to this session, so godmode cannot reach Jira. Connect the Atlassian connector (`/mcp`)')
   expect(jira.calls).toEqual([])
   expect([...world.files.keys()].some(path => path.includes('/tickets/') || path.includes('/tracker/'))).toBe(false)
@@ -521,8 +521,8 @@ const onJira = async ($: Engine, on: On, shared: Record<string, Answer> = {}, fa
   const world = makeWorld()
   const jira = makeJira(fake)
   await setUpProject(world, {
-    sharedAnswers: { tracker: 'jira', jiraCloudId: 'site-1', jiraProject: 'APP', jiraReviewStatus: 'Code Review', qaWaitStatus: 'In QA', ...shared },
-    personalAnswers: { permissions: 'free', ...(personal ?? { jiraServer: jira.server }) },
+    sharedAnswers: { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', jiraReviewStatus: 'Code Review', qaWaitStatus: 'In QA', ...shared },
+    personalAnswers: { ...(personal ?? { jiraServer: jira.server }) },
   })
   mountWorld(on, world)
   mountJira(on, jira)
@@ -545,7 +545,7 @@ for (const flavour of FLAVOURS) {
     expect(call?.server).toBe(jira.server)
     // Each server takes the issue type under its own field name.
     const typeField = flavour === 'listing' ? 'issueTypeName' : 'issueType'
-    expect(call?.args).toEqual({ cloudId: 'site-1', projectKey: 'APP', summary: 'Export button', [typeField]: 'Task', description: '## The ask\n\nadd export\n\n## Scope\n\n**Out:** PDF.' })
+    expect(call?.args).toEqual({ cloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', projectKey: 'APP', summary: 'Export button', [typeField]: 'Task', description: '## The ask\n\nadd export\n\n## Scope\n\n**Out:** PDF.' })
     expect(sideOf(world, 'APP-1')).toEqual({ title: 'Export button', status: 'todo', blockedBy: ['APP-9'], visibleChange: false, ready: false, created: '2026-10-16' })
     expect([...world.files.keys()].some(path => path.startsWith(`${REPO}/.godmode/tickets`))).toBe(false)
   })
@@ -623,7 +623,7 @@ test('Jira: the setup\'s server is called directly when its tools are missing fr
   expect(created.result).toContain('Filed APP-1 | todo | Export button')
   expect(moved.result).toContain('on the board: "Code Review"')
   expect(jira.calls.find(call => call.tool === 'createJiraIssue')?.args).toMatchObject({ issueType: 'Task' })
-  expect(jira.calls.find(call => call.tool === 'transitionJiraIssue')?.args).toEqual({ cloudId: 'site-1', issueIdOrKey: 'APP-1', transitionId: '3' })
+  expect(jira.calls.find(call => call.tool === 'transitionJiraIssue')?.args).toEqual({ cloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', issueIdOrKey: 'APP-1', transitionId: '3' })
 })
 
 test('Jira: with no server named and none in the tool list, the known server names that answer are tried before saying none is connected', async ($, on) => {

@@ -126,6 +126,19 @@ export interface TryRun {
   worktree: string
 }
 
+/**
+ * The person's explicit ask for one controlled action on one target (D74), recorded by the PM
+ * with `allow_once`. It is used once, and lapses after an hour.
+ */
+export interface Unlock {
+  action: string
+  target: string
+  /** The person's words, as the PM quoted them. */
+  ask: string
+  /** When it was recorded, in epoch milliseconds. */
+  at: number
+}
+
 /** How the "godmode is on" indicator shows (D68): a footer mode label, a hint-line tag, or a band above the prompt. */
 export type IndicatorStyle = 'mode' | 'hint' | 'band'
 
@@ -152,6 +165,10 @@ declare module 'claude-code' {
       setupReport: string
       /** The style of the on-indicator (D68), a personal answer; `mode` unless the note says otherwise. */
       indicator: 'mode' | 'hint' | 'band'
+      /** Whether Fable answered the PM in this session: untried, it works, or the PM runs on Opus (D74). */
+      pmModel: 'untried' | 'fable' | 'opus'
+      /** The person's asks that unlock one controlled action each (D74). */
+      unlocks: Unlock[]
       /** The app `/godmode try` runs, until `/godmode try stop`, the next try or the session's end; null when none. */
       tryRun: TryRun | null
     }

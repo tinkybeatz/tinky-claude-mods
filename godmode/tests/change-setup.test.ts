@@ -53,7 +53,10 @@ test('update: only a note from before the QA modes, under a newer godmode, lacks
   // Not newer, already answered, or written after the QA modes: nothing to offer.
   expect(pendingUpdates('0.5.0', '0.5.0', { qa: true })).toEqual([])
   expect(pendingUpdates('0.5.0', '0.6.0', { qaMode: 'bot' })).toEqual([])
-  expect(pendingUpdates('0.6.0', '0.7.0', {})).toEqual([])
+  // 0.7.0 replaced the permission tiers and asks the approval question of any older note (D74).
+  expect(pendingUpdates('0.6.0', '0.7.0', { qaMode: 'bot' }).map(entry => entry.topic)).toEqual(['prApproval'])
+  expect(pendingUpdates('0.6.0', '0.7.0', { qaMode: 'bot', prApproval: 'ask' })).toEqual([])
+  expect(pendingUpdates('0.7.0', '0.8.0', { qaMode: 'bot' })).toEqual([])
   expect(updateOfferLine('0.5.0', '0.6.0', pendingUpdates('0.5.0', '0.6.0', {}))).toContain('asks something new since this project\'s setup (0.5.0): the QA mode')
   expect(updateOfferLine('0.5.0', '0.6.0', [])).toBe('This project was set up with godmode 0.5.0; 0.6.0 asks nothing new of it.')
   expect(updateOfferLine('0.6.0', '0.6.0', [])).toBeUndefined()
@@ -88,8 +91,8 @@ type Person = {
   offered: Record<string, string[]>
 }
 
-/** Mounts the world, Jira when given, and the person, who picks `answers` by chip (else the first option; `null` dismisses). */
-const mount = (on: On, world: World, answers: Record<string, string | null> = {}, jira?: FakeJira): Person => {
+/** Mounts the world, Jira when given, and the person, who picks `answers` by chip (else the first option; `null` dismisses; a list answers in turn). */
+const mount = (on: On, world: World, answers: Record<string, string | null | (string | null)[]> = {}, jira?: FakeJira): Person => {
   const person: Person = { asked: [], offered: {} }
   mountWorld(on, world)
   on('agent.list', () => ({ value: [] }))
@@ -101,7 +104,8 @@ const mount = (on: On, world: World, answers: Record<string, string | null> = {}
     const header = question?.header ?? ''
     person.asked.push(header)
     person.offered[header] = question?.options.map(option => option.label) ?? []
-    const answer = answers[header]
+    const given = answers[header]
+    const answer = Array.isArray(given) ? (given.length > 1 ? given.shift() : given[0]) : given
     if (answer === null) return { deny: 'The person dismissed the question.' }
     return { result: { questions: input.questions, answers: { [question?.question ?? '']: answer ?? question?.options[0]?.label ?? '' } } } as never
   })
@@ -131,7 +135,7 @@ const noteFiles = (world: World) => [world.files.get(SHARED), world.files.get(PE
 
 const HUMAN_PR = {
   tracker: 'jira',
-  jiraCloudId: 'site-1',
+  jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90',
   jiraProject: 'APP',
   testCommand: 'npm test',
   qaMode: 'human-pr',
@@ -159,7 +163,7 @@ test('changing only the QA mode keeps every other answer and drops the old mode\
   const done = resultOf(await call($, 'setup_finish'))
 
   expect(person.asked.at(-1)).toBe('Save setup')
-  expect(sharedNote(world).answers).toEqual({ tracker: 'jira', jiraCloudId: 'site-1', jiraProject: 'APP', testCommand: 'npm test', qaMode: 'bot' })
+  expect(sharedNote(world).answers).toEqual({ tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', testCommand: 'npm test', qaMode: 'bot' })
   expect(sharedNote(world).godmodeVersion).toBe('0.6.0')
   expect(world.files.get(PERSONAL)).toBe(personalBefore)
   expect(done).toContain('\nQA mode: bot (')
@@ -191,7 +195,7 @@ test('changing the tracker to Jira asks the Jira questions after it, and keeps t
   expect(person.offered.Tracker?.[0]).toBe('None (markdown) (current)')
   expect(sharedNote(world).answers).toEqual({
     tracker: 'jira',
-    jiraCloudId: 'site-1',
+    jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90',
     jiraProject: 'APP',
     jiraTodoStatus: 'To Do',
     jiraDoingStatus: 'In Progress',
@@ -199,13 +203,13 @@ test('changing the tracker to Jira asks the Jira questions after it, and keeps t
     jiraDoneStatus: 'Done',
     qaMode: 'bot',
   })
-  expect(personalNote(world).answers).toEqual({ permissions: 'free', attribution: false, jiraServer: SERVER })
+  expect(personalNote(world).answers).toEqual({ attribution: false, jiraServer: SERVER })
   expect(done).toContain('Tickets the old tracker holds stay there')
 })
 
 test('jira runs the Jira questions again without the tracker one, the current project offered first', async ($, on) => {
   const world = makeWorld({ pluginVersion: '0.6.0' })
-  const onJira = { tracker: 'jira', jiraCloudId: 'site-1', jiraProject: 'APP', jiraTodoStatus: 'To Do', jiraDoingStatus: 'In Progress', jiraReviewStatus: 'Code Review', jiraDoneStatus: 'Done', qaMode: 'none' }
+  const onJira = { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', jiraTodoStatus: 'To Do', jiraDoingStatus: 'In Progress', jiraReviewStatus: 'Code Review', jiraDoneStatus: 'Done', qaMode: 'none' }
   await setUpProject(world, { sharedAnswers: onJira, personalAnswers: { permissions: 'free', jiraServer: SERVER } })
   const person = mount(on, world, { 'Jira project': 'OPS (Ops)', 'Jira mapping': 'Keep it' }, jiraWith(['APP', 'OPS']))
 
@@ -263,19 +267,19 @@ test('a shared change on an older note with nothing new left re-stamps the versi
 
 test('each answer lands in its half: the person\'s own in personal.json, the team\'s in shared.json (D61)', async ($, on) => {
   const world = makeWorld({ pluginVersion: '0.6.0' })
-  await setUpProject(world, { sharedAnswers: { tracker: 'none', qaMode: 'bot' }, models: { dev: 'opus' } })
-  const person = mount(on, world, { Permissions: 'Locked', 'Fix rounds': '5' })
+  await setUpProject(world, { sharedAnswers: { tracker: 'none', qaMode: 'bot' }, personalAnswers: { attribution: false, autoMerge: false }, models: { dev: 'opus' } })
+  const person = mount(on, world, { Merging: 'Merge when green', 'Fix rounds': '5' })
 
   await godmode($, 'setup')
-  resultOf(await call($, 'setup_questionnaire', { change: ['permissions', 'fixRoundLimit'] }))
+  resultOf(await call($, 'setup_questionnaire', { change: ['autoMerge', 'fixRoundLimit'] }))
   // A setting a question owns cannot be set freely, and nothing is saved.
   expect((await call($, 'setup_finish', { answers: { qaMode: 'none', testCommand: 'pnpm test' } })).deny).toContain('`qaMode` is set by a question')
   resultOf(await call($, 'setup_finish', { answers: { testCommand: 'pnpm test' } }))
 
-  expect(person.offered.Permissions?.[0]).toBe('Free (current)')
+  expect(person.offered.Merging?.[0]).toBe('Wait for my go (current)')
   expect(sharedNote(world).answers).toEqual({ tracker: 'none', qaMode: 'bot', testCommand: 'pnpm test' })
   const personal = personalNote(world)
-  expect(personal.answers).toEqual({ permissions: 'locked', attribution: false, fixRoundLimit: 5 })
+  expect(personal.answers).toEqual({ attribution: false, autoMerge: true, fixRoundLimit: 5 })
   expect(personal.models).toEqual({ dev: 'opus' })
 })
 
@@ -372,3 +376,54 @@ for (const ending of CHANGE_ENDS) {
     expect((await call($, 'setup_finish')).deny).toContain('not in setup mode')
   })
 }
+
+// ---------------------------------------------------------------------------
+// Saved answers that do not hold (the live test's note)
+
+test('the live test\'s note: /godmode flags the link and the bare site, and the check topic saves the repairs on a yes and names a start command with no script', async ($, on) => {
+  const world = makeWorld({ pluginVersion: '0.7.0' })
+  world.files.set(`${REPO}/package.json`, JSON.stringify({ name: 'app', scripts: { dev: 'vite' } }))
+  await setUpProject(world, {
+    sharedAnswers: {
+      tracker: 'jira',
+      jiraProject: 'HTTPS://ACME.ATLASSIAN.NET/JIRA/SOFTWARE/C/PROJECTS/APP/BOARDS/133/BACKLOG',
+      jiraCloudId: 'acme',
+      qaMode: 'human-pr',
+      qaSignals: 'ticket-status,pr-approval',
+      qaApprovers: '',
+      qaWaitStatus: 'In QA',
+      startCommand: 'pnpm editor:dev',
+    },
+    personalAnswers: { jiraServer: SERVER, prApproval: 'ask' },
+  })
+  const person = mount(on, world, {}, jiraWith(['APP']))
+
+  const on1 = await godmode($)
+  expect(on1.text).toContain('reads the setup\'s jiraProject "HTTPS://ACME.ATLASSIAN.NET/JIRA/SOFTWARE/C/PROJECTS/APP/BOARDS/133/BACKLOG" as "APP"')
+  expect(on1.text).toContain('jiraCloudId "acme" as "acme.atlassian.net"')
+
+  await godmode($, 'setup')
+  const checked = resultOf(await call($, 'setup_questionnaire', { change: ['check'] }))
+  expect(checked).toContain('startCommand does not hold (`pnpm editor:dev` runs `editor:dev`, which is not a script in package.json')
+  expect(checked).toContain('Call setup_finish')
+  resultOf(await call($, 'setup_finish'))
+
+  expect(person.asked).toEqual(['Save setup'])
+  expect(sharedNote(world).answers).toMatchObject({ jiraProject: 'APP', jiraCloudId: 'acme.atlassian.net' })
+  // The note is clean now: the next switch-on flags nothing.
+  await godmode($, 'off')
+  expect((await godmode($)).text ?? '').not.toContain('reads the setup')
+})
+
+test('a count typed in words is asked again with the reason, never dropped', async ($, on) => {
+  const world = makeWorld({ pluginVersion: '0.7.0' })
+  await setUpProject(world, { sharedAnswers: { tracker: 'none', qaMode: 'bot' }, personalAnswers: { prApproval: 'ask' } })
+  const person = mount(on, world, { 'Fix rounds': ['five', ' 4 '] })
+
+  await godmode($, 'setup')
+  resultOf(await call($, 'setup_questionnaire', { change: ['fixRoundLimit'] }))
+  resultOf(await call($, 'setup_finish'))
+
+  expect(person.asked).toEqual(['Fix rounds', 'Fix rounds', 'Save setup'])
+  expect(personalNote(world).answers.fixRoundLimit).toBe(4)
+})

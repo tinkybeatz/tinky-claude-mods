@@ -3,12 +3,10 @@ import { expect, test } from 'claude-code/testing'
 import {
   attributionIn,
   classifyShell,
-  DEFAULT_PRESET,
+  controlledRefusal,
   isInside,
   isMainThreadShell,
   mainThreadVerdict,
-  PRESET_LEVELS,
-  presetOf,
   relativeTo,
   roleOf,
   settingsOf,
@@ -96,9 +94,9 @@ test('AI attribution lines are found, and ordinary text is not', () => {
 })
 
 test('settings take their defaults, and every rule can be changed', () => {
-  const defaults = settingsOf({ permissions: 'free' })
+  const defaults = settingsOf({})
   expect(defaults).toMatchObject({
-    preset: 'free',
+    prApproval: 'ask',
     isAttributionAllowed: true,
     isAutoMergeOn: false,
     agentCap: 5,
@@ -113,43 +111,39 @@ test('settings take their defaults, and every rule can be changed', () => {
     isReviewStartOn: true,
     branchPrefix: 'godmode/',
   })
-  expect(defaults.presetNote).toBeUndefined()
 
   const changed = settingsOf({
-    permissions: 'Full freedom',
+    prApproval: 'when-passed',
     attribution: false,
     autoMerge: 'yes',
     agentCap: 3,
     thinMainThread: 'off',
     mainThreadReadLimit: '0',
     mainThreadTools: 'WebSearch, Grep',
-    'permission.push': 'never',
-    'permission.others-prs': 'ask',
   })
-  expect(changed.preset).toBe('full-freedom')
+  expect(changed.prApproval).toBe('when-passed')
   expect(changed.isAttributionAllowed).toBe(false)
   expect(changed.isAutoMergeOn).toBe(true)
   expect(changed.agentCap).toBe(3)
   expect(changed.isThinMainThread).toBe(false)
   expect(changed.mainThreadReadLimit).toBe(0)
   expect(changed.mainThreadTools).toEqual(['WebSearch', 'Grep'])
-  expect(changed.levels.push).toBe('never')
-  expect(changed.levels['force-push']).toBe('allow')
-  expect(changed.othersPrs).toBe('ask')
+  // A note's old tier and an unknown approval answer change nothing (D74).
+  expect(settingsOf({ permissions: 'locked', prApproval: 'always' }).prApproval).toBe('ask')
 })
 
-test('an unknown preset falls back to local only and says so', () => {
-  const settings = settingsOf({ permissions: 'yolo' })
-  expect(settings.preset).toBe(DEFAULT_PRESET)
-  expect(settings.presetNote).toContain('yolo')
-  expect(presetOf('local_only')).toBe('local-only')
+test('branch deletions and a push\'s branch are read from the shell line', () => {
+  expect(classifyShell('git branch -D old-work godmode/t-2-x')[0]?.deletes).toEqual(['old-work', 'godmode/t-2-x'])
+  expect(classifyShell('git push origin --delete deps')[0]?.deletes).toEqual(['deps'])
+  expect(classifyShell('git push origin :deps')[0]?.deletes).toEqual(['deps'])
+  expect(classifyShell('git push --force-with-lease origin godmode/t-1-x')[0]).toMatchObject({ action: 'force-push', branch: 'godmode/t-1-x' })
 })
 
-test('the four presets, as decided (D18, D53)', () => {
-  expect(Object.values(PRESET_LEVELS['full-freedom']).every(level => level === 'allow')).toBe(true)
-  expect(PRESET_LEVELS.free).toMatchObject({ edit: 'allow', 'git-write': 'allow', push: 'allow', 'pr-open': 'allow', 'pr-ready': 'allow', 'pr-merge': 'allow', 'force-push': 'ask', 'pr-approve': 'ask' })
-  expect(PRESET_LEVELS['local-only']).toMatchObject({ edit: 'allow', 'git-write': 'ask', push: 'ask', 'pr-open': 'ask', 'pr-comment': 'ask' })
-  expect(Object.values(PRESET_LEVELS.locked).every(level => level === 'ask')).toBe(true)
+test('a controlled action\'s refusal says to ask for it explicitly, and names the call that records the ask', () => {
+  const refusal = controlledRefusal([{ action: 'approve-pr', target: '9' }])
+  expect(refusal).toContain('ask for it explicitly and it goes through')
+  expect(refusal).toContain('mcp__godmode__allow_once (action: approve-pr, target: 9)')
+  expect(refusal).toContain('An agent never records an ask itself')
 })
 
 test('the main thread may run quick status checks and the PM\'s own PR actions, nothing heavier', () => {
@@ -172,7 +166,7 @@ test('the main thread\'s tools: talking, tickets and dispatch pass, heavier work
   for (const call of [{ tool: 'Read' }, { tool: 'Edit' }, { tool: 'Grep' }, { tool: 'WebFetch' }, { tool: 'Bash', command: 'npm test' }, { tool: 'mcp__other__thing' }]) {
     const verdict = mainThreadVerdict(call, settings, 2)
     expect(verdict.isAllowed).toBe(false)
-    if (!verdict.isAllowed) expect(verdict.reason).toContain('Dispatch a researcher or a shell')
+    if (!verdict.isAllowed) expect(verdict.reason).toContain('their ask is never a reason to refuse')
     if (!verdict.isAllowed) expect(verdict.reason).toContain('/godmode setup')
   }
   expect(mainThreadVerdict({ tool: 'Grep' }, settingsOf({ mainThreadTools: 'Grep' }), 0)).toEqual({ isAllowed: true })
@@ -201,6 +195,10 @@ test('roles, model floors, paths and ticket ids', () => {
   expect(spawnModel('claude-haiku-4-5', 'dev', { shared: { minimumModels: { dev: 'opus' } } })).toBe('opus')
   expect(spawnModel('sonnet', 'dev', { personal: { models: { dev: 'opus' } } })).toBe('opus')
   expect(spawnModel('fable', 'dev')).toBe('fable')
+  // The researcher's floor is Haiku; a model godmode cannot rank takes the floor, never above Fable (D74).
+  expect(spawnModel(undefined, 'researcher')).toBe('haiku')
+  expect(spawnModel('sonnet', 'researcher')).toBe('sonnet')
+  expect(spawnModel('claude-mythos-9', 'qa')).toBe('sonnet')
 
   expect(isInside('/w/app-worktrees/T-3/src/a.ts', '/w/app-worktrees/T-3')).toBe(true)
   expect(isInside('/w/app-worktrees/T-3/../T-4/a.ts', '/w/app-worktrees/T-3')).toBe(false)

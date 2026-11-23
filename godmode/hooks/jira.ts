@@ -1,9 +1,10 @@
 import type { EngineInterface, McpToolResult, ToolInfo } from 'claude-code'
 
+import { jiraProjectKeyOf, jiraSiteOf } from './answers'
 import type { Choice, Question } from './questionnaire'
 import { readNote, trackerDirOf } from './storage'
 import type { Answer, Project } from './storage'
-import type { QaResult, TicketBackend, TicketChange, TicketComment, TicketDraft, TicketFilter, TicketHeader, TicketStatus } from './tickets'
+import type { JiraFields, QaResult, TicketBackend, TicketChange, TicketComment, TicketDraft, TicketFilter, TicketHeader, TicketStatus } from './tickets'
 
 /*
  * The Jira tracker (D23, D24): the four ticket tools mapped onto the Atlassian connector the
@@ -29,6 +30,9 @@ export const JIRA_TOOLS = {
   sites: 'getAccessibleAtlassianResources',
   projects: 'getVisibleJiraProjects',
 } as const
+
+/** The tools that list a project's issue types and an issue type's fields; only the server with a transitions list has them. */
+const META_TOOLS = { types: 'getJiraProjectIssueTypesMetadata', fields: 'getJiraIssueTypeMetaWithFields' } as const
 
 /** The comment tool, which Atlassian's servers name differently. */
 const COMMENT_TOOLS: readonly string[] = ['addCommentToJiraIssue', 'addOrEditJiraIssueComment']
@@ -391,12 +395,29 @@ const landedStatusIn = (value: unknown, known: readonly string[]): string | unde
 
 type Site = { id: string; name: string; url?: string }
 
-const sitesIn = (value: unknown): Site[] =>
-  rowsIn(value, ['resources', 'sites', 'values']).flatMap(row =>
-    isRecord(row) && typeof row.id === 'string'
-      ? [{ id: row.id, name: typeof row.name === 'string' ? row.name : row.id, ...(typeof row.url === 'string' ? { url: row.url } : {}) }]
-      : [],
-  )
+/**
+ * The sites in `getAccessibleAtlassianResources`'s answer. One server answers a bare list of
+ * `{ id, name, url }`, one row per product, so a site can come twice; the "Atlassian MCP"
+ * server wraps `{ cloudId, url }` rows, with no name, in `{ data: { resources } }`.
+ */
+export const sitesIn = (value: unknown): Site[] => {
+  const seen = new Set<string>()
+  return rowsIn(unwrapped(value), ['resources', 'sites', 'values']).flatMap(row => {
+    if (!isRecord(row)) return []
+    const id = typeof row.id === 'string' ? row.id : typeof row.cloudId === 'string' ? row.cloudId : undefined
+    if (id === undefined || seen.has(id)) return []
+    seen.add(id)
+    const url = typeof row.url === 'string' ? row.url : undefined
+    const name = typeof row.name === 'string' ? row.name : (url === undefined ? undefined : jiraSiteOf(url)?.split('.')[0]) ?? id
+    return [{ id, name, ...(url === undefined ? {} : { url }) }]
+  })
+}
+
+/** Whether a site answer names one of the listed sites: by its cloud id or by its address. */
+const isListedSite = (sites: readonly Site[], answer: string) => {
+  const host = jiraSiteOf(answer)
+  return sites.some(listed => listed.id.toLowerCase() === answer.toLowerCase() || (listed.url !== undefined && jiraSiteOf(listed.url) === host))
+}
 
 type JiraProject = { key: string; name: string }
 
@@ -533,11 +554,12 @@ export type JiraSettings = { cloudId: string; project: string; issueType: string
 
 /** The Jira settings in a note's answers; a string says which answer is missing. */
 export const jiraSettingsOf = (answers: Readonly<Record<string, Answer>>): JiraSettings | string => {
-  const cloudId = textOf(answers.jiraCloudId)
-  const project = textOf(answers.jiraProject)?.toUpperCase()
+  // The answer rules ran when the note was read; read again here, a typed site or a link still gives what Jira takes.
+  const cloudId = answers.jiraCloudId === undefined ? undefined : jiraSiteOf(answers.jiraCloudId)
+  const project = answers.jiraProject === undefined ? undefined : jiraProjectKeyOf(answers.jiraProject)
   if (cloudId === undefined || project === undefined) {
     const missing = [cloudId === undefined ? 'Atlassian site' : undefined, project === undefined ? 'Jira project' : undefined].filter(part => part !== undefined)
-    return `The setup recorded no ${missing.join(' and no ')} for the Jira tracker, so godmode does not know where to file tickets. Record ${missing.length === 1 ? 'it' : 'them'} with \`/godmode setup\`.`
+    return `The setup recorded no usable ${missing.join(' and no usable ')} for the Jira tracker, so godmode does not know where to file tickets. Record ${missing.length === 1 ? 'it' : 'them'} with \`/godmode setup\`.`
   }
   return { cloudId, project, issueType: textOf(answers.jiraIssueType) ?? DEFAULT_ISSUE_TYPE, statuses: statusMapOf(answers) }
 }
@@ -559,6 +581,188 @@ async function openJira($: EngineInterface, answers: Readonly<Record<string, Ans
   const server = await findServer($, answers.jiraServer, timeoutMs)
   if (typeof server === 'string') throw new JiraError(server)
   return { server, settings, sideDir: await jiraSideDirOf($, project) }
+}
+
+/**
+ * The create call's arguments for the ticket-filing fields (D74), in each server's shape. The
+ * server with a transitions list takes `issueTypeName`, `parent` and everything else in
+ * `additional_fields`, and has no sprint parameter: a sprint goes in `fields` by the sprint
+ * field's id. The other takes `issueType`, `labels`, `priority`, `parent` and `assignToSprint`.
+ */
+export const createArgsOf = (isListing: boolean, issueType: string, jira: JiraFields): Record<string, unknown> => {
+  const components = jira.components === undefined ? {} : { components: jira.components.map(name => ({ name })) }
+  const parent = jira.parent === undefined ? {} : { parent: jira.parent }
+  if (isListing) {
+    if (jira.sprint !== undefined) {
+      throw new JiraError('This Atlassian server has no sprint parameter: pass the sprint in `jira.fields` under the sprint field\'s id, as the ticket-filing rules name it. Nothing was filed.')
+    }
+    const additional = {
+      ...(jira.labels === undefined ? {} : { labels: jira.labels }),
+      ...components,
+      ...(jira.priority === undefined ? {} : { priority: { name: jira.priority } }),
+      ...(jira.fields ?? {}),
+    }
+    return { issueTypeName: issueType, ...parent, ...(Object.keys(additional).length === 0 ? {} : { additional_fields: additional }) }
+  }
+  const additional = { ...components, ...(jira.fields ?? {}) }
+  return {
+    issueType,
+    ...parent,
+    ...(jira.labels === undefined ? {} : { labels: jira.labels }),
+    ...(jira.priority === undefined ? {} : { priority: jira.priority }),
+    ...(jira.sprint === undefined ? {} : { assignToSprint: jira.sprint }),
+    ...(Object.keys(additional).length === 0 ? {} : { additional_fields: additional }),
+  }
+}
+
+/** A field of an issue type, from its create metadata. */
+export type FieldMeta = { id: string; name: string; isRequired: boolean; hasDefault: boolean }
+
+/** The fields in `getJiraIssueTypeMetaWithFields`'s answer. */
+export const fieldMetaIn = (value: unknown): FieldMeta[] =>
+  rowsIn(unwrapped(value), ['fields', 'values', 'results']).flatMap(row => {
+    if (!isRecord(row)) return []
+    const id = typeof row.fieldId === 'string' ? row.fieldId : typeof row.key === 'string' ? row.key : undefined
+    if (id === undefined) return []
+    return [{ id, name: typeof row.name === 'string' ? row.name : id, isRequired: row.required === true, hasDefault: row.hasDefaultValue === true }]
+  })
+
+/** The fields godmode always sets itself, or Jira fills in. */
+const SET_BY_GODMODE: readonly string[] = ['summary', 'description', 'issuetype', 'project', 'reporter']
+
+/**
+ * An issue type's fields, from the server with the metadata tools; none where the server has
+ * none or the type is not found. `requiredOnly` asks for the required ones alone.
+ */
+export async function issueTypeFields($: EngineInterface, server: string, settings: JiraSettings, tools: ReadonlySet<string>, issueType: string, requiredOnly: boolean): Promise<FieldMeta[]> {
+  if (!tools.has(META_TOOLS.types) || !tools.has(META_TOOLS.fields)) return []
+  const types = await callJira($, server, META_TOOLS.types, { cloudId: settings.cloudId, projectIdOrKey: settings.project }).catch(() => undefined)
+  const type = rowsIn(unwrapped(types), ['issueTypes', 'values', 'results']).find(row => isRecord(row) && typeof row.name === 'string' && sameName(row.name, issueType))
+  if (!isRecord(type) || (typeof type.id !== 'string' && typeof type.id !== 'number')) return []
+  const meta = await callJira($, server, META_TOOLS.fields, {
+    cloudId: settings.cloudId,
+    projectIdOrKey: settings.project,
+    issueTypeId: String(type.id),
+    requiredFieldsOnly: requiredOnly,
+  }).catch(() => undefined)
+  return fieldMetaIn(meta)
+}
+
+/**
+ * The fields an issue type requires that the ticket does not set (D74): each named as
+ * "Name (id)". A field with a default, or one godmode always sets, is not missing. A server
+ * with no metadata tools reports none: its create call names a missing field itself.
+ */
+async function missingRequired($: EngineInterface, server: string, settings: JiraSettings, tools: ReadonlySet<string>, issueType: string, jira: JiraFields): Promise<string[]> {
+  const required = (await issueTypeFields($, server, settings, tools, issueType, true)).filter(field => field.isRequired && !field.hasDefault)
+  const given = new Set(
+    [
+      ...Object.keys(jira.fields ?? {}),
+      ...(jira.parent === undefined ? [] : ['parent']),
+      ...(jira.labels === undefined ? [] : ['labels']),
+      ...(jira.components === undefined ? [] : ['components']),
+      ...(jira.priority === undefined ? [] : ['priority']),
+      ...(jira.sprint === undefined ? [] : ['sprint']),
+      ...SET_BY_GODMODE,
+    ].map(name => name.toLowerCase()),
+  )
+  return required.filter(field => !given.has(field.id.toLowerCase()) && !given.has(field.name.toLowerCase())).map(field => `${field.name} (${field.id})`)
+}
+
+/** What a board scan reads: the latest issues with every field, the person's account, and each issue type's fields. */
+export type BoardData = { project: string; site: string; issues: unknown[]; account?: string; typeFields: Record<string, FieldMeta[]> }
+
+/**
+ * The raw data of a board scan (D74), read-only: the project's latest `count` issues with
+ * every field, newest first, the person's account (to tell their issues from the team's), and
+ * the fields of each issue type in use, where the server lists them. A string says why
+ * nothing could be read.
+ */
+export async function jiraBoardData($: EngineInterface, answers: Readonly<Record<string, Answer>>, count = 30): Promise<BoardData | string> {
+  let jira: Jira
+  try {
+    jira = await openJira($, answers)
+  } catch (error) {
+    return messageOf(error)
+  }
+  const { settings, server } = jira
+  const found = await callJira($, server.name, JIRA_TOOLS.search, {
+    cloudId: settings.cloudId,
+    jql: `project = ${jqlText(settings.project)} ORDER BY created DESC`,
+    fields: ['*all'],
+    maxResults: Math.max(count, 50),
+  }).catch((error: unknown) => messageOf(error))
+  if (typeof found === 'string') return found
+  const issues = rowsIn(found, ['issues', 'values', 'results']).slice(0, count)
+  const account = accountIdIn(await callJira($, server.name, 'atlassianUserInfo', {}).catch(() => undefined))
+  const tools = server.tools.size > 0 ? server.tools : await probeTools($, server.name, settings.cloudId)
+  const types = [...new Set(issues.flatMap(issue => {
+    const fields = isRecord(issue) && isRecord(issue.fields) ? issue.fields : undefined
+    return isRecord(fields?.issuetype) && typeof fields.issuetype.name === 'string' ? [fields.issuetype.name] : []
+  }))]
+  const typeFields: Record<string, FieldMeta[]> = {}
+  for (const type of types) typeFields[type] = await issueTypeFields($, server.name, settings, tools, type, false)
+  return { project: settings.project, site: settings.cloudId, issues, ...(account === undefined ? {} : { account }), typeFields }
+}
+
+/** Whether a ticket is the person's own (D74): godmode filed it, or their account created it; else why it counts as someone else's. */
+export type TicketOwnership = { isOwn: true } | { isOwn: false; why: string }
+
+/** The account id in `atlassianUserInfo`'s answer, in the shapes the servers give. */
+export const accountIdIn = (value: unknown): string | undefined => {
+  const answer = unwrapped(value)
+  if (!isRecord(answer)) return undefined
+  const found = [answer.accountId, answer.account_id, isRecord(answer.user) ? answer.user.accountId : undefined].find(id => typeof id === 'string' && id !== '')
+  return typeof found === 'string' ? found : undefined
+}
+
+/** Who created an issue, from `getJiraIssue`: its creator, else its reporter. */
+export const creatorIdIn = (value: unknown): string | undefined => {
+  const answer = unwrapped(value)
+  const issue = isRecord(answer) && isRecord(answer.issue) ? answer.issue : answer
+  const fields = isRecord(issue) && isRecord(issue.fields) ? issue.fields : issue
+  if (!isRecord(fields)) return undefined
+  for (const person of [fields.creator, fields.reporter]) if (isRecord(person) && typeof person.accountId === 'string') return person.accountId
+  return undefined
+}
+
+/** Caches in the person's store: their account per site, and each issue's creator, which never changes. */
+const accountKey = (cloudId: string) => `jiraAccount:${cloudId}`
+const creatorKey = (cloudId: string, key: string) => `jiraCreator:${cloudId}:${key}`
+
+/**
+ * Whether a Jira ticket is the person's own (D74): godmode filed it (it has a side file), or
+ * the person's own Atlassian account created it (the creator, else the reporter; the assignee
+ * is not enough). The account and each creator are read once and kept in `$.store`; the
+ * issue is read only for a ticket with no side file. Anything that cannot be read counts as
+ * someone else's ticket, with the reason.
+ */
+export async function jiraOwnership($: EngineInterface, project: Project, rawKey: string): Promise<TicketOwnership> {
+  const key = rawKey.trim().toUpperCase()
+  let jira: Jira
+  try {
+    jira = await openJira($, await noteAnswersOf($), project)
+  } catch (error) {
+    return { isOwn: false, why: `godmode could not reach Jira to tell who created ${key} (${messageOf(error)})` }
+  }
+  if (await $.fs.exists(`${jira.sideDir}/${key}.json`).catch(() => false)) return { isOwn: true }
+  const { cloudId } = jira.settings
+  const keptAccount: unknown = await $.store.get(accountKey(cloudId)).catch(() => undefined)
+  let account = typeof keptAccount === 'string' ? keptAccount : undefined
+  if (account === undefined) {
+    account = accountIdIn(await callJira($, jira.server.name, 'atlassianUserInfo', {}).catch(() => undefined))
+    if (account === undefined) return { isOwn: false, why: 'godmode could not read your Atlassian account, so it cannot tell whether you created it' }
+    await $.store.set(accountKey(cloudId), account).catch(() => undefined)
+  }
+  const keptCreator: unknown = await $.store.get(creatorKey(cloudId, key)).catch(() => undefined)
+  let creator = typeof keptCreator === 'string' ? keptCreator : undefined
+  if (creator === undefined) {
+    const issue = await callJira($, jira.server.name, JIRA_TOOLS.read, { cloudId, issueIdOrKey: key, fields: ['creator', 'reporter'] }).catch(() => undefined)
+    creator = creatorIdIn(issue)
+    if (creator === undefined) return { isOwn: false, why: `godmode could not read who created ${key}` }
+    await $.store.set(creatorKey(cloudId, key), creator).catch(() => undefined)
+  }
+  return creator === account ? { isOwn: true } : { isOwn: false, why: `someone else created ${key}` }
 }
 
 /** What a search over side-file keys found, and the keys Jira says do not exist. */
@@ -773,13 +977,19 @@ export function jiraBackend($: EngineInterface, answers?: Readonly<Record<string
       const { settings } = await jira()
       const blockedBy = keysIn(draft.blockedBy ?? [], 'blockedBy')
       const [fixFor] = draft.fixFor === undefined ? [] : keysIn([draft.fixFor], 'fixFor')
-      // One server takes the type as `issueTypeName`, the other as `issueType`.
-      const typeField = (await toolsOf()).has(JIRA_TOOLS.transitions) ? 'issueTypeName' : 'issueType'
+      const tools = await toolsOf()
+      const issueType = draft.jira?.issueType ?? settings.issueType
+      const missing = await missingRequired($, (await jira()).server.name, settings, tools, issueType, draft.jira ?? {})
+      if (missing.length > 0) {
+        throw new JiraError(
+          `A ${issueType} in ${settings.project} requires ${missing.join(', ')}, which this ticket does not set. If the ticket-filing rules do not say what goes there, ask the person rather than guess, then file it again with each in \`jira.fields\` (by its id or name). Nothing was filed.`,
+        )
+      }
       const answer = await call(JIRA_TOOLS.create, {
         projectKey: settings.project,
         summary: oneLine(draft.title),
-        [typeField]: settings.issueType,
         description: descriptionOf(draft),
+        ...createArgsOf(tools.has(JIRA_TOOLS.transitions), issueType, draft.jira ?? {}),
       })
       const key = createdKeyIn(answer)
       if (key === undefined) throw new JiraError(`Jira filed the issue but answered no key godmode could read, so it keeps no record of it. Find it in ${settings.project} and move it with ticket_move.`)
@@ -985,8 +1195,11 @@ export async function jiraLatestComment(
 // ---------------------------------------------------------------------------
 // Setup: which server, which site, which project, and the board's statuses
 
-/** Asks one question (or takes the person's earlier answer); undefined when nobody could answer. */
-export type JiraAsk = (question: Question) => Promise<Record<string, Answer> | undefined>
+/**
+ * Asks one question (or takes the person's earlier answer); undefined when nobody could answer.
+ * `known` holds the Jira answers so far, which checking a typed answer against the site needs.
+ */
+export type JiraAsk = (question: Question, known?: Readonly<Record<string, Answer>>) => Promise<Record<string, Answer> | undefined>
 
 /** What the Jira part of the setup found: the answers to record, notes for the agent, and the board's statuses. */
 export type JiraSetup = { answers: Record<string, Answer>; notes: string[]; boardStatuses: string[] }
@@ -1030,7 +1243,7 @@ const projectQuestion = (projects: readonly JiraProject[]): Question => ({
   question: `Which Jira project should godmode file tickets in?${projects.length > 4 ? ` Its projects include ${projects.slice(4, 12).map(project => project.key).join(', ')}.` : ''} Pick one, or type its key under Other.`,
   choices: withLater(projects.map(project => ({ label: `${project.key} (${project.name.replace(/,/g, ' ')})`, value: project.key }))),
   half: 'shared',
-  freeText: text => ({ jiraProject: text.trim().toUpperCase() }),
+  freeText: text => ({ jiraProject: text.trim() }),
 })
 
 /** What each godmode status means, for the mapping questions. */
@@ -1081,6 +1294,56 @@ async function boardStatuses($: EngineInterface, server: string, cloudId: string
   return [...found.values()]
 }
 
+/** The answers that name a status on the board: godmode's four, the waiting status and the pass status. */
+export const JIRA_STATUS_ANSWERS: readonly string[] = [...Object.values(JIRA_STATUS_KEYS), 'qaPassStatus']
+
+/** The values Jira's JQL error calls unknown: `The value 'X' does not exist for the field 'project'.` */
+export const unknownJqlValues = (said: string) =>
+  [...said.matchAll(/value '([^']+)' does not exist for the field '(\w+)'/gi)].map(match => ({ value: match[1] ?? '', field: (match[2] ?? '').toLowerCase() }))
+
+const siteShown = (site: Site) => (site.url === undefined ? site.name : (jiraSiteOf(site.url) ?? site.name))
+
+/**
+ * The Jira answers checked against the site, read-only: the site is one the connector reaches,
+ * the project exists there, and each status name exists on the site (one JQL search, whose
+ * error names every unknown value; Jira checks a status name site-wide, not per workflow).
+ * Resolves a problem per answer key that does not hold. An answer it could not check (no
+ * server connected, a refused call it cannot read) has none: only a definite "no" is a problem.
+ */
+export async function jiraAnswerProblems($: EngineInterface, answers: Readonly<Record<string, Answer>>): Promise<Record<string, string>> {
+  const problems: Record<string, string> = {}
+  const cloudId = answers.jiraCloudId === undefined ? undefined : jiraSiteOf(answers.jiraCloudId)
+  if (cloudId === undefined) return problems
+  const server = await findServer($, answers.jiraServer)
+  if (typeof server === 'string') return problems
+  const sites = sitesIn(await callJira($, server.name, JIRA_TOOLS.sites, {}).catch(() => []))
+  if (sites.length > 0 && !isListedSite(sites, cloudId)) {
+    problems.jiraCloudId = `"${cloudId}" is not one of the Atlassian sites this connector reaches (${sites.map(siteShown).join(', ')})`
+    return problems
+  }
+  const project = answers.jiraProject === undefined ? undefined : jiraProjectKeyOf(answers.jiraProject)
+  if (project === undefined) return problems
+  const named = JIRA_STATUS_ANSWERS.flatMap(key => {
+    const name = textOf(answers[key])
+    return name === undefined ? [] : [{ key, name }]
+  })
+  const names = [...new Set(named.map(entry => entry.name))]
+  const jql = `project = ${jqlText(project)}${names.length === 0 ? '' : ` AND status in (${names.map(jqlText).join(', ')})`}`
+  try {
+    await callJira($, server.name, JIRA_TOOLS.search, { cloudId, jql, fields: ['status'], maxResults: 1 })
+  } catch (error) {
+    if (!(error instanceof JiraRefused)) return problems
+    for (const unknown of unknownJqlValues(error.said)) {
+      if (unknown.field === 'project') problems.jiraProject = `Jira has no project "${unknown.value}" on ${cloudId}, or you cannot see it`
+      if (unknown.field !== 'status') continue
+      for (const entry of named) {
+        if (sameName(entry.name, unknown.value)) problems[entry.key] = `"${entry.name}" is not a status on ${cloudId}: type the status exactly as the board shows it`
+      }
+    }
+  }
+  return problems
+}
+
 /**
  * The Jira part of a setup, after the tracker answer: the server (asked only when several
  * are connected), the site, the project, and the board's names for godmode's statuses,
@@ -1107,7 +1370,7 @@ export async function jiraSetup($: EngineInterface, given: Readonly<Record<strin
 
   const sites = textOf(given.jiraCloudId) === undefined ? sitesIn(await callJira($, server.name, JIRA_TOOLS.sites, {}).catch(() => [])) : []
   const [onlySite] = sites
-  const site = textOf(given.jiraCloudId) !== undefined || sites.length !== 1 || onlySite === undefined ? await ask(siteQuestion(sites)) : { jiraCloudId: onlySite.id }
+  const site = textOf(given.jiraCloudId) !== undefined || sites.length !== 1 || onlySite === undefined ? await ask(siteQuestion(sites), result.answers) : { jiraCloudId: onlySite.id }
   const cloudId = textOf(site?.jiraCloudId)
   if (cloudId === undefined) {
     if (site !== undefined) result.notes.push('The Jira site is left for later: the ticket tools say so until `/godmode setup` records it.')
@@ -1119,7 +1382,7 @@ export async function jiraSetup($: EngineInterface, given: Readonly<Record<strin
   const projects = textOf(given.jiraProject) === undefined && (server.tools.size === 0 || server.tools.has(JIRA_TOOLS.projects))
     ? projectsIn(await callJira($, server.name, JIRA_TOOLS.projects, { cloudId }).catch(() => []))
     : []
-  const projectAnswer = await ask(projectQuestion(projects))
+  const projectAnswer = await ask(projectQuestion(projects), result.answers)
   const project = textOf(projectAnswer?.jiraProject)?.toUpperCase()
   if (project === undefined) {
     if (projectAnswer !== undefined) result.notes.push('The Jira project is left for later: the ticket tools say so until `/godmode setup` records it.')
@@ -1156,7 +1419,7 @@ export async function jiraSetup($: EngineInterface, given: Readonly<Record<strin
     }
   }
   for (const status of open) {
-    const answer = await ask(statusQuestion(status, result.boardStatuses, guess[status]))
+    const answer = await ask(statusQuestion(status, result.boardStatuses, guess[status]), result.answers)
     if (answer === undefined) return result
     const name = textOf(answer[JIRA_STATUS_KEYS[status]])
     if (name !== undefined) result.answers[JIRA_STATUS_KEYS[status]] = name

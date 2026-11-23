@@ -170,7 +170,7 @@ const facts = (overrides: Partial<ScanFacts> = {}): ScanFacts => ({
 })
 
 test('questionnaire: a fully scanned project asks only the person\'s choices, in order', () => {
-  expect(questionsFor(facts(), 'full').map(question => question.key)).toEqual(['permissions', 'storage', 'tracker', 'attribution', 'qaHuman', 'indicator'])
+  expect(questionsFor(facts(), 'full').map(question => question.key)).toEqual(['autoMerge', 'prApproval', 'storage', 'tracker', 'attribution', 'qaHuman', 'indicator'])
 })
 
 test('questionnaire: each gap the scan left becomes one question, first', () => {
@@ -181,7 +181,7 @@ test('questionnaire: each gap the scan left becomes one question, first', () => 
     git: { hasGit: true, origin: 'git@gitlab.com:acme/app.git', remoteHost: 'gitlab.com', host: 'local', hostReason: '`origin` is not on github.com' },
   })
   expect(gapQuestions(gaps).map(question => question.key)).toEqual(['stack', 'testCommand', 'startCommand', 'gitHost'])
-  expect(questionsFor(gaps, 'full').map(question => question.key).slice(0, 5)).toEqual(['stack', 'testCommand', 'startCommand', 'gitHost', 'permissions'])
+  expect(questionsFor(gaps, 'full').map(question => question.key).slice(0, 5)).toEqual(['stack', 'testCommand', 'startCommand', 'gitHost', 'autoMerge'])
   const host = gapQuestions(gaps).find(question => question.key === 'gitHost')
   expect(host?.choices.map(choice => choice.value)).toEqual(['local', 'other'])
 })
@@ -238,13 +238,13 @@ test('questionnaire: each pass signal is offered only where godmode can read it 
   const local = facts({ git: { hasGit: true, host: 'local', hostReason: 'the repo has no `origin` remote' } })
 
   // Markdown tickets have no board, so only the PR approval, and only before the merge on GitHub.
-  expect(humanFlow(facts(), { tracker: 'none', qaMode: 'human-pr' })).toEqual({ headers: ['QA bot first', 'QA signals'], offered: ['PR approval', 'Only being told'] })
+  expect(humanFlow(facts(), { tracker: 'none', qaMode: 'human-pr' })).toEqual({ headers: ['QA bot first', 'QA signals'], offered: ['PR approval', 'PR merged', 'Only being told'] })
   expect(humanFlow(facts(), { tracker: 'none', qaMode: 'human-staging' })).toEqual({ headers: ['QA bot first'], offered: undefined })
   expect(humanFlow(local, { tracker: 'none', qaMode: 'human-pr' })).toEqual({ headers: ['QA bot first'], offered: undefined })
   // A board asks its waiting status too, and offers its pass status.
   expect(humanFlow(facts(), { tracker: 'jira', qaMode: 'human-pr' })).toEqual({
     headers: ['QA bot first', 'QA waiting', 'QA signals'],
-    offered: ['Ticket status', 'PR approval', 'Only being told'],
+    offered: ['Ticket status', 'PR approval', 'PR merged', 'Only being told'],
   })
   expect(humanFlow(local, { tracker: 'other', qaMode: 'human-staging' })).toEqual({
     headers: ['QA bot first', 'QA waiting', 'QA signals'],
@@ -268,20 +268,20 @@ test('questionnaire: the signals are picked together, each leading to its own na
 })
 
 test('questionnaire: a personal setup asks only the personal questions (D61)', () => {
-  expect(questionsFor(facts({ commands: {} }), 'personal').map(question => question.key)).toEqual(['permissions', 'attribution', 'indicator'])
+  expect(questionsFor(facts({ commands: {} }), 'personal').map(question => question.key)).toEqual(['autoMerge', 'prApproval', 'attribution', 'indicator'])
 })
 
 test('questionnaire: answers by label, by value, and typed under Other', () => {
-  const [, , tracker] = questionsFor(facts(), 'full')
+  const [, , , tracker] = questionsFor(facts(), 'full')
   if (tracker === undefined) throw new Error('no tracker question')
   expect(resolveAnswer(tracker, 'None (markdown)').values).toEqual({ tracker: 'none' })
   expect(resolveAnswer(tracker, 'jira').values).toEqual({ tracker: 'jira' })
   expect(resolveAnswer(tracker, 'no tracker').values).toEqual({ tracker: 'none' })
   expect(resolveAnswer(tracker, 'Linear').values).toEqual({ tracker: 'other', trackerName: 'Linear' })
-  const [permissions] = questionsFor(facts(), 'full')
-  if (permissions === undefined) throw new Error('no permissions question')
-  const unclear = resolveAnswer(permissions, 'whatever')
-  expect(unclear.values).toEqual({ permissions: 'full-freedom' })
+  const [merging] = questionsFor(facts(), 'full')
+  if (merging === undefined) throw new Error('no merging question')
+  const unclear = resolveAnswer(merging, 'whatever')
+  expect(unclear.values).toEqual({ autoMerge: false })
   expect(unclear.note).toContain('/godmode setup')
 })
 
@@ -330,8 +330,10 @@ type Setup = {
   asked: string[]
   /** The choices each question offered, by its chip. */
   offered: Record<string, string[]>
-  /** The person's answer per chip; absent, the first option; `null` dismisses it. */
-  answers: Record<string, string | null>
+  /** The person's answer per chip; absent, the first option; `null` dismisses it; a list answers each time asked, in turn. */
+  answers: Record<string, string | null | (string | null)[]>
+  /** Each question's full text, in order. */
+  texts: string[]
   /** Edits that got past the plugin. */
   edited: string[]
   spawned: AgentSpawnInput[]
@@ -342,7 +344,7 @@ const godmode = ($: Engine, args = '') => $.command.run({ command: 'godmode', ar
 
 /** Mounts the world and the person beneath the plugin; registers every hook before the first `$` call. */
 const mount = (on: On, world: World, answers: Setup['answers'] = {}, beneath?: (on: On) => void): Setup => {
-  const setup: Setup = { world, asked: [], offered: {}, answers, edited: [], spawned: [], contexts: [] }
+  const setup: Setup = { world, asked: [], offered: {}, answers, texts: [], edited: [], spawned: [], contexts: [] }
   mountWorld(on, world)
   on('agent.list', () => ({ value: [] }))
   on('ui.toast', () => ({ value: undefined }) as never)
@@ -360,8 +362,10 @@ const mount = (on: On, world: World, answers: Setup['answers'] = {}, beneath?: (
       const question = (input.questions as { question: string; header: string; options: { label: string }[] }[])[0]
       const header = question?.header ?? ''
       setup.asked.push(header)
+      setup.texts.push(question?.question ?? '')
       setup.offered[header] = question?.options.map(option => option.label) ?? []
-      const answer = setup.answers[header]
+      const given = setup.answers[header]
+      const answer = Array.isArray(given) ? (given.length > 1 ? given.shift() : given[0]) : given
       if (answer === null) return { deny: 'The person dismissed the question.' }
       return { result: { questions: input.questions, answers: { [question?.question ?? '']: answer ?? question?.options[0]?.label ?? '' } } } as never
     }
@@ -391,7 +395,7 @@ const sharedNote = (world: World, dir = `${REPO}/.godmode`) => JSON.parse(world.
 const personalNote = (world: World, dir = `${REPO}/.godmode`) => JSON.parse(world.files.get(`${dir}/personal.json`) ?? 'null') as { answers: Record<string, unknown> }
 
 test('setup, no conventions: the preset is written, the note lands, and the next /godmode is coding mode', async ($, on) => {
-  const setup = mount(on, webApp(), { Permissions: 'Free', Indicator: 'Band', QA: 'No' })
+  const setup = mount(on, webApp(), { Indicator: 'Band', QA: 'No' })
 
   await godmode($)
   // The PM dispatches the setup agent, which runs on Opus whatever the call asked (D33, D39).
@@ -410,7 +414,7 @@ test('setup, no conventions: the preset is written, the note lands, and the next
   const answers = resultOf(await tool($, 'setup_questionnaire'))
   // A web app with its commands found and GitHub signed in: no gap to ask about.
   // No people test, and the runnable UI makes the QA agent the default (D69).
-  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA agent', 'Indicator'])
+  expect(setup.asked).toEqual(['Merging', 'Approvals', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA agent', 'Indicator'])
   expect(answers).toContain('- qaMode: "bot"')
 
   const wrote = resultOf(await tool($, 'setup_write_preset'))
@@ -440,7 +444,7 @@ test('setup, no conventions: the preset is written, the note lands, and the next
     tracker: 'none',
     qaMode: 'bot',
   })
-  expect(personalNote(setup.world).answers).toEqual({ permissions: 'free', attribution: false, indicator: 'band' })
+  expect(personalNote(setup.world).answers).toEqual({ autoMerge: false, prApproval: 'ask', attribution: false, indicator: 'band' })
   expect(shared.conventions.map(file => file.path)).toEqual([
     'AGENTS.md',
     'CLAUDE.md',
@@ -559,11 +563,12 @@ test('setup asks only the gaps, never reference repos, and skips what the person
     }),
   )
   // The QA answer and its follow-up were given, so neither is asked.
-  expect(setup.asked).toEqual(['Tests', 'e2eCommand', 'Permissions', 'Attribution', 'Indicator'])
+  expect(setup.asked).toEqual(['Tests', 'e2eCommand', 'Merging', 'Approvals', 'Attribution', 'Indicator'])
   expect(answers).toContain('- qaMode: "none"')
   expect(answers).toContain('- testCommand: "pytest -q"')
   expect(answers).toContain('- tracker: "none"')
-  expect(answers).toContain('- e2eCommand: "None"')
+  // "None" for a command records none.
+  expect(answers).toContain('- e2eCommand: ""')
 })
 
 test('setup that cannot ask stops, saying which questions are left for the PM to relay', async ($, on) => {
@@ -575,8 +580,8 @@ test('setup that cannot ask stops, saying which questions are left for the PM to
   expect(stopped.deny).toContain('could not ask the person')
   expect(stopped.deny).toContain('- storage:')
   expect(stopped.deny).toContain('- indicator:')
-  expect(stopped.deny).not.toContain('- permissions:')
-  expect(setup.asked).toEqual(['Permissions', 'Storage'])
+  expect(stopped.deny).not.toContain('- autoMerge:')
+  expect(setup.asked).toEqual(['Merging', 'Approvals', 'Storage'])
 })
 
 /** A setup run through to its note with the person's answers; resolves the report. */
@@ -601,7 +606,7 @@ test('setup, people test the PR: where, the bot pass, the board\'s statuses and 
 
   const done = await setUp($)
 
-  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA where', 'QA bot first', 'QA waiting', 'QA signals', 'QA pass', 'QA approvers', 'Indicator'])
+  expect(setup.asked).toEqual(['Merging', 'Approvals', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA where', 'QA bot first', 'QA waiting', 'QA signals', 'QA pass', 'QA approvers', 'Indicator'])
   const answers = sharedNote(setup.world).answers
   expect(answers).toMatchObject({
     qaMode: 'human-pr',
@@ -624,7 +629,7 @@ test('setup, people test on staging: no PR signal and, with markdown tickets, no
 
   const done = await setUp($)
 
-  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA where', 'QA bot first', 'Indicator'])
+  expect(setup.asked).toEqual(['Merging', 'Approvals', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA where', 'QA bot first', 'Indicator'])
   const answers = sharedNote(setup.world).answers
   // The runnable UI made the bot pass first the default (D71).
   expect(answers).toMatchObject({ tracker: 'none', qaMode: 'human-staging', qaBotFirst: true })
@@ -668,7 +673,7 @@ test('setup that stops at the tracker lists the board\'s QA questions as conditi
   expect(stopped.deny).toContain('      if On staging:\n        - qaBotFirst:')
   expect(stopped.deny).toContain('        - qaWaitStatus (only if the tracker is Jira or Other): Which status')
   expect(stopped.deny).toContain('        - qaSignals (only if the tracker is Jira or Other): Being told')
-  expect(stopped.deny).toContain('(Ticket status [only if the tracker is Jira or Other] / PR approval / Only being told)')
+  expect(stopped.deny).toContain('(Ticket status [only if the tracker is Jira or Other] / PR approval / PR merged / Only being told)')
   expect(stopped.deny).toContain('- qaPassStatus: Which status on the board means QA passed?')
 
   // The PM relays them; the person picks Jira. Every QA dialog is dismissed, so only `given` can answer.
@@ -689,7 +694,7 @@ test('setup that stops at the tracker lists the board\'s QA questions as conditi
     }),
   )
 
-  expect(setup.asked.slice(3)).toEqual(['Permissions', 'Storage'])
+  expect(setup.asked.slice(4)).toEqual(['Merging', 'Approvals', 'Storage'])
   expect(answers).toContain('- qaWaitStatus: "In QA"')
   expect(answers).toContain('- qaSignals: "ticket-status"')
   expect(answers).toContain('- qaPassStatus: "QA passed"')
@@ -735,7 +740,7 @@ test('setup in gitignored storage keeps the conventions under .godmode, excluded
 })
 
 test('setup outside the repo writes nothing in it, and every agent brief lists the conventions (D19)', async ($, on) => {
-  const setup = mount(on, webApp(), { Storage: 'Outside the repo', Permissions: 'Free' })
+  const setup = mount(on, webApp(), { Storage: 'Outside the repo' })
   await godmode($)
   await tool($, 'setup_questionnaire')
   resultOf(await tool($, 'setup_write_preset'))
@@ -774,14 +779,14 @@ test('setup with Jira: the one server is used unasked, the site read, the projec
 
   await setUp($)
 
-  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Jira project', 'Jira mapping', 'Attribution', 'QA', 'QA where', 'QA bot first', 'QA waiting', 'QA signals', 'QA pass', 'Indicator'])
+  expect(setup.asked).toEqual(['Merging', 'Approvals', 'Storage', 'Tracker', 'Jira project', 'Jira mapping', 'Attribution', 'QA', 'QA where', 'QA bot first', 'QA waiting', 'QA signals', 'QA pass', 'Indicator'])
   expect(setup.offered['Jira project']).toEqual(['APP (App)', 'OPS (Ops)'])
   expect(setup.offered['QA waiting']).toEqual(['In QA', 'To Do', 'In Progress', 'Code Review'])
   expect(setup.offered['QA pass']).toEqual(['QA passed', 'Done', 'To Do', 'In Progress'])
   const shared = sharedNote(setup.world).answers
   expect(shared).toMatchObject({
     tracker: 'jira',
-    jiraCloudId: 'site-1',
+    jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90',
     jiraProject: 'APP',
     jiraTodoStatus: 'To Do',
     jiraDoingStatus: 'In Progress',
@@ -802,14 +807,14 @@ test('setup with Jira and no Atlassian server connected asks nothing more and sa
 
   const answered = resultOf(await tool($, 'setup_questionnaire'))
 
-  expect(setup.asked).toEqual(['Permissions', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA agent', 'Indicator'])
+  expect(setup.asked).toEqual(['Merging', 'Approvals', 'Storage', 'Tracker', 'Attribution', 'QA', 'QA agent', 'Indicator'])
   expect(answered).toContain('Note: No Atlassian (Jira) server is connected to this session, so godmode could not read the board.')
 })
 
-test('a teammate\'s personal setup asks three questions and writes only the personal half (D61)', async ($, on) => {
+test('a teammate\'s personal setup asks four questions and writes only the personal half (D61)', async ($, on) => {
   const world = webApp()
   world.files.set(`${REPO}/AGENTS.md`, '# Rules\n')
-  const team = mount(on, world, { Permissions: 'Locked', Indicator: 'Hint tag' })
+  const team = mount(on, world, { Merging: 'Merge when green', Indicator: 'Hint tag' })
   const shared = JSON.stringify({ godmodeVersion: '0.5.0', storage: 'committed', writtenAt: 'x', answers: { tracker: 'none' }, minimumModels: {}, conventions: [] })
   world.files.set(`${REPO}/.godmode/shared.json`, shared)
 
@@ -820,9 +825,9 @@ test('a teammate\'s personal setup asks three questions and writes only the pers
   const done = resultOf(await tool($, 'setup_finish'))
 
   expect(done).toContain('\nQA mode: none (')
-  expect(team.asked).toEqual(['Permissions', 'Attribution', 'Indicator'])
+  expect(team.asked).toEqual(['Merging', 'Approvals', 'Attribution', 'Indicator'])
   expect(world.files.get(`${REPO}/.godmode/shared.json`)).toBe(shared)
-  expect(personalNote(world).answers).toEqual({ permissions: 'locked', attribution: false, indicator: 'hint' })
+  expect(personalNote(world).answers).toEqual({ autoMerge: true, prApproval: 'ask', attribution: false, indicator: 'hint' })
 })
 
 test('no git: /godmode offers git init, runs it on a yes, and starts setup (D54)', async ($, on) => {
@@ -851,4 +856,118 @@ test('no git: a "Not now" leaves the folder untouched and godmode off', async ($
   expect(world.gitRuns).not.toContain('git init')
   expect(answer.text).toContain('`git init`')
   expect((await tool($, 'setup_scan')).deny).toContain('godmode is off')
+})
+
+// ---------------------------------------------------------------------------
+// Messy answers, as people really type them (the live test's bug class)
+
+/** A board in project APP with an issue in each of the usual statuses, so the mapping is guessed whole. */
+const appBoard = (overrides: Parameters<typeof makeJira>[0] = {}) => {
+  const jira = makeJira(overrides)
+  for (const [index, status] of ['To Do', 'In Progress', 'Code Review', 'In QA', 'QA passed', 'Done'].entries()) {
+    jira.issues.set(`APP-${index + 1}`, { key: `APP-${index + 1}`, summary: `Issue ${index + 1}`, status })
+  }
+  return jira
+}
+
+test('messy Jira answers: the wrapped site list picks its one site, a project link saves its key, and an unknown project or status is asked again with the reason', async ($, on) => {
+  const jira = appBoard({ flavour: 'runner', sitesShape: 'wrapped' })
+  const setup = mount(
+    on,
+    webApp({ gh: { login: 'me', prs: [], collaborators: ['alice'] } }),
+    {
+      Tracker: 'jira',
+      'Jira project': ['  nope ', 'https://acme.atlassian.net/jira/software/c/projects/app/boards/133/backlog'],
+      'Jira mapping': 'Keep it',
+      QA: 'Yes, people test',
+      'QA where': 'On the PR',
+      'QA bot first': 'No',
+      'QA waiting': ['Waiting for QA', ' "In QA" '],
+      'QA signals': 'QA sometimes moves ticket to Done, sometimes approves or merges PR themselves. really depends.',
+      'QA pass': 'QA passed',
+      'QA approvers': ['@alice, bob', '@alice'],
+    },
+    beneath => mountJira(beneath, jira),
+  )
+
+  const done = await setUp($)
+
+  // No "Jira site" question: the "Atlassian MCP" server's one site was read from its wrapped list.
+  expect(setup.asked).toEqual([
+    'Merging', 'Approvals', 'Storage', 'Tracker', 'Jira project', 'Jira project', 'Jira mapping', 'Attribution',
+    'QA', 'QA where', 'QA bot first', 'QA waiting', 'QA waiting', 'QA signals', 'QA pass', 'QA approvers', 'QA approvers', 'Indicator',
+  ])
+  expect(setup.texts[5]).toContain('That answer could not be used: Jira has no project "NOPE"')
+  expect(setup.texts[12]).toContain('That answer could not be used: "Waiting for QA" is not a status on')
+  expect(setup.texts[16]).toContain('bob is not a collaborator on acme/app')
+  expect(sharedNote(setup.world).answers).toMatchObject({
+    jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90',
+    jiraProject: 'APP',
+    qaWaitStatus: 'In QA',
+    qaSignals: 'ticket-status,pr-approval,pr-merged',
+    qaApprovers: 'alice',
+  })
+  // The report quotes what the note holds on disk.
+  expect(done).toContain('Saved for the team: ')
+  expect(done).toContain('jiraProject "APP"')
+})
+
+test('messy Jira answers: with no site listed, a bare site name is saved as its address, and a lower-case key as the key', async ($, on) => {
+  const setup = mount(
+    on,
+    webApp(),
+    { Tracker: 'Jira', 'Jira site': ' Acme ', 'Jira project': 'app', 'Jira mapping': 'Keep it', QA: 'No', 'QA agent': 'Off' },
+    beneath => mountJira(beneath, appBoard({ sites: [] })),
+  )
+
+  await setUp($)
+
+  expect(setup.asked.slice(3, 7)).toEqual(['Tracker', 'Jira site', 'Jira project', 'Jira mapping'])
+  expect(sharedNote(setup.world).answers).toMatchObject({ jiraCloudId: 'acme.atlassian.net', jiraProject: 'APP' })
+})
+
+test('messy commands: a test command naming no script is asked again, and backticks and spaces are taken off', async ($, on) => {
+  const world = webApp()
+  world.files.set(`${REPO}/package.json`, packageJson({ dev: 'vite', unit: 'vitest run' }, { react: '18' }))
+  const setup = mount(on, world, { Tests: ['pnpm editor:test', ' `npm run  unit` '], QA: 'No' })
+
+  await setUp($)
+
+  expect(setup.asked.slice(0, 2)).toEqual(['Tests', 'Tests'])
+  expect(setup.texts[1]).toContain('`pnpm editor:test` runs `editor:test`, which is not a script in package.json')
+  expect(sharedNote(setup.world).answers.testCommand).toBe('npm run unit')
+})
+
+test('setup_finish refuses a setting it cannot use or that names no script, saying which and why, and saves nothing', async ($, on) => {
+  const setup = mount(on, webApp(), { QA: 'No' })
+  await godmode($)
+  await tool($, 'setup_questionnaire')
+  resultOf(await tool($, 'setup_write_preset'))
+
+  const unusable = await tool($, 'setup_finish', { answers: { branchPrefix: 'my prefix/' } })
+  const missing = await tool($, 'setup_finish', { answers: { lintCommand: 'npm run lint' } })
+
+  expect(unusable.deny).toContain('- branchPrefix: "my prefix/" is not a usable branch prefix')
+  expect(missing.deny).toContain('- lintCommand "npm run lint": `npm run lint` runs `lint`, which is not a script in package.json')
+  expect(setup.world.files.has(`${REPO}/.godmode/shared.json`)).toBe(false)
+})
+
+test('first setup on Jira: the setup agent learns the ticket rules from the board, and they join the conventions on finish', async ($, on) => {
+  const setup = mount(
+    on,
+    webApp(),
+    { Tracker: 'Jira', 'Jira project': 'APP (App)', 'Jira mapping': 'Keep it', QA: 'No', 'QA agent': 'Off', 'Ticket rules': ['Scan the board, then I confirm', 'Looks right', 'Save'] },
+    beneath => mountJira(beneath, appBoard()),
+  )
+  await godmode($)
+  await tool($, 'setup_questionnaire')
+
+  const learned = resultOf(await tool($, 'ticket_rules'))
+  resultOf(await tool($, 'setup_write_preset'))
+  const done = resultOf(await tool($, 'setup_finish'))
+
+  expect(learned).toContain('Saved docs/conventions/ticket-filing.md')
+  expect(setup.world.files.get(`${REPO}/docs/conventions/ticket-filing.md`)).toContain('- Task: 6 of 6.')
+  expect(sharedNote(setup.world).conventions.map(file => file.path)).toContain('docs/conventions/ticket-filing.md')
+  expect(done).toContain('ticketRules "docs/conventions/ticket-filing.md"')
 })

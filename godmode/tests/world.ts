@@ -13,8 +13,11 @@ export type Run = { argv: string[]; cwd?: string; stdin?: string }
 /** An open PR on the pretend GitHub. */
 export type GhPr = { number: number; title: string; branch: string; author: string; files: string[]; head: string; isDraft?: boolean }
 
-/** A pretend GitHub: `origin` points there, `gh` is signed in as `login`, and these PRs are open. */
-export type Gh = { login: string; prs: GhPr[] }
+/**
+ * A pretend GitHub: `origin` points there, `gh` is signed in as `login`, and these PRs are open.
+ * With `collaborators`, `gh` reads the repo as `acme/app` and answers who collaborates on it.
+ */
+export type Gh = { login: string; prs: GhPr[]; collaborators?: string[] }
 
 /**
  * A pretend disk and git repo, in memory. `mountWorld` answers the plugin's `$.fs`,
@@ -175,6 +178,11 @@ const github = (world: World, argv: readonly string[]): RunAnswer | undefined =>
     if (gh === undefined) return { exitCode: 1, stdout: '', stderr: 'not signed in' }
     if (argv[1] === 'auth') return { exitCode: 0, stdout: '' }
     if (argv[1] === 'api' && argv[2] === 'user') return { exitCode: 0, stdout: `${gh.login}\n` }
+    if (gh.collaborators !== undefined && argv[1] === 'repo' && argv[2] === 'view') return { exitCode: 0, stdout: 'acme/app\n' }
+    const collaborator = argv[1] === 'api' ? /^repos\/acme\/app\/collaborators\/(.+)$/.exec(argv[2] ?? '')?.[1] : undefined
+    if (gh.collaborators !== undefined && collaborator !== undefined) {
+      return gh.collaborators.includes(collaborator) ? { exitCode: 0, stdout: '' } : { exitCode: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' }
+    }
     if (argv[1] === 'pr' && argv[2] === 'list') return { exitCode: 0, stdout: ghList(gh) }
     if (argv[1] === 'pr' && argv[2] === 'view') {
       const pr = gh.prs.find(candidate => String(candidate.number) === argv[3])
@@ -284,7 +292,7 @@ export const draft = (overrides: Partial<NoteDraft> = {}): NoteDraft => ({
   sharedAnswers: { tracker: 'none', qa: true },
   minimumModels: { reviewer: 'opus' },
   conventions: ['AGENTS.md'],
-  personalAnswers: { permissions: 'free', attribution: false },
+  personalAnswers: { attribution: false },
   models: { dev: 'sonnet' },
   ...overrides,
 })

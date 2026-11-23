@@ -1,11 +1,13 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'claude-code'
 
 import type { GodmodeMode, SetupScope } from '../types'
 import { NO_GIT_LINE } from './host'
 import { indicatorOf, registerIndicator } from './indicator'
+import { answerIssueLines } from './answers'
 import {
   afterToolCall,
+  ALLOW_ONCE_TOOL,
   context7Refusal,
   decideToolCall,
   noteDevEnds,
@@ -14,6 +16,7 @@ import {
   recordAgent,
   recordDevDispatch,
   REVIEW_VERDICT_TOOL,
+  serveAllowOnce,
   serveQaVerdict,
   serveReviewVerdict,
   takePendingReviews,
@@ -23,10 +26,11 @@ import type { LoopCache } from './loop'
 import { changedConventions, godmodeVersionOf, projectOf, readNote } from './storage'
 import type { NoteLookup, Project } from './storage'
 import { qaCheckBlock } from './qa-check'
-import { pmReminder, pmRoleOf, qaModeLine } from './role'
+import { fableOutcome, isPmModel, PM_FALLBACK_MODEL, PM_MODEL, pmReminder, pmRoleOf, qaModeLine } from './role'
 import { godmodeReport, resumeOf, updateLineOf } from './report'
 import { beginChangeSetup, beginSetup, leaveChangeSetup, offerGitInit, serveSetupTool, SETUP_TOOLS, setupEditRefusal, takeSetupReport } from './setup'
 import type { SetupToolName } from './setup'
+import { serveTicketRules, TICKET_RULES_TOOL } from './ticket-rules'
 import { runTicketTool, TICKET_TOOLS, TicketError, ticketBackendOf } from './tickets'
 import type { TicketToolName } from './tickets'
 import { forgetStaleTry, startTry, stopTry, stopTryCommand } from './try'
@@ -44,6 +48,7 @@ const setupScope = atom({ plugin: 'godmode', key: 'setupScope' } as const, 'full
 const recheck = atom({ plugin: 'godmode', key: 'recheck' } as const, [] as string[])
 const mainThreadReads = atom({ plugin: 'godmode', key: 'mainThreadReads' } as const, 0)
 const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'mode' as 'mode' | 'hint' | 'band')
+const pmModel = atom({ plugin: 'godmode', key: 'pmModel' } as const, 'untried' as 'untried' | 'fable' | 'opus')
 
 /** How `/godmode` switches on: the mode, and what the setup or the PM picks up first. */
 type SwitchOnPlan = {
@@ -79,7 +84,9 @@ const switchOnPlan = async ($: EngineInterface, project: Project): Promise<Switc
   const { shared } = found
   const recheck = await changedConventions($, found.project, shared.conventions).catch(() => [])
   const current = await godmodeVersionOf($).catch(() => shared.godmodeVersion)
-  const line = updateLineOf(shared.godmodeVersion, current)
+  // A saved answer the rules repaired or cannot use is told at each switch-on, with what fixes it.
+  const flagged = answerIssueLines(found.repairs ?? [], found.issues ?? [])
+  const line = [updateLineOf(shared.godmodeVersion, current), ...flagged].filter(part => part !== undefined).join('\n') || undefined
   if (found.personal === undefined) return { mode: 'setup', setupScope: 'personal', recheck, line }
   return { mode: 'coding', setupScope: 'full', recheck, line, indicatorStyle: found.personal.answers.indicator, qaLine: qaModeLine(shared.answers) }
 }
@@ -91,7 +98,7 @@ const switchOnPlan = async ($: EngineInterface, project: Project): Promise<Switc
  */
 const registerTicketTools = async ($: EngineInterface) => {
   try {
-    for (const tool of [...TICKET_TOOLS, REVIEW_VERDICT_TOOL, QA_VERDICT_TOOL, ...SETUP_TOOLS]) await $.tool.register(tool)
+    for (const tool of [...TICKET_TOOLS, REVIEW_VERDICT_TOOL, QA_VERDICT_TOOL, ALLOW_ONCE_TOOL, TICKET_RULES_TOOL, ...SETUP_TOOLS]) await $.tool.register(tool)
     return undefined
   } catch (error) {
     return `godmode could not add its ticket tools (${error instanceof Error ? error.message : String(error)}).`
@@ -170,6 +177,42 @@ export const register: Register = on => {
   })
 
   // The app a try started stops with the session (D49).
+  /*
+   * The PM's main loop runs on Fable while godmode is on in coding or change-setup mode
+   * (D74); agents keep the model their dispatch gave them, and once godmode is off the
+   * person's own model applies again. The session's first Fable step is held until it
+   * ends: an error saying Fable is unavailable here, thrown or as a response with no
+   * message, sends the same request on Opus, and every later step goes to Opus straight
+   * away. Once Fable answered, steps stream as they come. Other errors pass as they are.
+   */
+  on('turn.step', async function* ($, e, next) {
+    const current = (await read($, isOn)) === true ? await read($, mode) : undefined
+    const isPm = e.agentId === undefined && (current === 'coding' || current === 'change-setup') && !isPmModel(e.model)
+    if (!isPm) return yield* next(e)
+    const known = await read($, pmModel)
+    if (known !== 'untried') return yield* next({ ...e, model: known === 'opus' ? PM_FALLBACK_MODEL : PM_MODEL })
+    const held: TurnStepChunk[] = []
+    let outcome: 'unavailable' | 'works' | 'unknown'
+    let result: TurnStepResult | undefined
+    try {
+      const stream = next({ ...e, model: PM_MODEL })
+      for await (const chunk of stream) held.push(chunk)
+      result = await stream.result
+      outcome = fableOutcome(result)
+    } catch (error) {
+      outcome = fableOutcome({ error: error instanceof Error ? error.message : String(error) })
+      if (outcome !== 'unavailable') throw error
+    }
+    if (outcome === 'unavailable' || result === undefined) {
+      await update($, pmModel, () => 'opus')
+      $.ui.log('Fable is unavailable here, so the PM runs on Opus.')
+      return yield* next({ ...e, model: PM_FALLBACK_MODEL })
+    }
+    if (outcome === 'works') await update($, pmModel, () => 'fable')
+    for (const chunk of held) yield chunk
+    return result
+  })
+
   on('session.end', async ($, e, next) => {
     await stopTry($, tries).catch(() => undefined)
     return next(e)
@@ -195,6 +238,12 @@ export const register: Register = on => {
   }))
   on('tool.call', { tool: 'mcp__godmode__qa_verdict' }, ($, e) => serveQaVerdict($, cache, e)).catch(() => ({
     deny: 'godmode\'s qa_verdict tool failed before it could record anything.',
+  }))
+  on('tool.call', { tool: 'mcp__godmode__ticket_rules' }, ($, e) => serveTicketRules($, e)).catch(() => ({
+    deny: 'godmode\'s ticket_rules tool failed before it could save anything.',
+  }))
+  on('tool.call', { tool: 'mcp__godmode__allow_once' }, ($, e) => serveAllowOnce($, e)).catch(() => ({
+    deny: 'godmode\'s allow_once tool failed before it could record anything.',
   }))
 
   /*

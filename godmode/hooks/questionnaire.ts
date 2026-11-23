@@ -15,13 +15,19 @@ import { trackerKindOf } from './tickets'
  * One choice: the label the person picks, and the answer it records. `onlyIf` says when
  * it applies, set only while an answer it depends on is still unknown (the PM's outline).
  */
-export type Choice = { label: string; value: Answer; onlyIf?: string }
+export type Choice = {
+  label: string
+  value: Answer
+  onlyIf?: string
+  /** On a multi-select, words in text typed under Other that mean this choice. */
+  words?: RegExp
+}
 
 /** Which half of the note an answer goes in (D61). */
 export type NoteHalf = 'shared' | 'personal'
 
 export type Question = {
-  /** The answer's key in the note, as the loop reads it (`permissions`, `tracker`, ...). */
+  /** The answer's key in the note, as the loop reads it (`autoMerge`, `tracker`, ...). */
   key: string
   /** The dialog's chip, 12 characters at most. */
   header: string
@@ -66,7 +72,7 @@ export const JIRA_KEYS: readonly string[] = ['jiraServer', 'jiraCloudId', 'jiraP
 
 /** The keys of the fixed questions; an extra question may not reuse one. */
 export const FIXED_KEYS: readonly string[] = [
-  'permissions',
+  'prApproval',
   'storage',
   'tracker',
   'attribution',
@@ -96,20 +102,35 @@ export const isGitHubHost = (facts: ScanFacts, answers: Readonly<Record<string, 
  * Answers that stay one person's (D61), even when the setup agent passes them. The Jira
  * server is one: each person's session names its Atlassian connector its own way.
  */
-export const PERSONAL_KEYS: readonly string[] = ['permissions', 'attribution', 'autoMerge', 'agentCap', 'fixRoundLimit', 'indicator', 'trackerAccount', 'jiraServer']
+export const PERSONAL_KEYS: readonly string[] = ['prApproval', 'attribution', 'autoMerge', 'agentCap', 'fixRoundLimit', 'indicator', 'trackerAccount', 'jiraServer']
 
-export const isPersonalKey = (key: string) => PERSONAL_KEYS.includes(key) || key.startsWith('permission.')
+export const isPersonalKey = (key: string) => PERSONAL_KEYS.includes(key)
 
-export const PERMISSIONS: Question = {
-  key: 'permissions',
-  header: 'Permissions',
+/**
+ * Merging, the headline of what godmode does alone (D53, D74): merge once review (and QA,
+ * where it runs) passed, or wait for the person's go. Every other write is free.
+ */
+export const AUTO_MERGE: Question = {
+  key: 'autoMerge',
+  header: 'Merging',
   question:
-    'What may godmode\'s agents do without asking you? Full freedom: everything, other people\'s PRs too. Free: commit, push, draft PRs, verdicts, ready and merge on your own PRs. Local only: edit and test; every git or PR write asks you. Locked: every write asks you.',
+    'godmode\'s agents commit, push, open draft PRs, comment and move tickets on their own. Merging is yours to control: once a PR passed review (and QA, where it runs), should godmode merge it, or wait for your go? With people testing the PR, it always waits.',
   choices: [
-    { label: 'Full freedom', value: 'full-freedom' },
-    { label: 'Free', value: 'free' },
-    { label: 'Local only', value: 'local-only' },
-    { label: 'Locked', value: 'locked' },
+    { label: 'Wait for my go', value: false },
+    { label: 'Merge when green', value: true },
+  ],
+  half: 'personal',
+}
+
+/** Approving a PR (D74): never unasked, or once review and QA passed. */
+export const APPROVAL: Question = {
+  key: 'prApproval',
+  header: 'Approvals',
+  question:
+    'Should godmode ever approve a PR? Never unasked: only when you ask for that PR. When it passed: godmode may approve once review (and QA, where it runs) passed.',
+  choices: [
+    { label: 'Never unasked', value: 'ask' },
+    { label: 'When it passed', value: 'when-passed' },
   ],
   half: 'personal',
 }
@@ -287,9 +308,11 @@ const unlessRuledOut = <T extends { onlyIf?: string }>(holds: boolean | undefine
  * Undefined when none applies.
  */
 const signalsQuestion = (facts: ScanFacts, answers: Readonly<Record<string, Answer>>): Question | undefined => {
+  const onGitHubPr = answers.qaMode === 'human-pr' ? prsOnGitHub(facts, answers) : false
   const offered: Choice[] = [
-    ...unlessRuledOut<Choice>(hasBoard(answers), { label: 'Ticket status', value: 'ticket-status' }, BOARD_ONLY),
-    ...unlessRuledOut<Choice>(answers.qaMode === 'human-pr' ? prsOnGitHub(facts, answers) : false, { label: 'PR approval', value: 'pr-approval' }, GITHUB_ONLY),
+    ...unlessRuledOut<Choice>(hasBoard(answers), { label: 'Ticket status', value: 'ticket-status', words: /status|done|move|column|board|transition/i }, BOARD_ONLY),
+    ...unlessRuledOut<Choice>(onGitHubPr, { label: 'PR approval', value: 'pr-approval', words: /approv/i }, GITHUB_ONLY),
+    ...unlessRuledOut<Choice>(onGitHubPr, { label: 'PR merged', value: 'pr-merged', words: /merg/i }, GITHUB_ONLY),
   ]
   if (offered.length === 0) return undefined
   // Every signal waiting on an unknown answer: the question itself applies only if one holds.
@@ -300,7 +323,7 @@ const signalsQuestion = (facts: ScanFacts, answers: Readonly<Record<string, Answ
     key: 'qaSignals',
     header: 'QA signals',
     question:
-      'Being told always counts as a QA result. Which other signals should godmode watch? Ticket status: a tester moves the ticket to the board\'s pass status. PR approval: named people or a team approve the PR.',
+      'Being told always counts as a QA result. Which other signals should godmode watch? Ticket status: a tester moves the ticket to the board\'s pass status. PR approval: named people or a team approve the PR. PR merged: someone merges the PR themselves while its ticket waits for QA.',
     choices: [...offered, { label: 'Only being told', value: '' }],
     half: 'shared',
     multiSelect: true,
@@ -347,10 +370,8 @@ const countQuestion = (key: 'fixRoundLimit' | 'agentCap', header: string, questi
   question: `${question} Pick one, or type another number under Other.`,
   choices: counts.map(count => ({ label: String(count), value: count })),
   half: 'personal',
-  freeText: text => {
-    const count = Number.parseInt(text.trim(), 10)
-    return Number.isFinite(count) && count >= 1 ? { [key]: count } : {}
-  },
+  // The answer rules read the count, and ask again with the reason when it is none.
+  freeText: text => ({ [key]: text.trim() }),
 })
 
 /** Fix rounds on one ticket before the PM stops and asks (D56); the loop's default is 3. */
@@ -358,19 +379,6 @@ export const FIX_ROUNDS = countQuestion('fixRoundLimit', 'Fix rounds', 'How many
 
 /** Agents running at once (D58); the loop's default is 5. */
 export const AGENT_CAP = countQuestion('agentCap', 'Agent cap', 'How many godmode agents may run at once? Without an answer it is 5.', [3, 5, 8])
-
-/** Arming auto-merge (D53), off unless the person turns it on. */
-export const AUTO_MERGE: Question = {
-  key: 'autoMerge',
-  header: 'Auto-merge',
-  question:
-    'May godmode arm auto-merge on your PRs once review (and QA, where it runs) passed? Off: a PR merges only when you say so. With people testing the PR, auto-merge stays refused either way.',
-  choices: [
-    { label: 'Off', value: false },
-    { label: 'On', value: true },
-  ],
-  half: 'personal',
-}
 
 /** A command the scan could not find: picked from the two plain answers, or typed under Other. */
 const commandQuestion = (key: 'testCommand' | 'startCommand', question: string, none: string): Question => ({
@@ -464,13 +472,13 @@ export const extraQuestion = (extra: ExtraQuestion): Question | string => {
 
 /**
  * Every question a setup asks, in order. `full`: the gaps, then the person's own choices
- * (D18, D19, D23, D15, D69, D68), the QA question bringing its follow-ups. `personal`, a
+ * (D74's merging and approval, D19, D23, D15, D69, D68), the QA question bringing its follow-ups. `personal`, a
  * teammate on a committed note (D61): only the personal ones, the team's answers being in
  * the note already.
  */
 export const questionsFor = (facts: ScanFacts, scope: SetupScope, extras: readonly Question[] = []): Question[] => {
-  if (scope === 'personal') return [PERMISSIONS, ATTRIBUTION, INDICATOR, ...extras.filter(question => question.half === 'personal')]
-  return [...gapQuestions(facts), ...extras, PERMISSIONS, STORAGE, TRACKER, ATTRIBUTION, qaQuestion(facts), INDICATOR]
+  if (scope === 'personal') return [AUTO_MERGE, APPROVAL, ATTRIBUTION, INDICATOR, ...extras.filter(question => question.half === 'personal')]
+  return [...gapQuestions(facts), ...extras, AUTO_MERGE, APPROVAL, STORAGE, TRACKER, ATTRIBUTION, qaQuestion(facts), INDICATOR]
 }
 
 // A label may carry a mark: `(default)` from the scan, `(current)` or `(suggested)` in a change-setup.
@@ -480,15 +488,34 @@ const choiceNamed = (question: Question, text: string) =>
   question.choices.find(candidate => candidate.label === text) ??
   question.choices.find(candidate => fold(candidate.label) === fold(text) || fold(String(candidate.value)) === fold(text))
 
-/** A multi-select answer: the dialog joins the picked labels with commas; each part names a choice, or is left out. */
+/** Whether an answer names one of the question's own choices, by label or by value (each part, on a multi-select). */
+export const namesChoice = (question: Question, raw: string | boolean | number) =>
+  (question.multiSelect === true ? String(raw).split(',') : [String(raw)]).every(part => choiceNamed(question, part.trim()) !== undefined)
+
+/** The choices whose words a part typed under Other holds, as a person describes them in a sentence. */
+const choicesWorded = (question: Question, part: string) => question.choices.filter(choice => choice.words?.test(part) === true)
+
+/**
+ * A multi-select answer: the dialog joins the picked labels with commas, and text typed under
+ * Other joins them too, commas and all. Each part names a choice, or else is read for the
+ * words of each choice; a part that holds neither is left out.
+ */
 const resolvePicks = (question: Question, text: string): { values: Record<string, Answer>; note?: string } => {
   const parts = text.split(',').map(part => part.trim()).filter(part => part !== '')
-  const picked = parts.map(part => choiceNamed(question, part))
-  const unknown = parts.filter((_part, index) => picked[index] === undefined)
-  const values = [...new Set(picked.flatMap(choice => (choice === undefined || choice.value === '' ? [] : [String(choice.value)])))]
+  const named = parts.map(part => choiceNamed(question, part))
+  const worded = parts.map((part, index) => (named[index] === undefined ? choicesWorded(question, part) : []))
+  const picked = [...named.flatMap(choice => choice ?? []), ...worded.flat()]
+  const unknown = parts.filter((_part, index) => named[index] === undefined && worded[index]?.length === 0)
+  const values = [...new Set(picked.flatMap(choice => (choice.value === '' ? [] : [String(choice.value)])))]
+  const read = parts.flatMap((part, index) => {
+    const choices = worded[index] ?? []
+    return choices.length === 0 ? [] : [`"${part}" was read as ${choices.map(choice => choice.label).join(' and ')}`]
+  })
+  const left = unknown.length === 0 ? [] : [`"${unknown.join(', ')}" named none of the choices for ${question.key}, so it was left out`]
+  const notes = [...read, ...left]
   const recorded = { values: { [question.key]: values.join(',') } }
-  if (unknown.length === 0) return recorded
-  return { ...recorded, note: `"${unknown.join(', ')}" named none of the choices for ${question.key}, so it was left out; change it with \`/godmode setup\`.` }
+  if (notes.length === 0) return recorded
+  return { ...recorded, note: `${notes.join('; ')}; change it with \`/godmode setup\`.` }
 }
 
 /**

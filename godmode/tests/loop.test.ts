@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { AgentInfo, AgentSpawnInput, On } from 'claude-code'
 
+import { fableOutcome } from '../hooks/role'
 import type { Answer, ModelTier, AgentRole } from '../hooks/storage'
 import { markdownBackend, otherBackend } from '../hooks/tickets'
 import { makeJira, mountJira, SERVER, sidePath } from './jira-world'
@@ -37,7 +38,7 @@ type Options = {
 const startLoop = async ($: Engine, on: On, options: Options = {}) => {
   const world = makeWorld({ gh: options.gh === null ? undefined : (options.gh ?? ghWith()) })
   const dir = await setUpProject(world, {
-    personalAnswers: { permissions: 'free', ...options.personal },
+    personalAnswers: { ...options.personal },
     sharedAnswers: { tracker: 'none', ...options.shared },
     minimumModels: options.minimumModels ?? {},
   })
@@ -129,96 +130,125 @@ const devAgent = async ($: Engine, loop: Loop, title = 'Report filters') => {
 const reviewer = async ($: Engine) => (await spawn($, 'godmode:reviewer', 'Review PR #12.')).agentId ?? ''
 
 // ---------------------------------------------------------------------------
-// Permissions (D18), asked directly (D66)
+// Free writes and the controlled actions (D74)
 
-test('Free: an agent commits and pushes alone, and force-pushing asks the person directly', async ($, on) => {
+const allowOnce = ($: Engine, action: string, target: string, agentId?: string) =>
+  call($, { tool: 'mcp__godmode__allow_once', action, target, ask: `please do ${action} on ${target}`, agentId })
+
+test('agents write freely: edits, commits, pushes, a draft PR and comments, a teammate\'s PR included, with no question', async ($, on) => {
   const loop = await startLoop($, on)
-
-  const pushed = await bash($, 'git commit -m "add filters" && git push', 'agent-x')
-  expect(pushed.deny).toBeUndefined()
-  expect(loop.asked).toEqual([])
-
-  const forced = await bash($, 'git push --force-with-lease', 'agent-x')
-  expect(forced.deny).toBeUndefined()
-  expect(loop.asked).toHaveLength(1)
-  expect(loop.asked[0]).toContain('force-push')
-  expect(loop.asked[0]).toContain('agent-x')
-  expect(loop.ran).toEqual(['Bash git commit -m "add filters" && git push', 'Bash git push --force-with-lease'])
-})
-
-test('an ask the person answers no is refused, and nothing runs', async ($, on) => {
-  const loop = await startLoop($, on)
-  loop.answer = 'Deny'
-
-  const answer = await bash($, 'git push --force', 'agent-x')
-
-  expect(answer.deny).toContain('The person said no')
-  expect(loop.ran).toEqual([])
-})
-
-test('an ask with nobody to answer is refused, saying why and what unblocks it', async ($, on) => {
-  const loop = await startLoop($, on)
-  loop.answer = undefined
-
-  const answer = await bash($, 'git push --force', 'agent-x')
-
-  expect(answer.deny).toContain('could not ask them')
-  expect(answer.deny).toContain('/godmode setup')
-  expect(loop.ran).toEqual([])
-})
-
-test('Local only: edits run alone, every git and PR write asks', async ($, on) => {
-  const loop = await startLoop($, on, { personal: { permissions: 'local-only' } })
 
   await edit($, `${REPO}/src/a.ts`, 'agent-x')
-  expect(loop.asked).toEqual([])
+  await bash($, 'git commit -m "add filters" && git push', 'agent-x')
+  await bash($, `${PR_CREATE} --draft --title "T-1"`, 'agent-x')
+  await bash($, 'gh pr comment 12 --body "fixed"', 'agent-x')
+  await bash($, 'gh pr comment 9 --body "conflicts with mine"', 'agent-x')
+  await bash($, 'gh pr review 9 --comment --body "one note"', 'agent-x')
+  await bash($, 'git branch -D godmode/t-1-old', 'agent-x')
 
-  await bash($, 'git commit -m "x"', 'agent-x')
-  await bash($, 'gh pr comment 12 --body "looks good"', 'agent-x')
-  expect(loop.asked).toHaveLength(2)
-  expect(loop.ran).toHaveLength(3)
+  expect(loop.asked).toEqual([])
+  expect(loop.ran).toHaveLength(7)
 })
 
-test('Locked: even a file edit asks', async ($, on) => {
+test('a controlled action is refused until the person\'s ask is recorded, then runs once on that target only', async ($, on) => {
+  const loop = await startLoop($, on)
+
+  const refused = await bash($, 'gh pr close 9', 'agent-x')
+  expect(refused.deny).toContain('controlled action: closing a PR (9)')
+  expect(refused.deny).toContain('ask for it explicitly and it goes through')
+  expect(refused.deny).toContain('allow_once (action: close-pr, target: 9)')
+
+  expect((await allowOnce($, 'close-pr', '#9')).deny).toBeUndefined()
+  expect((await bash($, 'gh pr close 12', 'agent-x')).deny).toContain('closing a PR (12)')
+  expect((await bash($, 'gh pr close 9', 'agent-x')).deny).toBeUndefined()
+  // One ask, one use.
+  expect((await bash($, 'gh pr close 9', 'agent-x')).deny).toContain('closing a PR (9)')
+  expect(loop.ran).toEqual(['Bash gh pr close 9'])
+  expect(loop.asked).toEqual([])
+})
+
+test('an agent cannot record an ask: only the main thread unlocks a controlled action', async ($, on) => {
+  const loop = await startLoop($, on)
+
+  const byAgent = await allowOnce($, 'approve-pr', '9', 'agent-x')
+  expect(byAgent.deny).toContain('Only the PM records the person\'s ask')
+
+  expect((await bash($, 'gh pr review 9 --approve', 'agent-x')).deny).toContain('approving a PR (9)')
+  expect(loop.ran).toEqual([])
+})
+
+test('deleting a branch godmode did not create, and force-pushing over a reviewed PR, are controlled; godmode\'s own unreviewed branch is free', async ($, on) => {
+  const loop = await startLoop($, on)
+
+  expect((await bash($, 'git push origin --delete deps', 'agent-x')).deny).toContain('deleting a branch godmode did not create (deps)')
+  expect((await bash($, 'git push --force-with-lease origin godmode/t-1-export-button', 'agent-x')).deny).toBeUndefined()
+
+  await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'change-request', agentId: await reviewer($) })
+  const forced = await bash($, 'git push --force-with-lease origin godmode/t-1-export-button', 'agent-x')
+  expect(forced.deny).toContain('force-pushing over a reviewed commit (godmode/t-1-export-button)')
+  expect(loop.ran).toEqual(['Bash git push --force-with-lease origin godmode/t-1-export-button'])
+})
+
+test('approving a PR is controlled by default; with approvals on once passed, the verdict gate holds it instead', async ($, on) => {
+  const loop = await startLoop($, on, { personal: { prApproval: 'when-passed' } })
+
+  const early = await bash($, 'gh pr review 12 --approve', 'agent-x')
+  expect(early.deny).toContain('approved')
+  expect(early.deny).not.toContain('controlled action')
+
+  await call($, { tool: 'mcp__godmode__review_verdict', pr: '12', verdict: 'clean', agentId: await reviewer($) })
+  expect((await bash($, 'gh pr review 12 --approve', 'agent-x')).deny).toBeUndefined()
+  expect(loop.ran).toEqual(['Bash gh pr review 12 --approve'])
+})
+
+/** A Jira project PROD where the person (`acc-me`) created PROD-5748 by hand and a colleague created PROD-12. */
+const prodBoard = (overrides: Parameters<typeof makeJira>[0] = {}) => {
+  const jira = makeJira({ projects: [{ key: 'PROD', name: 'Product' }], account: 'acc-me', ...overrides })
+  jira.issues.set('PROD-5748', { key: 'PROD-5748', summary: 'Mine', status: 'To Do', creator: 'acc-me' })
+  jira.issues.set('PROD-12', { key: 'PROD-12', summary: 'Sam\'s', status: 'To Do', creator: 'acc-sam' })
+  return jira
+}
+
+const ON_PROD = { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'PROD', qaMode: 'none' }
+
+const transition = ($: Engine, key: string) =>
+  call($, { tool: 'mcp__claude_ai_Atlassian__transitionJiraIssue', cloudId: 'acme.atlassian.net', issueIdOrKey: key, agentId: 'agent-x' })
+
+test('a Jira ticket the person created by hand moves freely; a colleague\'s is controlled until the person asks for it', async ($, on) => {
+  const jira = prodBoard()
+  const loop = await startLoop($, on, { shared: ON_PROD, personal: { jiraServer: SERVER }, beneath: below => mountJira(below, jira) })
+
+  expect((await transition($, 'prod-5748')).deny).toBeUndefined()
+  const refused = await transition($, 'PROD-12')
+  expect(refused.deny).toContain('moving or editing a ticket that is neither godmode\'s nor created by you (PROD-12: someone else created PROD-12)')
+  expect((await call($, { tool: 'mcp__godmode__ticket_move', id: 'PROD-12', status: 'doing' })).deny).toContain('(PROD-12: someone else created PROD-12)')
+
+  await allowOnce($, 'edit-ticket', 'PROD-12')
+  expect((await transition($, 'PROD-12')).deny).toBeUndefined()
+  expect(loop.ran).toEqual(['mcp__claude_ai_Atlassian__transitionJiraIssue', 'mcp__claude_ai_Atlassian__transitionJiraIssue'])
+  // The account and each creator are read once.
+  await transition($, 'PROD-5748')
+  expect(jira.calls.filter(found => found.tool === 'atlassianUserInfo')).toHaveLength(1)
+  expect(jira.calls.filter(found => found.tool === 'getJiraIssue' && found.args.issueIdOrKey === 'PROD-5748')).toHaveLength(1)
+})
+
+test('when the person\'s Atlassian account cannot be read, a ticket godmode did not file stays controlled, saying why', async ($, on) => {
+  const jira = prodBoard({ account: undefined })
+  const loop = await startLoop($, on, { shared: ON_PROD, personal: { jiraServer: SERVER }, beneath: below => mountJira(below, jira) })
+
+  const refused = await transition($, 'PROD-5748')
+
+  expect(refused.deny).toContain('godmode could not read your Atlassian account, so it cannot tell whether you created it')
+  expect(loop.ran).toEqual([])
+})
+
+test('a note\'s old permissions tier is ignored: even "locked" writes freely', async ($, on) => {
   const loop = await startLoop($, on, { personal: { permissions: 'locked' } })
 
-  await edit($, `${REPO}/src/a.ts`, 'agent-x')
-
-  expect(loop.asked).toHaveLength(1)
-  expect(loop.asked[0]).toContain('edit files')
-  expect(loop.asked[0]).toContain(`${REPO}/src/a.ts`)
-})
-
-test('Full freedom: force-pushing and others\' PRs need no question', async ($, on) => {
-  const loop = await startLoop($, on, { personal: { permissions: 'full-freedom' } })
-
-  await bash($, 'git push --force', 'agent-x')
-  await bash($, 'gh pr comment 9 --body "rebased on yours"', 'agent-x')
+  await bash($, 'git commit -m "x" && git push', 'agent-x')
 
   expect(loop.asked).toEqual([])
-  expect(loop.ran).toHaveLength(2)
-})
-
-test('Free acts alone on the person\'s own PR, and asks before touching a teammate\'s', async ($, on) => {
-  const loop = await startLoop($, on)
-
-  await bash($, 'gh pr comment 12 --body "fixed"', 'agent-x')
-  expect(loop.asked).toEqual([])
-
-  await bash($, 'gh pr comment 9 --body "conflicts with mine"', 'agent-x')
-  expect(loop.asked).toHaveLength(1)
-  expect(loop.asked[0]).toContain('someone else')
-})
-
-test('a "never" setting refuses without asking, and names the setting', async ($, on) => {
-  const loop = await startLoop($, on, { personal: { 'permission.push': 'never' } })
-
-  const answer = await bash($, 'git push', 'agent-x')
-
-  expect(answer.deny).toContain('never allows this')
-  expect(answer.deny).toContain('permission.push')
-  expect(loop.asked).toEqual([])
-  expect(loop.ran).toEqual([])
+  expect(loop.ran).toHaveLength(1)
 })
 
 test('godmode registers no permission check of its own: an "ask" never goes to Claude Code\'s decider (D66)', async ($, on) => {
@@ -288,7 +318,8 @@ test('the main thread\'s heavier work is refused, saying to dispatch a researche
     { tool: 'WebSearch', query: 'csv export' },
   ]) {
     const answer = await call($, input)
-    expect(answer.deny).toContain('Dispatch a researcher or a shell')
+    expect(answer.deny).toContain('Dispatch a researcher, a dev agent or a background shell')
+    expect(answer.deny).toContain('If the person asked for it, do it that way now')
     expect(answer.deny).toContain('/godmode setup')
   }
   expect(loop.ran).toEqual([])
@@ -780,8 +811,8 @@ test('a note from before the QA modes with qa: true gates as bot: the QA agent\'
   expect((await ticketOf(loop, id))?.status).toBe('review')
 })
 
-test('a merge behind gh\'s -R flag, a path, bash -c or the raw API meets the verdict gate, even in full freedom', async ($, on) => {
-  const loop = await startLoop($, on, { personal: { permissions: 'full-freedom' } })
+test('a merge behind gh\'s -R flag, a path, bash -c or the raw API meets the verdict gate, though writes are free', async ($, on) => {
+  const loop = await startLoop($, on)
 
   for (const command of ['gh pr -R acme/app merge 12', 'gh --repo acme/app pr merge 12', '/usr/bin/gh pr merge 12', 'bash -c "gh pr merge 12"', 'gh api -X PUT repos/acme/app/pulls/12/merge']) {
     expect([command, (await bash($, command, 'agent-x')).deny]).toEqual([command, expect.stringContaining('PR #12 has no review verdict')])
@@ -944,7 +975,7 @@ test('a dev agent\'s new draft PR leaves a ticket waiting in qa where it is', as
 
 test('a draft PR on a board with no review status keeps the PR link on the ticket, and the PM is told to move it by hand', async ($, on) => {
   const jira = makeJira()
-  const board = { tracker: 'jira', jiraCloudId: 'site-1', jiraProject: 'APP', jiraTodoStatus: 'To Do', jiraDoingStatus: 'In Progress', jiraDoneStatus: 'Done' }
+  const board = { tracker: 'jira', jiraCloudId: '0c5e2f7a-1d3b-4e8f-9a6c-2b7d4e1f3a90', jiraProject: 'APP', jiraTodoStatus: 'To Do', jiraDoingStatus: 'In Progress', jiraDoneStatus: 'Done' }
   const loop = await startLoop($, on, { shared: board, personal: { jiraServer: SERVER }, beneath: below => mountJira(below, jira) })
   jira.issues.set('APP-1', { key: 'APP-1', summary: 'Report filters', status: 'To Do' })
   loop.world.files.set(sidePath('APP-1'), JSON.stringify({ title: 'Report filters', status: 'todo', blockedBy: [], visibleChange: false, ready: true }))
@@ -1472,7 +1503,7 @@ test('godmode\'s context7 tools serve only while godmode is on in a set-up proje
 })
 
 test('godmode off: no loop rule applies', async ($, on) => {
-  const loop = await startLoop($, on, { personal: { permissions: 'locked', attribution: false } })
+  const loop = await startLoop($, on, { personal: { attribution: false } })
   await godmode($, 'off')
   loop.running = running(9)
 
@@ -1484,4 +1515,73 @@ test('godmode off: no loop rule applies', async ($, on) => {
   expect(loop.ran).toHaveLength(2)
   expect(started.deny).toBeUndefined()
   expect(loop.spawned[0]?.model).toBe('haiku')
+})
+
+// ---------------------------------------------------------------------------
+// The PM on Fable (D74)
+
+/** The model each step beneath the plugin was sent with; a step on a model `fails` names answers that error with no message. */
+const stepsBeneath = (models: string[], fails: Record<string, string> = {}, logs: string[] = []) => (below: On) => {
+  below('ui.log', (_$, e) => {
+    logs.push(e.text)
+    return { value: undefined } as never
+  })
+  below('turn.step', async function* (_$, e) {
+    models.push(e.model)
+    const error = fails[e.model]
+    if (error !== undefined) return { turnId: e.turnId, index: e.index, answer: error, toolUses: [], stopReason: null, usage: null }
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+}
+
+const step = async ($: Engine, model: string, agentId?: string) => {
+  const stream = $.turn.step({ turnId: 'turn-1', index: 0, model, messageCount: 1, ...(agentId === undefined ? {} : { agentId }) })
+  for await (const _chunk of stream) {
+    // drain the step
+  }
+}
+
+test('while godmode is on, the main loop runs on Fable; agents keep their model, and off gives the person theirs back', async ($, on) => {
+  const models: string[] = []
+  await startLoop($, on, { beneath: stepsBeneath(models) })
+
+  await step($, 'claude-opus-4-1')
+  await step($, 'claude-sonnet-4-5', 'agent-x')
+  await step($, 'claude-fable-5')
+  await godmode($, 'off')
+  await step($, 'claude-opus-4-1')
+
+  expect(models).toEqual(['fable', 'claude-sonnet-4-5', 'claude-fable-5', 'claude-opus-4-1'])
+})
+
+test('Fable unavailable here: the same request goes to Opus, later steps go straight there, and it is logged once', async ($, on) => {
+  const models: string[] = []
+  const logs: string[] = []
+  await startLoop($, on, { beneath: stepsBeneath(models, { fable: 'API Error: 404 {"type":"not_found_error","message":"model: fable"}' }, logs) })
+
+  await step($, 'claude-opus-4-1')
+  await step($, 'claude-opus-4-1')
+
+  expect(models).toEqual(['fable', 'opus', 'opus'])
+  expect(logs).toEqual(['Fable is unavailable here, so the PM runs on Opus.'])
+})
+
+test('an ordinary error on Fable (overload, network) never moves the PM off it', async ($, on) => {
+  const models: string[] = []
+  await startLoop($, on, { beneath: stepsBeneath(models, { fable: 'API Error: 529 overloaded_error' }) })
+
+  await step($, 'claude-opus-4-1')
+  await step($, 'claude-opus-4-1')
+
+  expect(models).toEqual(['fable', 'fable'])
+})
+
+test('which Fable outcomes mean the model is unavailable: a thrown or returned model error, never an ordinary one', () => {
+  expect(fableOutcome({ error: 'model_not_found: fable' })).toBe('unavailable')
+  expect(fableOutcome({ error: 'Your organization is not allowed to use this model (oauth_org_not_allowed)' })).toBe('unavailable')
+  expect(fableOutcome({ error: 'The model fable is not available on your plan' })).toBe('unavailable')
+  expect(fableOutcome({ error: 'fetch failed: ECONNRESET' })).toBe('unknown')
+  expect(fableOutcome({ error: 'rate_limit: too many requests' })).toBe('unknown')
+  expect(fableOutcome({ stopReason: 'end_turn', answer: 'ok' })).toBe('works')
+  expect(fableOutcome({ stopReason: null, answer: 'API Error: 500 server_error' })).toBe('unknown')
 })

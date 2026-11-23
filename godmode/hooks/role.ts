@@ -23,6 +23,37 @@ export const bodyOf = (text: string) => text.replace(/^---\r?\n[\s\S]*?\r?\n---\
  */
 export const expandRoot = (text: string, root: string) => text.split('${CLAUDE_PLUGIN_ROOT}').join(root.replace(/[\\/]+$/, ''))
 
+/**
+ * The model the PM's main loop runs on while godmode is on (D74): Fable, by the alias the
+ * engine takes in a `turn.step` rewrite. The agents it dispatches run on lighter tiers.
+ */
+export const PM_MODEL = 'fable'
+
+/** The PM's model when Fable is unavailable to this session (D74). */
+export const PM_FALLBACK_MODEL = 'opus'
+
+/**
+ * An API error that says the model itself cannot be used here (not found, not allowed, not
+ * on this plan). Overload, rate limits, network and server errors never match: those clear
+ * on their own and must not move the PM off Fable.
+ */
+const MODEL_UNAVAILABLE =
+  /model_not_found|oauth_org_not_allowed|not_found_error|\b(invalid|unknown|unsupported) model\b|\b(model|fable)\b[^\n]{0,80}\b(not (available|allowed|found|supported|enabled)|unavailable|does not exist|is not accessible|no access|not have access|access denied)/i
+
+/**
+ * What a Fable step's outcome says about Fable (D74): `unavailable` for an error naming the
+ * model as unusable, thrown or given as a response with no message; `works` once a response
+ * arrived; `unknown` for anything else (an ordinary error, no request made).
+ */
+export const fableOutcome = (outcome: { error: string } | { stopReason: string | null; answer: string }): 'unavailable' | 'works' | 'unknown' => {
+  if ('error' in outcome) return MODEL_UNAVAILABLE.test(outcome.error) ? 'unavailable' : 'unknown'
+  if (outcome.stopReason !== null) return 'works'
+  return MODEL_UNAVAILABLE.test(outcome.answer) ? 'unavailable' : 'unknown'
+}
+
+/** Whether a resolved model already is the PM's: an alias or a full id naming Fable. */
+export const isPmModel = (model: string) => /fable/i.test(model)
+
 /** The one line each prompt carries while godmode is on in coding mode, so the role survives compaction. */
 export const pmReminder = (root: string) =>
   `godmode is on: you are its PM. Keep this thread for talking, tickets and dispatch; agents do the work. If your role is no longer in view, read ${root.replace(/[\\/]+$/, '')}/agents/pm.md.`
@@ -65,8 +96,10 @@ export const qaModeOf = (answers: Readonly<Record<string, Answer>>): QaMode => {
  * The pass signals setup can add in the human modes (D70); being told always counts and
  * is not among them. `ticket-status`: the ticket moved to the board's pass status (Jira
  * or Other). `pr-approval`: an approval on the PR from the named people (GitHub, `human-pr`).
+ * `pr-merged`: someone merged the PR outside godmode while its ticket waited in qa (GitHub,
+ * `human-pr`), as testers who merge what they passed do.
  */
-export const QA_SIGNALS = ['ticket-status', 'pr-approval'] as const
+export const QA_SIGNALS = ['ticket-status', 'pr-approval', 'pr-merged'] as const
 
 export type QaSignal = (typeof QA_SIGNALS)[number]
 
@@ -81,11 +114,11 @@ const textOf = (value: Answer | undefined) => (typeof value === 'string' && valu
 /** How people test, in a human mode: the bot pass first (D71), the board's waiting status and the pass signals (D70). */
 const humanQaDetails = (answers: Readonly<Record<string, Answer>>) => {
   const waiting = textOf(answers.qaWaitStatus)
-  const signals = qaSignalsOf(answers).map(signal =>
-    signal === 'ticket-status'
-      ? `the ticket moved to "${textOf(answers.qaPassStatus) ?? 'no status named yet'}"`
-      : `a PR approval from ${textOf(answers.qaApprovers) ?? 'nobody named yet'}`,
-  )
+  const signals = qaSignalsOf(answers).map(signal => {
+    if (signal === 'ticket-status') return `the ticket moved to "${textOf(answers.qaPassStatus) ?? 'no status named yet'}"`
+    if (signal === 'pr-approval') return `a PR approval from ${textOf(answers.qaApprovers) ?? 'nobody named yet'}`
+    return 'the PR merged by someone outside godmode while its ticket waits in qa'
+  })
   return [
     `The QA agent tests first: ${answers.qaBotFirst === true ? 'yes' : 'no'}.`,
     ...(waiting === undefined ? [] : [`Waiting-for-QA status: "${waiting}".`]),

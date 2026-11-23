@@ -15,6 +15,7 @@ import {
   updateOfferLine,
   withSuggestion,
 } from './change-setup'
+import { answerIssueLines, checkAnswer, savedAnswers, topicOf } from './answers'
 import { indicatorOf } from './indicator'
 import { jiraSetup, personalJiraQuestions } from './jira'
 import {
@@ -23,6 +24,7 @@ import {
   isPersonalKey,
   JIRA_KEYS,
   mergeAnswers,
+  namesChoice,
   outline,
   QA_KEYS,
   questionsFor,
@@ -34,6 +36,7 @@ import type { ExtraQuestion, Question } from './questionnaire'
 import { qaModeLine, qaModeOf } from './role'
 import { COMMAND_KEYS, presetFoldersFor, scanProject } from './scan'
 import { trackerKindOf } from './tickets'
+import { verifyAnswer, verifyAnswers } from './verify'
 import {
   claudeDirOf,
   conventionsDirOf,
@@ -94,7 +97,7 @@ export const SETUP_TOOLS: readonly (ToolSpec & { name: SetupToolName })[] = [
   {
     name: 'setup_questionnaire',
     description:
-      'godmode setup, step 2: ask the person the setup questions, one multiple-choice dialog each: only the gaps the scan left, then permissions, storage, tracker, attribution, QA (with the follow-ups its answers lead to) and the on-indicator. Add a question only for a real gap the scan could not settle; never about reference repos. `given` holds answers the person already gave (relayed by the PM), which are not asked again. In change-setup mode (`/godmode setup`), pass `change`: only those topics are asked again, with the follow-ups they lead to, and nothing is saved until setup_finish.',
+      'godmode setup, step 2: ask the person the setup questions, one multiple-choice dialog each: only the gaps the scan left, then merging, approvals, storage, tracker, attribution, QA (with the follow-ups its answers lead to) and the on-indicator. Every answer, typed or given, is read through godmode\'s answer rules and checked against Jira, GitHub and package.json; one that does not hold is asked again with the reason. Add a question only for a real gap the scan could not settle; never about reference repos. `given` holds answers the person already gave (relayed by the PM), which are not asked again. In change-setup mode (`/godmode setup`), pass `change`: only those topics are asked again, with the follow-ups they lead to, and nothing is saved until setup_finish.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -112,7 +115,7 @@ export const SETUP_TOOLS: readonly (ToolSpec & { name: SetupToolName })[] = [
             required: ['key', 'question', 'options'],
           },
         },
-        given: { type: 'object', description: 'Answers the person already gave, by key (`permissions`, `storage`, `tracker`, `qaHuman`, `qaMode`, ...).' },
+        given: { type: 'object', description: 'Answers the person already gave, by key (`autoMerge`, `prApproval`, `storage`, `tracker`, `qaHuman`, `qaMode`, ...).' },
         change: { type: 'array', items: { type: 'string' }, description: `Change-setup mode only: what the person wants to change, as topics: ${TOPIC_HELP}.` },
       },
     },
@@ -300,30 +303,67 @@ async function askQuestion($: EngineInterface, question: Question) {
   }
 }
 
+/** How many times one question is asked when its answer cannot be used. */
+const ASK_TRIES = 3
+
+/** A question asked again, with why the last answer could not be used. */
+const askedAgain = (question: Question, problem: string): Question => ({ ...question, question: `That answer could not be used: ${problem}. ${question.question}` })
+
+/**
+ * One answer's values through the answer rules (A) and checked against the world (B): the
+ * values to keep, or the first problem. A value that names one of the question's choices
+ * was offered by godmode itself, so only a typed or given one is checked against the world.
+ */
+async function checkedValues($: EngineInterface, root: string, question: Question, raw: Answer, values: Readonly<Record<string, Answer>>, known: Readonly<Record<string, Answer>>) {
+  const kept: Record<string, Answer> = {}
+  for (const [key, value] of Object.entries(values)) {
+    const checked = checkAnswer(key, value)
+    if ('problem' in checked) return { problem: checked.problem }
+    kept[key] = checked.value
+  }
+  if (question.multiSelect === true || namesChoice(question, raw)) return { values: kept }
+  for (const [key, value] of Object.entries(kept)) {
+    const problem = await verifyAnswer($, root, key, value, { ...known, ...kept })
+    if (problem !== undefined) return { problem }
+  }
+  return { values: kept }
+}
+
 /**
  * Asks the questions in order, each answer's follow-ups right after it (D69), taking an
- * answer from `given` when the person gave it already. After the first question nobody
- * could answer, the rest are only collected, for the PM to relay. A Jira tracker brings its
- * own questions, read from the board, right after the tracker answer; the board's statuses
- * are then offered for the QA status questions too.
+ * answer from `given` when the person gave it already. Every answer passes the answer rules
+ * and the checks against the world; one that cannot be used is asked again with the reason,
+ * up to three times, then left out with a note, never saved as it was. After the first
+ * question nobody could answer, the rest are only collected, for the PM to relay. A Jira
+ * tracker brings its own questions, read from the board, right after the tracker answer; the
+ * board's statuses are then offered for the QA status questions too.
  */
-async function askAll($: EngineInterface, questions: readonly Question[], given: Readonly<Record<string, Answer>>, suggest = (question: Question) => question) {
+async function askAll($: EngineInterface, root: string, questions: readonly Question[], given: Readonly<Record<string, Answer>>, suggest = (question: Question) => question) {
   const answers: Record<string, Answer> = {}
   const notes: string[] = []
   const unasked: Question[] = []
   const queue = [...questions]
   let board: string[] = []
-  const askOne = async (asked: Question) => {
+  const askOne = async (asked: Question, known: Readonly<Record<string, Answer>> = {}) => {
     // A change-setup offers the note's answer first (D22); a setup asks the question as it is.
-    const question = suggest(asked)
-    const raw = given[question.key] ?? (unasked.length === 0 ? await askQuestion($, question) : undefined)
-    if (raw === undefined) {
-      unasked.push(question)
-      return undefined
+    let question = suggest(asked)
+    let raw: Answer | undefined = given[question.key] ?? (unasked.length === 0 ? await askQuestion($, question) : undefined)
+    for (let tries = 1; raw !== undefined; tries += 1) {
+      const resolved = resolveAnswer(question, raw)
+      const checked = await checkedValues($, root, question, raw, resolved.values, { ...given, ...answers, ...known })
+      if ('values' in checked) {
+        if (resolved.note !== undefined) notes.push(resolved.note)
+        return checked.values
+      }
+      if (tries >= ASK_TRIES) {
+        notes.push(`${question.key} is left unset: ${checked.problem}. \`/godmode setup\` asks it again.`)
+        return {}
+      }
+      question = askedAgain(suggest(asked), checked.problem)
+      raw = unasked.length === 0 ? await askQuestion($, question) : undefined
     }
-    const resolved = resolveAnswer(question, raw)
-    if (resolved.note !== undefined) notes.push(resolved.note)
-    return resolved.values
+    unasked.push(question)
+    return undefined
   }
   for (let question = queue.shift(); question !== undefined; question = queue.shift()) {
     const values = await askOne(withBoardStatuses(question, board))
@@ -346,14 +386,14 @@ export async function beginSetup($: EngineInterface, scope: SetupScope) {
   await update($, setupReport, () => '')
   const what =
     scope === 'personal'
-      ? 'This project\'s team setup is committed already, so only your own answers are missing (permissions, attribution, the on-indicator).'
+      ? 'This project\'s team setup is committed already, so only your own answers are missing (merging, approvals, attribution, the on-indicator).'
       : 'A setup agent scans the project, then asks you a few multiple-choice questions and sets up its conventions.'
   return {
     text: `godmode is setting up this project. ${what}`,
     context: [
       [
         `godmode is on in setup mode (scope: ${scope}). The project has no finished setup note yet, so the loop cannot start.`,
-        `Dispatch the setup now, in the background, without being asked: one Agent call with subagent_type \`godmode:setup\`, description "godmode setup", and the prompt "Set up godmode for this project. Scope: ${scope}." godmode runs it on Opus.`,
+        `Dispatch the setup now, in the background, without being asked: one Agent call with subagent_type \`godmode:setup\`, description "godmode setup", and the prompt "Set up godmode for this project. Scope: ${scope}." godmode runs it on Opus, its floor.`,
         'Do not scan, read or write anything for the setup yourself: the setup agent does it in its own context, and asks the person its questions through godmode\'s own dialog.',
         'When it reports, relay the outcome to the person in one or two lines. If it says it could not ask (a headless run, or a dismissed question), ask the person those questions here in plain words, then dispatch `godmode:setup` again with their answers in the prompt, to pass as `given`.',
       ].join('\n'),
@@ -430,7 +470,7 @@ export async function setupQuestionnaire($: EngineInterface, input: Record<strin
     const found = await readNote($, project).catch(() => undefined)
     if (found?.status === 'found' && trackerKindOf(found.shared.answers.tracker ?? '') === 'jira') extras.push(...(await personalJiraQuestions($)))
   }
-  const { answers, notes, unasked } = await askAll($, questionsFor(facts, scope, extras), answersIn(input.given, 'given'))
+  const { answers, notes, unasked } = await askAll($, project.root, questionsFor(facts, scope, extras), answersIn(input.given, 'given'))
   await saveRun($, current => ({ ...current, answers: mergeAnswers(current.answers ?? {}, answers) }))
   if (unasked.length > 0) {
     const lines = unasked.flatMap(question => outline(question, answers))
@@ -565,6 +605,45 @@ export const noteAnswers = (facts: ScanFacts, agent: Readonly<Record<string, Ans
   return { shared, personal }
 }
 
+/**
+ * Settings passed straight to `setup_finish` (`answers`), through the answer rules: a value
+ * that cannot be used refuses the finish with the reason, so nothing unusable is saved.
+ */
+const checkedSettings = (settings: Readonly<Record<string, Answer>>) => {
+  const kept: Record<string, Answer> = {}
+  const problems: string[] = []
+  for (const [key, value] of Object.entries(settings)) {
+    const checked = checkAnswer(key, value)
+    if ('problem' in checked) problems.push(`- ${key}: ${checked.problem}`)
+    else kept[key] = checked.value
+  }
+  if (problems.length > 0) throw new SetupError(['These settings cannot be used, so nothing was saved:', ...problems, 'Correct each one, or leave it out, and call setup_finish again.'].join('\n'))
+  return kept
+}
+
+/**
+ * The answers checked against the world before they are saved (B): a problem refuses the
+ * save, saying which answer and why, and how it is asked again; warnings go in the report.
+ */
+async function verifiedOrRefused($: EngineInterface, root: string, answers: Readonly<Record<string, Answer>>, again: string, keys?: ReadonlySet<string>) {
+  const { problems, warnings } = await verifyAnswers($, root, answers, keys)
+  if (problems.length === 0) return warnings
+  throw new SetupError(
+    ['These answers do not hold up, so nothing was saved:', ...problems.map(finding => `- ${finding.key} ${JSON.stringify(answers[finding.key])}: ${finding.problem}`), again].join('\n'),
+  )
+}
+
+/** The answers a note holds, as one line per half, for a report built from what was saved. */
+const savedLine = (label: string, answers: Readonly<Record<string, Answer>>) =>
+  `${label}: ${Object.entries(answers).map(([key, value]) => `${key} ${JSON.stringify(value)}`).join(', ') || 'none'}.`
+
+/** The note as saved, read back, so the report says what is on disk and not what was meant to be. */
+async function savedNote($: EngineInterface, project: Project) {
+  const found = await readNote($, project).catch(() => undefined)
+  if (found?.status !== 'found') throw new SetupError('godmode wrote the note but could not read it back. Run `/godmode` to check it.')
+  return found
+}
+
 /** Switches to coding mode after a setup, and leaves the PM its one report. */
 async function finishInto($: EngineInterface, report: string, personal: Readonly<Record<string, Answer>>, isChange = false) {
   // A change-setup re-checks no conventions, so the edits seen at switch-on stay listed.
@@ -584,16 +663,21 @@ export async function setupFinish($: EngineInterface, input: Record<string, unkn
   const project = await projectOf($)
   const facts = await factsOf($, project)
   const scope = await read($, setupScope)
-  const agentAnswers = answersIn(input.answers, 'answers')
+  const agentAnswers = checkedSettings(answersIn(input.answers, 'answers'))
   const { shared, personal } = noteAnswers(facts, agentAnswers, run.answers)
+  const again = 'Correct a setting you passed in `answers`, or leave it out; for a question\'s answer, call setup_questionnaire again with the other answers as `given` and that one left out, so the person is asked it again. Then call setup_finish again.'
+  const warnings = await verifiedOrRefused($, project.root, { ...shared, ...personal }, again)
 
   if (scope === 'personal') {
     const found = await readNote($, project)
     if (found.status !== 'found') throw new SetupError('The team\'s committed note is gone, so this is no longer a personal setup. Run `/godmode` again for a full setup.')
     const path = await writePersonalNote($, found.dir, personal)
+    const saved = await savedNote($, project)
     const report = [
-      `godmode: your personal setup is done (${notePath(project, path)}): permissions ${String(personal.permissions ?? 'unset')}. godmode is now in coding mode, and you are the PM.`,
+      `godmode: your personal setup is done (${notePath(project, path)}). godmode is now in coding mode, and you are the PM.`,
+      savedLine('Saved for you', saved.personal?.answers ?? {}),
       qaModeLine(found.shared.answers),
+      ...warnings,
     ].join('\n')
     await finishInto($, report, personal)
     return `${report}\nStop here and report this in one or two lines.`
@@ -627,15 +711,19 @@ export async function setupFinish($: EngineInterface, input: Record<string, unkn
     { storage: storage as StorageMode, sharedAnswers: shared, minimumModels: {}, conventions, personalAnswers: personal, models: {} },
     project,
   )
+  // The report quotes the note as read back from disk, so it never claims a value that was not saved.
+  const saved = await savedNote($, project)
   const report = [
     `godmode: setup is done. The note is in ${notePath(project, dir)} (${String(storage)} storage).`,
     `Conventions the loop follows: ${conventions.join(', ') || 'none'}.`,
-    `Tracker: ${String(shared.tracker ?? 'none')}; permissions: ${String(personal.permissions ?? 'unset')}; tests: ${String(shared.testCommand ?? 'none found')}.`,
-    qaModeLine(shared),
+    savedLine('Saved for the team', saved.shared.answers),
+    savedLine('Saved for you', saved.personal?.answers ?? {}),
+    qaModeLine(saved.shared.answers),
+    ...warnings,
     'godmode is now in coding mode, and you are the PM.',
   ].join('\n')
   await finishInto($, report, personal)
-  return `${report}\nStop here and report this to the PM in a few lines.`
+  return `${report}\nStop here and report this to the PM in a few lines, quoting the saved values above as they are.`
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +732,12 @@ export async function setupFinish($: EngineInterface, input: Record<string, unkn
 type FoundNote = Extract<NoteLookup, { status: 'found' }>
 
 const answersOfNote = (found: FoundNote) => ({ ...found.shared.answers, ...(found.personal?.answers ?? {}) })
+
+/** Each half of a note as it was saved, before the answer rules repaired or left out a value. */
+const savedHalves = (found: FoundNote) => ({
+  shared: savedAnswers(found.shared.answers, found.repairs ?? [], found.issues ?? [], 'shared'),
+  personal: savedAnswers(found.personal?.answers ?? {}, found.repairs ?? [], found.issues ?? [], 'personal'),
+})
 
 /** The note a change-setup changes; a refusal when there is none to change. */
 async function noteToChange($: EngineInterface, project: Project) {
@@ -672,7 +766,9 @@ export async function beginChangeSetup($: EngineInterface, found: NoteLookup | u
   const pending = pendingUpdates(noteVersion, version, answers)
   const lines = ['godmode is in change-setup mode: say what you want to change.', updateOfferLine(noteVersion, version, pending), toolsLine]
   const brief = changeSetupBrief({ noteVersion, version, storage: found.shared.storage, dir: notePath(found.project, found.dir), answers, pending })
-  return { text: lines.filter(line => line !== undefined).join('\n'), context: [brief] }
+  const flagged = answerIssueLines(found.repairs ?? [], found.issues ?? [])
+  const fix = flagged.length === 0 ? [] : [`${flagged.join(' ')} The \`check\` topic saves the repairs and asks again what cannot be used.`]
+  return { text: lines.filter(line => line !== undefined).join('\n'), context: [[brief, ...fix].join('\n')] }
 }
 
 /** Asks whether to answer the questions new since the note's version (D60); `unasked` when nobody could answer. */
@@ -730,18 +826,32 @@ async function changeQuestionnaire($: EngineInterface, input: Record<string, unk
   const noteVersion = found.shared.godmodeVersion
   const version = await godmodeVersionOf($)
   const pending = pendingUpdates(noteVersion, version, current)
-  let topics = requested
-  if (requested.includes('update') && pending.length > 0) {
+  const check = requested.includes('check') ? await checkNote($, project, found) : undefined
+  let topics = [...new Set([...requested.filter(topic => topic !== 'check'), ...(check?.topics ?? [])])]
+  if (check !== undefined && topics.length === 0) {
+    if (!check.isRepaired) return changeEndedUnsaved($, found, `the setup checks out: ${check.lines.join(' ') || 'every saved answer holds'}`)
+    await saveRun($, run => ({ ...run, change: { topics: [], dropped: [], answers: {}, isUpdate: false } }))
+    return [...check.lines, 'Nothing is saved yet. Call setup_finish: it shows the person the repaired values and saves them only on their yes.'].join('\n')
+  }
+  if (topics.includes('update') && pending.length > 0) {
     const offered = await offerUpdate($, noteVersion, version, pending.map(entry => entry.what))
     if (offered === 'unasked') {
       await endChangeSetup($, found, `godmode: the setup change ended, as nobody could answer whether to take the new questions. Nothing changed. ${BACK_TO_CODING}`)
       throw new SetupError(`godmode could not ask the person whether to answer the new questions (a headless run, or the question was dismissed). Nothing changed. ${BACK_TO_CODING} \`/godmode setup\` offers the new questions again.`)
     }
-    if (offered === 'no') topics = requested.filter(topic => topic !== 'update')
+    if (offered === 'no') topics = topics.filter(topic => topic !== 'update')
     if (topics.length === 0) return changeEndedUnsaved($, found, 'the person said not now to the new questions, so nothing changed. `/godmode setup` offers them again.')
   }
+  // The ticket-filing rules are learned through ticket_rules, which asks and saves on its own (D74).
+  const wantsTickets = topics.includes('tickets') || (topics.includes('update') && pending.some(entry => entry.topic === 'tickets'))
+  const others = pending.filter(entry => entry.topic !== 'tickets')
+  topics = topics.filter(topic => topic !== 'tickets')
   const isUpdate = topics.includes('update')
-  const plan = changePlan(await factsOf($, project), topics, current, pending.map(entry => entry.topic))
+  if (wantsTickets && topics.every(topic => topic === 'update') && others.length === 0) {
+    await saveRun($, run => ({ ...run, change: { topics: [], dropped: [], answers: {}, isUpdate } }))
+    return TICKETS_LINE
+  }
+  const plan = changePlan(await factsOf($, project), topics, current, others.map(entry => entry.topic))
   if (typeof plan === 'string') throw new SetupError(plan)
   if (plan.questions.length === 0) {
     if (!isOlderVersion(noteVersion, version)) return changeEndedUnsaved($, found, `this project's setup is up to date with godmode ${version}: nothing new to ask, and nothing changed.`)
@@ -750,7 +860,7 @@ async function changeQuestionnaire($: EngineInterface, input: Record<string, unk
   }
   const suggestions = suggestionsOf(current)
   const given = { ...plan.given, ...answersIn(input.given, 'given') }
-  const { answers, notes, unasked } = await askAll($, plan.questions, given, question => withSuggestion(question, suggestions))
+  const { answers, notes, unasked } = await askAll($, project.root, plan.questions, given, question => withSuggestion(question, suggestions))
   if (unasked.length > 0) {
     throw new SetupError(
       [
@@ -766,11 +876,40 @@ async function changeQuestionnaire($: EngineInterface, input: Record<string, unk
   await saveRun($, run => ({ ...run, change: { topics: plan.topics, dropped, answers, isUpdate } }))
   const shown = Object.entries(answers).map(([key, value]) => `- ${key}: ${JSON.stringify(value)}`)
   return [
+    ...(check?.lines ?? []),
     'The person answered:',
     ...shown,
     ...notes.map(note => `Note: ${note}`),
     'Nothing is saved yet. Call setup_finish: it shows the person every change and saves only on their yes.',
+    ...(wantsTickets ? [TICKETS_LINE] : []),
   ].join('\n')
+}
+
+/** What the PM is told for the `tickets` topic: ticket_rules asks the person and saves on their yes. */
+const TICKETS_LINE =
+  'For the ticket-filing rules, call mcp__godmode__ticket_rules with no arguments: it asks the person to scan the board and confirm, or to explain the flow, and saves the rules on their yes. Then call setup_finish to end the change.'
+
+/**
+ * `/godmode setup`'s `check` topic: the note's answers as the rules read them, then checked
+ * against the world. Resolves the topics to ask again (an answer the rules cannot use, or
+ * one that does not hold), whether the rules repaired any value (saved by setup_finish), and
+ * the lines that say so; a free setting that does not hold is for the PM to correct.
+ */
+async function checkNote($: EngineInterface, project: Project, found: FoundNote) {
+  const repairs = found.repairs ?? []
+  const issues = found.issues ?? []
+  const { problems, warnings } = await verifyAnswers($, project.root, answersOfNote(found))
+  const topicFor = (key: string) => topicOf(key)
+  const asked = [...issues.map(issue => ({ key: issue.key, problem: issue.problem })), ...problems]
+  const topics = [...new Set(asked.flatMap(entry => topicFor(entry.key) ?? []))]
+  const free = asked.filter(entry => topicFor(entry.key) === undefined)
+  const lines = [
+    ...answerIssueLines(repairs, []),
+    ...asked.filter(entry => topicFor(entry.key) !== undefined).map(entry => `${entry.key} does not hold (${entry.problem}): its question is asked again.`),
+    ...free.map(entry => `${entry.key} does not hold (${entry.problem}): pass the right value in setup_finish's \`answers\`, after asking the person if you do not know it.`),
+    ...warnings,
+  ]
+  return { topics, isRepaired: repairs.length > 0, lines }
 }
 
 /** The conventions entries with each named file's fingerprint taken again, or added; the rest kept as they were. */
@@ -809,7 +948,7 @@ const changeReport = (where: string, lines: readonly string[], before: Readonly<
 async function changeFinish($: EngineInterface, input: Record<string, unknown>) {
   const project = await projectOf($)
   const found = await noteToChange($, project)
-  const settings = answersIn(input.answers, 'answers')
+  const settings = checkedSettings(answersIn(input.answers, 'answers'))
   const owned = Object.keys(settings).filter(key => OWNED_KEYS.includes(key))
   if (owned.length > 0) {
     throw new SetupError(`${owned.map(key => `\`${key}\``).join(', ')} ${owned.length === 1 ? 'is' : 'are'} set by a question: call setup_questionnaire with its topic in \`change\` (${TOPIC_HELP}). Nothing was saved.`)
@@ -820,13 +959,23 @@ async function changeFinish($: EngineInterface, input: Record<string, unknown>) 
     return changeEndedUnsaved($, found, 'nothing to save: no change was asked (setup_questionnaire with `change`), and no `answers` or `conventions` were passed. `/godmode setup` starts a change again.')
   }
   const next = applyChange(found.shared.answers, found.personal?.answers ?? {}, change?.dropped ?? [], change?.answers ?? {}, settings)
-  const before = answersOfNote(found)
+  // Compared with the note as saved, so a value the answer rules repaired is shown and saved too.
+  const saved = savedHalves(found)
+  const before = { ...saved.shared, ...saved.personal }
   const after = { ...next.shared, ...next.personal }
+  const changedKeys = new Set(Object.keys({ ...before, ...after }).filter(key => before[key] !== after[key]))
+  const warnings = await verifiedOrRefused(
+    $,
+    project.root,
+    after,
+    'Ask the person again: call setup_questionnaire with the topic of each answer in `change`, or correct a setting you passed in `answers`. Then call setup_finish again.',
+    changedKeys,
+  )
   const noteVersion = found.shared.godmodeVersion
   const version = await godmodeVersionOf($)
   const still = pendingUpdates(noteVersion, version, after)
   const conventions = await recheckedConventions($, project, found.shared.conventions, edited)
-  const isSharedChanged = !sameAnswers(found.shared.answers, next.shared)
+  const isSharedChanged = !sameAnswers(saved.shared, next.shared)
   const isRestamped = (isSharedChanged || change?.isUpdate === true) && still.length === 0 && isOlderVersion(noteVersion, version)
   const rechecked = conventions.filter(file => !found.shared.conventions.some(old => old.path === file.path && old.fingerprint === file.fingerprint))
   const lines = [
@@ -851,8 +1000,8 @@ async function changeFinish($: EngineInterface, input: Record<string, unknown>) 
   if (isShared) {
     await writeSharedNote($, found.dir, { ...found.shared, godmodeVersion: isRestamped ? version : noteVersion, writtenAt, answers: next.shared, conventions })
   }
-  if (!sameAnswers(found.personal?.answers ?? {}, next.personal)) await writePersonalNote($, found.dir, next.personal, found.personal?.models ?? {})
-  const report = changeReport(notePath(project, found.dir), lines, before, after, still.map(entry => entry.what))
+  if (!sameAnswers(saved.personal, next.personal)) await writePersonalNote($, found.dir, next.personal, found.personal?.models ?? {})
+  const report = [changeReport(notePath(project, found.dir), lines, before, after, still.map(entry => entry.what)), ...warnings].join('\n')
   await endChangeSetup($, found, report, next.personal)
   return `${report}\nTell the person this in a line or two.`
 }

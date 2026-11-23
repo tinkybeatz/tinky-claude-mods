@@ -74,6 +74,19 @@ export type TicketDraft = {
   visibleChange: boolean
   /** The ticket this one fixes (D72); only the main thread sets it. */
   fixFor?: string
+  /** Jira's own fields, as the project's ticket-filing rules say (D74); other trackers ignore them. */
+  jira?: JiraFields
+}
+
+/** The Jira fields a ticket is filed with: its type, sprint, parent, labels, components, priority, and any other field by id or name. */
+export type JiraFields = {
+  issueType?: string
+  sprint?: string
+  parent?: string
+  labels?: string[]
+  components?: string[]
+  priority?: string
+  fields?: Record<string, unknown>
 }
 
 /** A change to a ticket's header; fields left out stay as they are. */
@@ -505,6 +518,20 @@ export const TICKET_TOOLS: readonly (ToolSpec & { name: TicketToolName })[] = [
         fixFor: text(
           'The ticket this one fixes, when people failed it on staging after its merge, e.g. T-3. Once this ticket records a QA pass, that one may move from qa to done without its own. Only the main thread sets it.',
         ),
+        jira: {
+          type: 'object',
+          description:
+            'Jira only: the fields the project\'s ticket-filing rules call for (read them with ticket_rules first). A field the issue type requires that is not given is refused with its name: ask the person for it rather than guess.',
+          properties: {
+            issueType: text('The issue type, e.g. Bug, Story, Task; the setup\'s default when left out.'),
+            sprint: text('Where it goes: "active", a sprint name or a sprint id. Left out, it goes to the backlog.'),
+            parent: text('The parent issue key, e.g. an epic or story for a sub-task.'),
+            labels: { type: 'array', items: { type: 'string' } },
+            components: { type: 'array', items: { type: 'string' } },
+            priority: text('The priority name, e.g. High.'),
+            fields: { type: 'object', description: 'Any other field, by its id (customfield_10100) or its name, with its value.' },
+          },
+        },
       },
       required: ['title', 'ask', 'visibleChange'],
     },
@@ -589,6 +616,31 @@ export type MoveCheck = (
 
 /** Who made a tool call: `agentId` is absent on the main thread, where the PM runs. */
 export type TicketCaller = { agentId?: string; checkMove?: MoveCheck }
+
+/** The `jira` object of a ticket_create call, checked; an unusable shape is refused. */
+const jiraFieldsOf = (value: unknown): { jira?: JiraFields } => {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) throw new TicketError('`jira` must be an object: issueType, sprint, parent, labels, components, priority, fields.')
+  const input = value as Record<string, unknown>
+  const strings = (key: string) => {
+    const list = input[key]
+    if (list === undefined) return undefined
+    if (!Array.isArray(list) || !list.every(item => typeof item === 'string')) throw new TicketError(`\`jira.${key}\` must be a list of text.`)
+    return list.map(item => item.trim()).filter(item => item !== '')
+  }
+  const fields = input.fields
+  if (fields !== undefined && (typeof fields !== 'object' || fields === null || Array.isArray(fields))) throw new TicketError('`jira.fields` must be an object of field ids or names and their values.')
+  const jira: JiraFields = {
+    issueType: stringField(input, 'issueType'),
+    sprint: stringField(input, 'sprint'),
+    parent: stringField(input, 'parent'),
+    labels: strings('labels'),
+    components: strings('components'),
+    priority: stringField(input, 'priority'),
+    ...(fields === undefined ? {} : { fields: fields as Record<string, unknown> }),
+  }
+  return { jira: Object.fromEntries(Object.entries(jira).filter(entry => entry[1] !== undefined)) as JiraFields }
+}
 
 const stringField = (input: Record<string, unknown>, key: string, isRequired = false) => {
   const value = input[key]
@@ -711,6 +763,7 @@ export const runTicketTool = async (
       blockedBy: listField(input, 'blockedBy'),
       visibleChange: booleanField(input, 'visibleChange', true) ?? false,
       fixFor: fixForField(input, caller),
+      ...jiraFieldsOf(input.jira),
     })
     return withMirror(backend, `Filed ${describeTicket(header)}`, `file a ticket titled "${header.title}" (godmode's ${header.id})`)
   }

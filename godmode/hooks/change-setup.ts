@@ -1,6 +1,7 @@
 import type { ScanFacts } from '../types'
 import {
   AGENT_CAP,
+  APPROVAL,
   ATTRIBUTION,
   AUTO_MERGE,
   FIX_ROUNDS,
@@ -9,7 +10,6 @@ import {
   INDICATOR,
   isPersonalKey,
   JIRA_KEYS,
-  PERMISSIONS,
   QA_KEYS,
   qaQuestion,
   TRACKER,
@@ -40,7 +40,6 @@ const TOPICS = {
       return question === undefined ? '`origin` is a GitHub godmode reaches, or there is no `origin`: there is no PR host to choose.' : [question]
     },
   },
-  permissions: { keys: ['permissions'], questions: () => [PERMISSIONS] },
   tracker: { keys: TRACKER_KEYS, questions: () => [TRACKER] },
   // The tracker question answered as Jira unasked, so only the Jira questions run again.
   jira: { keys: TRACKER_KEYS, questions: () => [TRACKER] },
@@ -48,6 +47,9 @@ const TOPICS = {
   qa: { keys: QA_KEYS, questions: facts => [qaQuestion(facts)] },
   indicator: { keys: ['indicator'], questions: () => [INDICATOR] },
   autoMerge: { keys: ['autoMerge'], questions: () => [AUTO_MERGE] },
+  prApproval: { keys: ['prApproval'], questions: () => [APPROVAL] },
+  // The ticket-filing rules are learned through the ticket_rules tool, not a question.
+  tickets: { keys: ['ticketRules'], questions: () => [] },
   agentCap: { keys: ['agentCap'], questions: () => [AGENT_CAP] },
   fixRoundLimit: { keys: ['fixRoundLimit'], questions: () => [FIX_ROUNDS] },
 } as const satisfies Record<string, Topic>
@@ -60,11 +62,11 @@ const TOPIC_ORDER = Object.keys(TOPICS) as ChangeTopic[]
 const isTopic = (name: string): name is ChangeTopic => TOPIC_ORDER.some(topic => topic === name)
 
 /** What `all` re-asks besides the scan's gaps: a full setup's own questions, storage aside. */
-const FULL_SETUP: readonly ChangeTopic[] = ['permissions', 'tracker', 'attribution', 'qa', 'indicator']
+const FULL_SETUP: readonly ChangeTopic[] = ['autoMerge', 'prApproval', 'tracker', 'attribution', 'qa', 'indicator']
 
 /** The topic names the PM may pass, for its brief and for a refusal. */
 export const TOPIC_HELP =
-  'permissions, attribution, indicator, autoMerge, agentCap, fixRoundLimit (the person\'s own); tracker, jira (the Jira questions again: server, site, project, statuses), qa (the QA mode and what it leads to), gitHost (the team\'s); all (every setup question but storage); update (only what is new since the note\'s godmode version)'
+  'autoMerge (merging), prApproval (approving PRs), tickets (the Jira ticket-filing rules, rescanned or explained, through ticket_rules), attribution, indicator, agentCap, fixRoundLimit (the person\'s own); tracker, jira (the Jira questions again: server, site, project, statuses), qa (the QA mode and what it leads to), gitHost (the team\'s); all (every setup question but storage); update (only what is new since the note\'s godmode version); check (checks every saved answer against Jira, GitHub and package.json, saves what godmode repaired, and asks again what does not hold)'
 
 /** The note's keys only a topic's questions may set: `setup_finish`'s free `answers` may not. */
 export const OWNED_KEYS: readonly string[] = [...new Set([...Object.values(TOPICS).flatMap(topic => topic.keys), ...UNRECORDED_KEYS])]
@@ -84,6 +86,18 @@ export const NEW_QUESTIONS: readonly NewQuestions[] = [
     topic: 'qa',
     what: 'the QA mode (whether people test on the PR or on staging, or the QA agent, or nobody, and how godmode learns the result)',
     isMissing: answers => answers.qaMode === undefined,
+  },
+  {
+    after: '0.6.0',
+    topic: 'prApproval',
+    what: 'whether godmode may approve a PR (never unasked, or once review and QA passed); the permission tiers are gone, and agents act freely on everything else',
+    isMissing: answers => answers.prApproval === undefined,
+  },
+  {
+    after: '0.6.0',
+    topic: 'tickets',
+    what: 'how your team files Jira tickets (godmode scans the board and you confirm, or you explain it), kept as ticket-filing.md',
+    isMissing: answers => answers.tracker === 'jira' && answers.ticketRules === undefined,
   },
 ]
 
