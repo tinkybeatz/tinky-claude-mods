@@ -233,8 +233,6 @@ declare module 'claude-code' {
       paneTickets: PaneTicket[]
       /** The side pane could not be placed (a narrow terminal), so the band shows that godmode is on. */
       paneFallback: boolean
-      /** The person closed the side pane by hand: it stays closed until godmode is next switched on. */
-      paneClosed: boolean
       /** Whether Fable answered the PM in this session: untried, it works, or the PM runs on Opus (D74). */
       pmModel: 'untried' | 'fable' | 'opus'
       /** The person's asks that unlock one controlled action each (D74). */

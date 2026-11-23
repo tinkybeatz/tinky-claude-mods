@@ -38,8 +38,12 @@ import { runTicketTool, TICKET_TOOLS, TicketError, ticketBackendOf } from './tic
 import type { TicketToolName } from './tickets'
 import { forgetStaleTry, startTry, stopTry, stopTryCommand } from './try'
 import { runReset } from './reset'
+import { isPersonPaneClose, noteSetupEnds, offWithoutNote, PANE_CLOSED, turnOff } from './off'
 import { closeGodmodePane, openGodmodePane, paneAction, paneReceived, paneSpawned, paneStep, refreshPaneTickets, registerPane, startPaneClock } from './pane'
 import type { TryHandles } from './try'
+
+/** The prompt that starts the PM's turn after a command that leaves it instructions; they are in the command's context. */
+export const KICK = 'godmode: act on the instructions above, as the PM.'
 
 const USAGE = 'Use `/godmode`, `/godmode setup`, `/godmode audit`, `/godmode off`, `/godmode report`, `/godmode try <ticket>` or `/godmode reset`.'
 
@@ -171,6 +175,88 @@ const noticeAudit = async ($: EngineInterface) => {
  */
 const PERSON_ORIGINS: readonly (string | undefined)[] = ['composer', 'bridge', 'sdk', undefined]
 
+/** What `/godmode <args>` answers: its line for the person, and `context` when the PM has to act on it. */
+async function godmodeCommand($: EngineInterface, cache: LoopCache, tries: TryHandles, args: string, signal: AbortSignal): Promise<{ text?: string; context?: string[] }> {
+  const [action = '', ...rest] = args.trim().split(/\s+/)
+  const ticket = rest.join(' ')
+  // The setup note may have changed: the loop reads it again on its next call.
+  cache.context = undefined
+
+  // Switching on is quiet (D46), and typed while on it changes nothing (D45), except to end a change-setup unsaved.
+  if (action === '') {
+    if ((await read($, isOn)) === true) {
+      if ((await read($, mode)) !== 'change-setup') return {}
+      const left = await leaveChangeSetup($)
+      const role = await pmRoleOf($)
+      return role === undefined ? { text: left } : { text: left, context: [role] }
+    }
+    let project = await gitProject($)
+    // No git (D54): offer `git init`, run only on a yes; otherwise godmode does not start.
+    if (project === undefined) {
+      const folder = await $.session.root()
+      if (!(await offerGitInit($, folder))) return { text: NO_GIT_LINE }
+      project = await gitProject($)
+      if (project === undefined) return { text: NO_GIT_LINE }
+    }
+    const plan = await switchOnPlan($, project)
+    await update($, setupScope, () => plan.setupScope)
+    await update($, recheck, () => plan.recheck)
+    await update($, indicator, () => indicatorOf(plan.indicatorStyle))
+    const toolsLine = await switchOn($, plan.mode)
+    // Setup mode (Step 3): the PM is told to dispatch the setup agent, so the main thread stays clean.
+    const setup = plan.mode === 'setup' ? await beginSetup($, plan.setupScope) : undefined
+    const lines = [plan.line, setup?.text, toolsLine].filter(line => line !== undefined)
+    if (setup !== undefined) return { text: lines.join('\n'), context: setup.context }
+    // Coding mode: the PM's role and the QA mode reach the main thread as hidden context, quietly (D46, D64).
+    // The one thing it shows is a line per ticket resumed (D57); tickets in qa are not resumed, and no QA result shows.
+    const resume = await resumeOf($, cache)
+    const shown = [plan.line, ...(resume?.lines ?? []), toolsLine].filter(line => line !== undefined)
+    const told = [await pmRoleOf($), plan.qaLine, resume?.context].filter(text => text !== undefined)
+    const context = told.length === 0 ? {} : { context: told }
+    return shown.length === 0 ? context : { text: shown.join('\n'), ...context }
+  }
+  if (action === 'setup') {
+    const project = await gitProject($)
+    if (project === undefined) return { text: NO_GIT_LINE }
+    const found = await readNote($, project).catch(() => undefined)
+    if (found?.status === 'found') await update($, indicator, () => indicatorOf(found.personal?.answers.indicator))
+    const toolsLine = await switchOn($, 'change-setup')
+    return beginChangeSetup($, found, toolsLine)
+  }
+  // Read-only until the person picks fixes (D75); in place, after `/reload-plugins` too.
+  if (action === 'audit') {
+    const project = await gitProject($)
+    if (project === undefined) return { text: NO_GIT_LINE }
+    const found = await readNote($, project).catch(() => undefined)
+    if (found?.status !== 'found') return { text: 'godmode is not set up in this project yet, so there is nothing to audit: `/godmode` runs the setup.' }
+    return runAudit($, found, async () => {
+      await update($, indicator, () => indicatorOf(found.personal?.answers.indicator))
+      return switchOn($, 'change-setup')
+    })
+  }
+  // The person's own command: it lists every trace first and wipes only on their "Wipe" (0.8.2).
+  if (action === 'reset') {
+    const project = await gitProject($)
+    if (project === undefined) return { text: 'godmode has nothing to wipe here: this folder is not a git repository, so godmode never set it up.' }
+    const isTrying = tries.live !== undefined
+    const text = await runReset($, project, isTrying, () => stopTry($, tries))
+    cache.context = undefined
+    return { text }
+  }
+  if (action === 'off') {
+    if (!(await turnOff($))) return { text: 'godmode is already off.' }
+    return { text: 'godmode is off: plain Claude Code for the rest of the session.' }
+  }
+  // Read-only, on or off (D44, D70).
+  if (action === 'report') return { text: await godmodeReport($, cache) }
+  if (action === 'try') {
+    if (ticket === '') return { text: 'Name a ticket: `/godmode try <ticket>`, or `/godmode try stop`.' }
+    if (ticket === 'stop') return { text: await stopTryCommand($, tries) }
+    return { text: await startTry($, cache, tries, ticket, signal) }
+  }
+  return { text: `Unknown \`/godmode ${action}\`. ${USAGE}` }
+}
+
 export const register: Register = on => {
   // The note's settings and the open PRs, kept between calls for this load of the module.
   const cache: LoopCache = {}
@@ -180,6 +266,12 @@ export const register: Register = on => {
   // The "godmode is on" indicator (D68), drawn by `indicator.tsx`, and the side pane, by `pane.tsx`.
   registerIndicator(on)
   registerPane(on)
+
+  // The person's own close of the side pane is "godmode off" (0.8.3); godmode's own close at `/godmode off` is a plugin close, and passes.
+  on('ui.close', async ($, e, next) => {
+    if (isPersonPaneClose(e)) await turnOff($, PANE_CLOSED)
+    return next(e)
+  })
 
   // The PM is the main thread, never a dispatched agent: its type stays off the model's list.
   on('agent.offer', { agent: 'godmode:pm' }, () => ({ isOffered: false }))
@@ -325,12 +417,16 @@ export const register: Register = on => {
     if (e.agentId === undefined && (await read($, isOn)) === true) await noteDevEnds($, cache, e.text).catch(() => undefined)
     // A finished agent or shell's notice ends its row on the side pane, a subagent's included.
     await paneReceived($, e.text).catch(() => undefined)
+    // The setup agent ending before setup_finish saved: setup did not finish, so godmode turns off.
+    if (e.agentId === undefined) await noteSetupEnds($, e.text).catch(() => undefined)
     return next(e)
   }).catch(($, e, next) => next(e))
 
   // The PM hears about each new draft PR, and each ticket waiting on QA, on its next prompt, a person's or a task notification (D35, D64, D73).
   on('prompt.submit', async ($, e, next) => {
     if ((await read($, isOn)) !== true) return next(e)
+    // godmode never stays on where its tools cannot work: its note gone, it turns off and injects nothing.
+    if (await offWithoutNote($)) return next(e)
     if (PERSON_ORIGINS.includes((e.origin as typeof e.origin | undefined)?.kind)) {
       await update($, mainThreadReads, () => 0)
       // An ask to work on this thread holds for one message of the person's (D78).
@@ -342,7 +438,10 @@ export const register: Register = on => {
     // A setup that just finished hands the main thread its PM role; after that, a one-line reminder (D64).
     const role = report === undefined ? undefined : await pmRoleOf($)
     const isCoding = (await read($, mode)) === 'coding'
-    const reminder = isCoding && role === undefined ? pmReminder($.plugin.root) : undefined
+    // godmode's own prompt follows a command whose context holds the role and its instructions: nothing again.
+    const origin = e.origin as typeof e.origin | undefined
+    const isKick = origin?.kind === 'plugin' && origin.name === 'godmode' && e.text === KICK
+    const reminder = isCoding && role === undefined && !isKick ? pmReminder($.plugin.root) : undefined
     // The tickets waiting on QA, read from the ticket store on each prompt, never from memory (D73).
     const qa = isCoding ? await qaCheckBlock($, cache) : undefined
     const review = isCoding ? await codeReviewBlock($, cache) : undefined
@@ -352,85 +451,12 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'godmode' }, async ($, e, next) => {
-    const [action = '', ...rest] = e.args.trim().split(/\s+/)
-    const ticket = rest.join(' ')
-    // The setup note may have changed: the loop reads it again on its next call.
-    cache.context = undefined
-
-    // Switching on is quiet (D46), and typed while on it changes nothing (D45), except to end a change-setup unsaved.
-    if (action === '') {
-      if ((await read($, isOn)) === true) {
-        if ((await read($, mode)) !== 'change-setup') return {}
-        const left = await leaveChangeSetup($)
-        const role = await pmRoleOf($)
-        return role === undefined ? { text: left } : { text: left, context: [role] }
-      }
-      let project = await gitProject($)
-      // No git (D54): offer `git init`, run only on a yes; otherwise godmode does not start.
-      if (project === undefined) {
-        const folder = await $.session.root()
-        if (!(await offerGitInit($, folder))) return { text: NO_GIT_LINE }
-        project = await gitProject($)
-        if (project === undefined) return { text: NO_GIT_LINE }
-      }
-      const plan = await switchOnPlan($, project)
-      await update($, setupScope, () => plan.setupScope)
-      await update($, recheck, () => plan.recheck)
-      await update($, indicator, () => indicatorOf(plan.indicatorStyle))
-      const toolsLine = await switchOn($, plan.mode)
-      // Setup mode (Step 3): the PM is told to dispatch the setup agent, so the main thread stays clean.
-      const setup = plan.mode === 'setup' ? await beginSetup($, plan.setupScope) : undefined
-      const lines = [plan.line, setup?.text, toolsLine].filter(line => line !== undefined)
-      if (setup !== undefined) return { text: lines.join('\n'), context: setup.context }
-      // Coding mode: the PM's role and the QA mode reach the main thread as hidden context, quietly (D46, D64).
-      // The one thing it shows is a line per ticket resumed (D57); tickets in qa are not resumed, and no QA result shows.
-      const resume = await resumeOf($, cache)
-      const shown = [plan.line, ...(resume?.lines ?? []), toolsLine].filter(line => line !== undefined)
-      const told = [await pmRoleOf($), plan.qaLine, resume?.context].filter(text => text !== undefined)
-      const context = told.length === 0 ? {} : { context: told }
-      return shown.length === 0 ? context : { text: shown.join('\n'), ...context }
-    }
-    if (action === 'setup') {
-      const project = await gitProject($)
-      if (project === undefined) return { text: NO_GIT_LINE }
-      const found = await readNote($, project).catch(() => undefined)
-      if (found?.status === 'found') await update($, indicator, () => indicatorOf(found.personal?.answers.indicator))
-      const toolsLine = await switchOn($, 'change-setup')
-      return beginChangeSetup($, found, toolsLine)
-    }
-    // Read-only until the person picks fixes (D75); in place, after `/reload-plugins` too.
-    if (action === 'audit') {
-      const project = await gitProject($)
-      if (project === undefined) return { text: NO_GIT_LINE }
-      const found = await readNote($, project).catch(() => undefined)
-      if (found?.status !== 'found') return { text: 'godmode is not set up in this project yet, so there is nothing to audit: `/godmode` runs the setup.' }
-      return runAudit($, found, async () => {
-        await update($, indicator, () => indicatorOf(found.personal?.answers.indicator))
-        return switchOn($, 'change-setup')
-      })
-    }
-    // The person's own command: it lists every trace first and wipes only on their "Wipe" (0.8.2).
-    if (action === 'reset') {
-      const project = await gitProject($)
-      if (project === undefined) return { text: 'godmode has nothing to wipe here: this folder is not a git repository, so godmode never set it up.' }
-      const isTrying = tries.live !== undefined
-      const text = await runReset($, project, isTrying, () => stopTry($, tries))
-      cache.context = undefined
-      return { text }
-    }
-    if (action === 'off') {
-      if ((await read($, isOn)) !== true) return { text: 'godmode is already off.' }
-      await update($, isOn, () => false)
-      await closeGodmodePane($).catch(() => undefined)
-      return { text: 'godmode is off: plain Claude Code for the rest of the session.' }
-    }
-    // Read-only, on or off (D44, D70).
-    if (action === 'report') return { text: await godmodeReport($, cache) }
-    if (action === 'try') {
-      if (ticket === '') return { text: 'Name a ticket: `/godmode try <ticket>`, or `/godmode try stop`.' }
-      if (ticket === 'stop') return { text: await stopTryCommand($, tries) }
-      return { text: await startTry($, cache, tries, ticket, next.signal) }
-    }
-    return { text: `Unknown \`/godmode ${action}\`. ${USAGE}` }
+    const answer = await godmodeCommand($, cache, tries, e.args, next.signal)
+    // A command whose answer carries instructions for the PM starts the PM's turn (0.8.3): one
+    // short prompt, queued until the session is idle, so the PM acts without waiting for the
+    // person's next message. The instructions themselves are the answer's hidden context.
+    // `$.prompt.submit` may not be called from the command's own hook, which holds its turn: a timer runs it right after.
+    if ((answer.context ?? []).length > 0) $.clock.after(0, () => void $.prompt.submit({ text: KICK }).catch(() => undefined))
+    return answer
   })
 }

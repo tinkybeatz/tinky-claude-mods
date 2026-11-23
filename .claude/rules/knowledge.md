@@ -415,3 +415,7 @@ Learned while building `godmode` 0.8.0 (D78: the project's rules, and the side p
   `$.session.start` needs `on('session.start', (_$, e) => e)` beneath.
 - **The "Atlassian MCP" server answers `atlassianUserInfo` as `{ data: { accountId } }`**
   (checked live, read-only, 2026-11-23); the other shape is `{ account_id, name }`.
+- **`$.prompt.submit` is refused from a `command.run` hook** ("it would wait on the turn this
+  hook is holding; submit from a later event"), in tests too. godmode 0.8.3 sends the PM's
+  starting prompt from `$.clock.after(0, ...)` right after the command; a test advances the
+  mocked clock by 1 to see it. The instructions ride in the command's `context`.

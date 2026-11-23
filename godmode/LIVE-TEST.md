@@ -22,10 +22,18 @@ claude --plugin-dir ~/tinky-claude-mods/godmode --debug
 ```
 
 If the folder was cloned earlier, run `git -C ~/tinky-claude-mods pull` first. Then type
-`/godmode` in the project.
+`/godmode` in the project. Send nothing else: the PM starts on its own.
 
 ## What to report back
 
+- [ ] 0a. Abandon a setup three ways, one per run: dismiss a setup question, stop the
+  setup agent, and dismiss the final "Save these settings" question. Each time, did
+  godmode turn off at once with "Setup didn't finish, so godmode is off", the pane gone,
+  and your next message free of godmode's role and checks?
+- [ ] 0. Right after `/godmode`, `/godmode setup` and an `/godmode audit` that found
+  something, did the PM start working on its own, once, with no message from you? Did
+  `/godmode off`, `report`, `try` and `reset`, and a second `/godmode` while on, start no
+  turn?
 - [ ] 1. Setup dialogs: did the setup questions pop up as dialogs you could answer, or
   did the main thread ask them in chat? Were the first two "Alone / With others" and
   "Careful / Not careful", with nothing asked before them?
@@ -55,7 +63,9 @@ If the folder was cloned earlier, run `git -C ~/tinky-claude-mods pull` first. T
     `/godmode try` with its link, then the Active and Finished tabs with each agent named
     by its role and ticket, and the usage bars?
   - [ ] 8c. Narrow window (under 144 columns): does the band show instead? Close the
-    pane by hand: does the band stand in until the next `/godmode`?
+    pane by hand: does godmode turn off, saying "godmode is off (side pane closed)", with
+    no band and no godmode text on your next message? Try it in setup and in
+    `/godmode setup` too: nothing should be saved.
   - [ ] 8d. `/godmode off`: does the pane close?
   - [ ] 8e. With the dispatch panel plugin on too: do both panes show, each with its own
     content, and does closing one leave the other alone?

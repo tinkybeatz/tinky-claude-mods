@@ -25,6 +25,23 @@ proven first on a repo set up by hand.
 
 ## Status (2026-11-16)
 
+- 0.8.3 (2026-11-23), the PM starts on its own: a `/godmode` command whose answer leaves the
+  PM instructions (switch-on into setup, coding or change-setup, `/godmode setup`, an
+  `/godmode audit` with findings, leaving a change-setup) starts the PM's turn with one short
+  prompt, sent from a timer right after the command, since the engine refuses
+  `$.prompt.submit` from the command's own hook. The instructions stay in the command's
+  hidden context, and the prompt hook adds no role reminder to that prompt, so nothing is
+  said twice. A command with nothing for the PM (`off`, `report`, `try`, `reset`, `/godmode`
+  while on) starts no turn. godmode never stays on where its tools cannot work: a setup
+  that does not finish (a question dismissed, the summary's confirm dismissed, the setup
+  agent ending or stopped before `setup_finish` saved) turns it off at once, saying
+  "Setup didn't finish, so godmode is off"; so does coding or change-setup mode whose note
+  is gone (at the next prompt). Off, it injects no role, instructions or per-prompt check,
+  and the pane and indicator go. The person's own close of the side pane (a `ui.close`
+  with origin `person`; godmode's own close is origin `plugin`) is "godmode off" too,
+  ending a change unsaved; the band stands in only for a pane the terminal cannot place.
+  The relay of unanswered setup questions through the PM is gone with it: answers the
+  person already gave still pass as `given`.
 - 0.8.2 (2026-11-23), `/godmode reset`: the person's command that lists every trace godmode
   left in the current project (the setup note and godmode's folders in every storage mode,
   the tracker's side files, the files setup wrote, its `.gitignore` and `.git/info/exclude`

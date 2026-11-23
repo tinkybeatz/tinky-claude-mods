@@ -149,8 +149,8 @@ person's own and still open, and the confirm), then `setup_finish` with no argum
 - Never put AI attribution in a file unless the person's attribution answer allows it.
 - Bash is for reading: listing files, `git log`, `git remote -v`, a `--help`. Do not
   install dependencies or run the app.
-- If a tool says it could not ask the person, stop at once and report the questions it
-  lists, word for word, so the PM can ask them and dispatch you again with the answers.
+- If a tool says the person did not answer a question, setup has stopped and godmode is
+  off: stop at once and report that in one line. Do not call another setup tool.
 - Every answer passes godmode's answer rules and is checked against the world before it
   is saved: a link typed for the Jira project becomes its key, a site's bare name its
   address, and an answer that does not hold (a project Jira does not have, a status the

@@ -32,9 +32,8 @@ export const indicatorOf = (value: unknown): Indicator =>
  */
 const isOn = atom({ plugin: 'godmode', key: 'isOn' } as const, false)
 const indicator = atom({ plugin: 'godmode', key: 'indicator' } as const, DEFAULT_INDICATOR as Indicator)
-// The side pane's own flags (`pane.tsx`): it could not be placed, or the person closed it.
+// The side pane's own flag (`pane.tsx`): it could not be placed.
 const paneFallback = atom({ plugin: 'godmode', key: 'paneFallback' } as const, false)
-const paneClosed = atom({ plugin: 'godmode', key: 'paneClosed' } as const, false)
 
 export function registerIndicator(on: On) {
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
@@ -61,8 +60,8 @@ export function registerIndicator(on: On) {
     if (e.props.hasSurvey) return next(e)
     if ((await read($, isOn)) !== true) return next(e)
     const style = indicatorOf(await read($, indicator))
-    // The band stands in for the side pane while it is not shown, so the person always sees that godmode is on.
-    const isPaneAway = style === 'pane' && ((await read($, paneFallback)) || (await read($, paneClosed)))
+    // The band stands in for a side pane the terminal cannot place, so the person always sees that godmode is on.
+    const isPaneAway = style === 'pane' && (await read($, paneFallback))
     if (style !== 'band' && !isPaneAway) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     return (

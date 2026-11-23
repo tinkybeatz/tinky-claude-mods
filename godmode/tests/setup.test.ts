@@ -566,18 +566,19 @@ test('setup asks only the gaps, never reference repos, and skips what the person
   expect(answers).toContain('- e2eCommand: ""')
 })
 
-test('setup that cannot ask stops, saying which questions are left for the PM to relay', async ($, on) => {
+test('a dismissed setup question ends the setup: godmode turns off, says so once, writes nothing, and injects nothing after', async ($, on) => {
   const setup = mount(on, webApp(), { Storage: null })
   await godmode($)
 
   const stopped = await tool($, 'setup_questionnaire')
 
-  expect(stopped.deny).toContain('could not ask the person')
-  expect(stopped.deny).toContain('- storage:')
-  expect(stopped.deny).toContain('- tracker:')
-  expect(stopped.deny).toContain('- attribution:')
-  expect(stopped.deny).not.toContain('- care:')
+  expect(stopped.deny).toContain('setup stopped and godmode is off')
   expect(setup.asked).toEqual(['Who', 'Care', 'Storage'])
+  expect(setup.logs).toContain('Setup didn\'t finish, so godmode is off. `/godmode` starts it again.')
+  expect(setup.world.files.has(`${REPO}/.godmode/shared.json`)).toBe(false)
+  expect((await tool($, 'setup_scan')).deny).toContain('godmode is off')
+  await $.prompt.submit({ text: 'and now?' } as Parameters<typeof $.prompt.submit>[0])
+  expect(setup.contexts.at(-1)).toBeUndefined()
 })
 
 /** A setup run through to its note with the person's answers; resolves the report. */
@@ -658,38 +659,14 @@ test('setup, a change typed in the person\'s own words goes back to the PM with 
   expect(setup.world.files.has(`${REPO}/.godmode/shared.json`)).toBe(false)
 })
 
-test('setup that cannot ask the QA question lists its follow-ups, so one round of answers covers them', async ($, on) => {
-  const setup = mount(on, webApp(), { Who: 'With others', QA: null })
+test('answers the person gave the PM, the board\'s QA flow included, are passed as `given` and not asked again', async ($, on) => {
+  const setup = mount(on, webApp())
   await godmode($)
 
-  const stopped = await tool($, 'setup_questionnaire')
-
-  expect(setup.asked.at(-1)).toBe('QA')
-  expect(stopped.deny).toContain('- qaMode: Does anyone test changes besides their author')
-  expect(stopped.deny).toContain('  if On the PR:\n    - qaSignals:')
-  expect(stopped.deny).not.toContain('if No one:')
-  expect(stopped.deny).toContain('- attribution:')
-})
-
-test('setup that stops at the tracker lists the board\'s QA questions as conditional, and one round of answers then covers the flow', async ($, on) => {
-  const setup = mount(on, webApp(), { Who: 'With others', Tracker: null })
-  await godmode($)
-
-  const stopped = await tool($, 'setup_questionnaire')
-
-  expect(setup.asked.at(-1)).toBe('Tracker')
-  // The tracker is unknown, so what only a board brings is listed, marked with its condition.
-  expect(stopped.deny).toContain('    - qaWaitStatus (only if the tracker is Jira or Other): Which status')
-  expect(stopped.deny).toContain('  if On staging:\n    - qaWaitStatus (only if the tracker is Jira or Other)')
-  expect(stopped.deny).toContain('    - qaSignals (only if the tracker is Jira or Other): Being told')
-  expect(stopped.deny).toContain('(Ticket status [only if the tracker is Jira or Other] / PR approval / PR merged / Only being told)')
-  expect(stopped.deny).toContain('- qaPassStatus: Which status on the board means QA passed?')
-
-  // The PM relays them; the person picks Jira. Every QA dialog is dismissed, so only `given` can answer.
-  for (const header of ['Tracker', 'QA', 'QA waiting', 'QA signals', 'QA pass', 'Attribution']) setup.answers[header] = null
   const answers = resultOf(
     await tool($, 'setup_questionnaire', {
       given: {
+        who: 'With others',
         tracker: 'Jira',
         attribution: 'No attribution',
         qaMode: 'On staging',
@@ -700,31 +677,28 @@ test('setup that stops at the tracker lists the board\'s QA questions as conditi
     }),
   )
 
-  expect(setup.asked.slice(4)).toEqual(['Who', 'Care', 'Storage', 'Approvals', 'Setup'])
+  expect(setup.asked).toEqual(['Care', 'Storage', 'Approvals', 'Setup'])
   expect(answers).toContain('- qaWaitStatus: "In QA"')
   expect(answers).toContain('- qaSignals: "ticket-status"')
   expect(answers).toContain('- qaPassStatus: "QA passed"')
 })
 
-test('setup asked again on another QA branch keeps none of the earlier branch\'s answers', async ($, on) => {
+test('setup changed to another QA branch keeps none of the earlier branch\'s answers', async ($, on) => {
   const setup = mount(on, webApp(), {
     Who: 'With others',
     Tracker: 'Jira',
-    QA: 'On the PR',
+    QA: ['On the PR', 'No one'],
     'QA waiting': 'In QA',
     'QA signals': 'Ticket status, PR approval',
     'QA pass': 'Ready to ship',
     'QA approvers': 'acme/qa',
-    Attribution: null,
+    Setup: [CHANGE, 'Save'],
+    Change: 'QA',
   })
-  await godmode($)
-  expect((await tool($, 'setup_questionnaire')).deny).toContain('could not ask the person')
 
-  Object.assign(setup.answers, { QA: 'No one', Attribution: 'No attribution' })
-  resultOf(await tool($, 'setup_questionnaire'))
-  resultOf(await tool($, 'setup_write_preset'))
-  resultOf(await tool($, 'setup_finish'))
+  await setUp($)
 
+  expect(setup.asked).toContain('QA waiting')
   const answers = sharedNote(setup.world).answers
   expect(Object.keys(answers).filter(key => key.startsWith('qa'))).toEqual(['qaMode'])
   // Nobody tests; godmode's own QA agent still tries its own changes, as the UI makes it.
@@ -1096,16 +1070,24 @@ test('setup: protection that cannot be read leaves approvals as a question, and 
   expect(answered).toContain('- humanReviewers: "carol"')
 })
 
-test('setup that cannot ask for the confirm hands the PM the summary, and `confirmed` then saves it unasked', async ($, on) => {
+test('a dismissed confirm ends the setup with nothing saved, and godmode is off', async ($, on) => {
   const setup = mount(on, webApp(), { Setup: null })
   await godmode($)
 
   const stopped = await tool($, 'setup_questionnaire')
-  expect(stopped.deny).toContain('could not ask the person to confirm the summary')
-  expect(stopped.deny).toContain('Merging      no conditions')
 
-  setup.answers.Setup = null
+  expect(stopped.deny).toContain('setup stopped and godmode is off')
+  expect(setup.logs).toContain('Setup didn\'t finish, so godmode is off. `/godmode` starts it again.')
+  expect(setup.world.files.has(`${REPO}/.godmode/shared.json`)).toBe(false)
+})
+
+test('answers the person confirmed with the PM, `confirmed` among them, save without the confirm', async ($, on) => {
+  const setup = mount(on, webApp(), { Setup: null })
+  await godmode($)
+
   const answered = resultOf(await tool($, 'setup_questionnaire', { given: { who: 'alone', care: 'careful', storage: 'committed', tracker: 'none', attribution: false, confirmed: true } }))
+
+  expect(setup.asked).toEqual([])
   expect(answered).toContain('- who: "alone"')
   expect(answered).not.toContain('- confirmed')
 })

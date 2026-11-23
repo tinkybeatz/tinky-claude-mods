@@ -67,7 +67,6 @@ const limits = atom({ plugin: 'godmode', key: 'paneLimits' } as const, [] as Pan
 const collapsed = atom({ plugin: 'godmode', key: 'paneCollapsed' } as const, { agent: false, shell: false } as Record<PaneRowKind, boolean>)
 const tickets = atom({ plugin: 'godmode', key: 'paneTickets' } as const, [] as PaneTicket[])
 const fallback = atom({ plugin: 'godmode', key: 'paneFallback' } as const, false)
-const closed = atom({ plugin: 'godmode', key: 'paneClosed' } as const, false)
 
 /** The docked pane's width as last drawn; the render hook records it, since no `$` call reports it. */
 let measuredColumns: number | undefined
@@ -124,7 +123,6 @@ async function storedColumns($: EngineInterface) {
  */
 export async function openGodmodePane($: EngineInterface) {
   if (!(await isPaneOn($))) return false
-  await update($, closed, () => false)
   const columns = await storedColumns($)
   const opened = await $.ui.open({ id: PANE_ID, title: TITLE, ...(columns === undefined ? {} : { columns }) }).catch(() => ({ isPlaced: false }))
   await update($, fallback, () => !opened.isPlaced)
@@ -350,12 +348,6 @@ export async function paneReceived($: EngineInterface, text: string) {
 
 /** The pane's own hooks (as the dispatch panel's, those godmode already hooks aside), its close hook and its drawing. */
 export function registerPane(on: On) {
-  // The person's close mark: the pane stays closed until godmode is next switched on, and the band stands in.
-  on('ui.close', async ($, e, next) => {
-    if (e.id === PANE_ID && e.origin.kind === 'person') await update($, closed, () => true)
-    return next(e)
-  })
-
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     if (e.tool !== 'Bash') return next(e)
     const startedAt = await $.clock.now()

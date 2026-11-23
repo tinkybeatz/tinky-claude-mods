@@ -36,7 +36,6 @@ const tryRun = atom({ plugin: 'godmode', key: 'tryRun' } as const, null as TryRu
 const paneRows = atom({ plugin: 'godmode', key: 'paneRows' } as const, [] as PaneRow[])
 const paneTickets = atom({ plugin: 'godmode', key: 'paneTickets' } as const, [] as PaneTicket[])
 const paneFallback = atom({ plugin: 'godmode', key: 'paneFallback' } as const, false)
-const paneClosed = atom({ plugin: 'godmode', key: 'paneClosed' } as const, false)
 
 /** A worktree godmode made for a ticket: its folder and branch, and whether it holds work. */
 export type GodmodeWorktree = { path: string; branch: string; work?: string }
@@ -261,7 +260,6 @@ export async function wipe($: EngineInterface, project: Project, plan: ResetPlan
   await update($, paneRows, () => [])
   await update($, paneTickets, () => [])
   await update($, paneFallback, () => false)
-  await update($, paneClosed, () => false)
   if (tracked.length > 0) notes.push(`These deletions are in the working tree, not committed: ${tracked.join(', ')}. Commit them when you are ready.`)
   return notes
 }

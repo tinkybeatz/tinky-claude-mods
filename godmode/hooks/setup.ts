@@ -23,6 +23,7 @@ import { indicatorOf } from './indicator'
 import { logLines, questionText } from './ui-text'
 import { jiraSetup, personalJiraQuestions } from './jira'
 import { liveFactsOf } from './live-facts'
+import { endUnfinishedSetup } from './off'
 import { openGodmodePane } from './pane'
 import { toNoteAnswers, NO_LIVE_FACTS, WORKING_KEYS, prefill, PROJECT_RULES_FILE, projectRulesText, ownRulesIn, summaryLines, summaryText, workingAnswersOf } from './project-rules'
 import type { AreaFiles, Source } from './project-rules'
@@ -194,6 +195,9 @@ export const SETUP_TOOL_NAMES: readonly SetupToolName[] = SETUP_TOOLS.map(tool =
 
 /** A setup tool's refusal: the model reads it as the tool's error. */
 export class SetupError extends Error {}
+
+/** A setup question nobody answered (dismissed, cancelled, or no one to ask): setup did not finish. */
+class UnaskedError extends SetupError {}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -472,7 +476,7 @@ const CHANGE_ROUNDS = 5
 
 /** The setup stopped because nobody could answer: the questions left, as an outline for the PM to relay. */
 const unaskedError = (unasked: readonly Question[], answers: Readonly<Record<string, Answer>>) =>
-  new SetupError(
+  new UnaskedError(
     [
       'godmode could not ask the person (a headless run, or the question was dismissed), so setup stops here. Nothing was written.',
       'Report these questions to the PM, who asks the person and dispatches the setup again with the answers as `given`:',
@@ -527,7 +531,7 @@ async function askSetup($: EngineInterface, project: Project, facts: ScanFacts, 
     const answer = await askConfirm($, groups)
     if (answer.kind === 'save') break
     if (answer.kind === 'unasked') {
-      throw new SetupError(
+      throw new UnaskedError(
         [
           'godmode could not ask the person to confirm the summary (a headless run, or the question was dismissed). Nothing was written.',
           'Report this summary to the PM, who shows it to the person and, on their yes, dispatches the setup again with these answers and `confirmed: true` as `given`:',
@@ -547,7 +551,9 @@ async function askSetup($: EngineInterface, project: Project, facts: ScanFacts, 
     }
     const suggestions = suggestionsOf(state.working)
     const asked = groups.filter(group => answer.picked.includes(group.label)).flatMap(group => group.questions)
-    for (const question of asked) delete person[question.key]
+    // A part asked again leaves nothing of its earlier branch: the QA follow-ups, or whose approvals counted.
+    const dropped = asked.flatMap(question => (question.key === 'qaMode' ? QA_KEYS.filter(key => key !== 'qaAgent') : question.key === 'mergeApprovals' ? ['mergeApprovals', 'humanReviewers'] : [question.key]))
+    for (const key of dropped) delete person[key]
     await ask(asked, {}, question => withSuggestion(question, suggestions))
     state = settle()
     await ask(openQuestionsOf(facts, scope, state.open, extras, false), person)
@@ -598,7 +604,7 @@ export async function beginSetup($: EngineInterface, scope: SetupScope) {
         `godmode is on in setup mode (scope: ${scope}). The project has no finished setup note yet, so the loop cannot start.`,
         `Dispatch the setup now, in the background, without being asked: one Agent call with subagent_type \`godmode:setup\`, description "godmode setup", and the prompt "Set up godmode for this project. Scope: ${scope}." godmode runs it on Opus, its floor.`,
         'Do not scan, read or write anything for the setup yourself: the setup agent does it in its own context, and asks the person its questions through godmode\'s own dialog.',
-        'When it reports, relay the outcome to the person in one or two lines. If it says it could not ask (a headless run, or a dismissed question), ask the person those questions here in plain words, then dispatch `godmode:setup` again with their answers in the prompt, to pass as `given`.',
+        'When it reports, relay the outcome to the person in one or two lines. If the setup does not finish (a question dismissed, the agent stopped or ending before it saved), godmode turns off by itself and says so: tell the person `/godmode` starts it again, and do nothing more for godmode.',
       ].join('\n'),
     ],
   }
@@ -673,7 +679,16 @@ export async function setupQuestionnaire($: EngineInterface, input: Record<strin
     const found = await readNote($, project).catch(() => undefined)
     if (found?.status === 'found' && trackerKindOf(found.shared.answers.tracker ?? '') === 'jira') extras.push(...(await personalJiraQuestions($)))
   }
-  const { answers, notes } = await askSetup($, project, facts, scope, extras, answersIn(input.given, 'given'))
+  let asked: Awaited<ReturnType<typeof askSetup>>
+  try {
+    asked = await askSetup($, project, facts, scope, extras, answersIn(input.given, 'given'))
+  } catch (error) {
+    // A question dismissed or cancelled, the summary's confirm included: setup did not finish, so godmode turns off (0.8.3).
+    if (!(error instanceof UnaskedError)) throw error
+    await endUnfinishedSetup($)
+    throw new SetupError('The person did not answer a setup question, so setup stopped and godmode is off. Nothing was written. Stop here and report that in one line: `/godmode` starts the setup again.')
+  }
+  const { answers, notes } = asked
   await saveRun($, current => ({ ...current, answers: mergeAnswers(current.answers ?? {}, answers) }))
   const shown = Object.entries(answers).map(([key, value]) => `- ${key}: ${JSON.stringify(value)}`)
   return ['The person confirmed:', ...shown, ...notes.map(note => `Note: ${note}`)].join('\n')

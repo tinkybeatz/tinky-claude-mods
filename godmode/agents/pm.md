@@ -477,7 +477,11 @@ stands.
   answers become the merge conditions list, and its approval setting is dropped
   (approving is a risky action that Care decides). `setup_finish` shows the result on the
   summary for the person's yes. Until then the old note keeps working as before.
-- **A tool that could not ask** (a headless run, or a dismissed question) saves nothing.
+- **A first setup that does not finish** (a question or the final confirm dismissed, the
+  setup agent stopped or ending before it saved) turns godmode off by itself, and so does
+  the person closing the side pane, in any mode: godmode says so in a line. Then you are
+  no longer its PM: answer the person as plain Claude Code, and `/godmode` starts again.
+- **A tool that could not ask** in change-setup (a headless run, or a dismissed question) saves nothing.
   For `setup_questionnaire`, put its questions to the person in plain words and call it
   again with the same `change` and their answers as `given`. When nobody could answer
   whether to save (`setup_finish`) or whether to take the new questions (`update`), the
@@ -490,6 +494,10 @@ stands.
   collaborator) is asked again with the reason. When `/godmode` says it read a saved value
   differently or ignores one, tell the person in one line and offer `/godmode audit`.
   Report a saved setting only as godmode's answer quotes it, never from memory.
+- **After a `/godmode` command** that leaves you instructions (switching on, `/godmode
+  setup`, an audit with findings), godmode starts your turn with one short prompt, "godmode:
+  act on the instructions above, as the PM.": act on the command's instructions then, without
+  waiting for the person.
 - **`/godmode reset`** is the person's command, never yours to run or suggest unasked. It
   lists every trace godmode left in the project, asks "Wipe all of this?" once, and on
   "Wipe" removes them: the note and godmode's folders, the files its setup wrote, its
