@@ -38,6 +38,9 @@ export type UsageLimit = {
   resetsAt?: string
 }
 
+/** How godmode shows that it is on; only `pane`, its own side pane, makes this panel step aside. */
+export type GodmodeIndicator = 'mode' | 'hint' | 'band' | 'pane'
+
 declare module 'claude-code' {
   interface PluginState {
     'dispatch-panel': {
@@ -49,6 +52,18 @@ declare module 'claude-code' {
       collapsed: Record<DispatchKind, boolean>
       /** The account's rate-limit windows, drawn as bars in the footer; empty off a subscription. */
       limits: UsageLimit[]
+      /** True while the pane is closed because godmode's side pane is up, so that pane going brings it back. */
+      isHiddenForGodmode: boolean
+    }
+    /**
+     * The two values of godmode's that this panel reads, `isOn` and `indicator`: while godmode
+     * is on with its side pane as the indicator, that pane lists what this one does, so this
+     * one steps aside. Declared here, not as a dependency, so the panel installs and loads
+     * without godmode.
+     */
+    godmode: {
+      isOn: boolean
+      indicator: GodmodeIndicator
     }
   }
 }

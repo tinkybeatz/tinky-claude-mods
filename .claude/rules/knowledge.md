@@ -419,3 +419,19 @@ Learned while building `godmode` 0.8.0 (D78: the project's rules, and the side p
   hook is holding; submit from a later event"), in tests too. godmode 0.8.3 sends the PM's
   starting prompt from `$.clock.after(0, ...)` right after the command; a test advances the
   mocked clock by 1 to see it. The instructions ride in the command's `context`.
+
+Learned while making `dispatch-panel` 1.5.5 step aside for `godmode`.
+
+- **A `state.set` hook with a `{ plugin, key }` matcher hears another plugin's writes.** The
+  hook sees `e.value` and `e.previous` as the write passes; `await next(e)` first, then act
+  only when `.value?.isSet` is true. The reading plugin declares just the key it reads under
+  the other plugin's name in its own contract, so it needs no `dependencies` entry and loads
+  alone.
+- **A test loads a stand-in for another plugin with `test(name, { plugins: [...] }, body)`.**
+  Each entry is `{ name, register }`; a stand-in named `godmode` writes `godmode`'s state,
+  which the plugin under test hears. The test's `$` has no `ui.close`, so the person's close
+  mark is played by dropping the pane from the record a `ui.panes` hook beneath answers.
+- **An inline test plugin's hooks cannot name anything from the test file's scope.** A
+  stand-in whose `command.run` hook called a helper declared in the file was skipped, and
+  every command reached the bottom ("no implementation for command.run"). Keep each check
+  inside the hook.

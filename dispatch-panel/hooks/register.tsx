@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentInfo, EngineInterface, Register } from 'claude-code'
 
-import type { Dispatch, DispatchKind, DispatchTab, UsageLimit } from '../types'
+import type { Dispatch, DispatchKind, DispatchTab, GodmodeIndicator, UsageLimit } from '../types'
 import { THINKING, describeAction, shellTitle } from './actions'
 import {
   ACTIVITY_LABELS,
@@ -52,6 +52,22 @@ const tab = atom({ plugin: 'dispatch-panel', key: 'tab' } as const, 'active' as 
 const isSized = atom({ plugin: 'dispatch-panel', key: 'isSized' } as const, false)
 const limits = atom({ plugin: 'dispatch-panel', key: 'limits' } as const, [] as UsageLimit[])
 const collapsed = atom({ plugin: 'dispatch-panel', key: 'collapsed' } as const, { agent: false, shell: false } as Record<DispatchKind, boolean>)
+const hiddenForGodmode = atom({ plugin: 'dispatch-panel', key: 'isHiddenForGodmode' } as const, false)
+/**
+ * godmode's on switch and indicator style, `isOn` and `indicator` on plugin `godmode`. While
+ * godmode is on with its own side pane as the indicator, that pane lists what this one does,
+ * and a plugin cannot close another's pane, so this panel steps aside by itself rather than
+ * sit as a second tab in the same column. Only read; never set while godmode is absent,
+ * which leaves the panel as it was.
+ */
+const godmodeOn = atom({ plugin: 'godmode', key: 'isOn' } as const, false)
+const godmodeIndicator = atom({ plugin: 'godmode', key: 'indicator' } as const, 'pane' as GodmodeIndicator)
+/** godmode's styles that draw no side pane; godmode reads anything else, a missing value included, as its pane. */
+const PANELESS_INDICATORS: ReadonlySet<unknown> = new Set(['mode', 'hint', 'band'])
+const isGodmodePaneUp = (isOn: boolean | undefined, indicator: GodmodeIndicator | undefined) =>
+  isOn === true && !PANELESS_INDICATORS.has(indicator)
+/** Read once at session start: a value never written means a fresh session, not a reload. */
+const NOW_REF = { plugin: 'dispatch-panel', key: 'now' } as const
 
 /** The docked pane's width as last drawn; the render hook records it, since no `$` call reports it. */
 let measuredColumns: number | undefined
@@ -106,6 +122,26 @@ const openPane = async ($: EngineInterface) => {
   const columns = await storedColumns($)
   return $.ui.open({ id: PANE, title: TITLE, ...(columns === undefined ? {} : { columns }) })
 }
+
+const isPaneOpen = async ($: EngineInterface) => (await $.ui.panes()).some(pane => pane.id === PANE)
+
+/** Closes the pane while godmode's pane is up, remembering that godmode, not the person, closed it. */
+const stepAside = async ($: EngineInterface) => {
+  if (!(await isPaneOpen($))) return
+  await update($, hiddenForGodmode, () => true)
+  await $.ui.close({ id: PANE })
+}
+
+/** Brings the pane back once godmode's pane is gone, only when godmode was what hid it. */
+const comeBack = async ($: EngineInterface) => {
+  if ((await read($, hiddenForGodmode)) !== true) return
+  await update($, hiddenForGodmode, () => false)
+  await openPane($)
+}
+
+/** Steps aside or comes back as godmode's pane is up or not; a failure leaves godmode's write alone. */
+const followGodmode = ($: EngineInterface, isPaneUp: boolean) =>
+  (isPaneUp ? stepAside($) : comeBack($)).catch(() => undefined)
 
 /**
  * Narrows the dock once per session to the remembered width, or to two thirds of the
@@ -264,16 +300,24 @@ export const register: Register = on => {
         'Show dispatched agents and shells in a side panel (`active`, `finished`, `clear` to drop finished rows, `clear all` to drop every row, `width <columns>` to resize)',
       argumentHint: '[active|finished|clear|clear all|width <columns>]',
     })
+    const isFresh = (await $.state.get(NOW_REF)).version === 0
     const startedAt = await $.clock.now()
     await update($, now, () => startedAt)
     $.clock.every(1000, () => void tick($))
-    void openPane($)
+    if (!isGodmodePaneUp(await read($, godmodeOn), await read($, godmodeIndicator))) void openPane($)
+    else if (isFresh) {
+      // A reload keeps the flag, which already says whether godmode hid the pane; a fresh
+      // session that starts with godmode's pane up owes this pane to that one going.
+      await update($, hiddenForGodmode, () => true)
+    }
 
     return next(e)
   })
 
   on('command.run', { command: 'dispatches' }, async ($, e) => {
     const arg = e.args.trim()
+    // The person's own open or close from here on decides, not godmode's turning off.
+    if (!arg.startsWith('clear')) await update($, hiddenForGodmode, () => false)
     if (arg === 'active' || arg === 'finished') {
       await update($, tab, () => arg)
       await openPane($)
@@ -297,6 +341,20 @@ export const register: Register = on => {
     }
     await openPane($)
     return { text: 'Dispatch panel opened.' }
+  })
+
+  on('state.set', { plugin: 'godmode', key: 'isOn' }, async ($, e, next) => {
+    const written = await next(e)
+    if (written.value?.isSet !== true || e.plugin !== 'godmode' || e.key !== 'isOn') return written
+    await followGodmode($, isGodmodePaneUp(e.value, await read($, godmodeIndicator)))
+    return written
+  })
+
+  on('state.set', { plugin: 'godmode', key: 'indicator' }, async ($, e, next) => {
+    const written = await next(e)
+    if (written.value?.isSet !== true || e.plugin !== 'godmode' || e.key !== 'indicator') return written
+    await followGodmode($, isGodmodePaneUp(await read($, godmodeOn), e.value))
+    return written
   })
 
   on('agent.spawn', async ($, e, next) => {

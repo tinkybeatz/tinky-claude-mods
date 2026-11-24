@@ -62,8 +62,9 @@ conditions the project sets (approvals, green CI, QA, or none), checked live on 
 and the rules are kept in plain language in `project-rules.md`, which you can edit. Older
 setups keep working; `/godmode setup` offers the two questions and maps the old answers
 for your yes. godmode shows that it is on with its own side pane by default, or with a mode
-label, a hint tag or a band (what waits on you, its tickets, a running try, its agents and shells),
-which sits beside the dispatch panel without clashing; change it with `/godmode setup`.
+label, a hint tag or a band (what waits on you, its tickets, a running try, its agents and shells);
+change it with `/godmode setup`. While godmode's side pane is up, the dispatch panel steps
+aside, and it comes back afterwards.
 After a godmode update, `/godmode audit` checks
 each project's saved setup against the new version and the project as it is now, in the
 open session; it changes nothing until you pick the fixes. `/godmode reset` wipes every
@@ -110,6 +111,11 @@ Do not install the same mod from the marketplace and from a clone at once.
 
 The panel opens by itself in a terminal at least 144 columns wide, docked on the right in
 the fullscreen layout (see step 3 above). Elsewhere, open it with `/dispatches`.
+
+While `godmode` is on in the same session with its side pane as the indicator, the panel
+closes itself, since godmode's pane lists the same agents and shells. It comes back when
+godmode turns off or switches to another indicator, unless you had closed it yourself.
+`/dispatches` still opens it meanwhile.
 
 | Command | Effect |
 | --- | --- |
